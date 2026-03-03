@@ -69,9 +69,7 @@ class TestBitbucketReadOperations:
 
     def test_list_repositories(self):
         """List repositories in workspace/project."""
-        result = self.client.list_repositories(
-            workspace=self.workspace, limit=5
-        )
+        result = self.client.list_repositories(workspace=self.workspace, limit=5)
         assert isinstance(result, dict)
         assert "values" in result
         assert len(result["values"]) > 0
@@ -111,7 +109,7 @@ class TestBitbucketReadOperations:
                     repo_slug=self.repo,
                     path=filename,
                 )
-                assert isinstance(result, (dict, str))
+                assert isinstance(result, dict | str)
                 return
             except Exception:
                 continue
@@ -219,7 +217,5 @@ class TestBitbucketAuthentication:
         workspace = config.workspace or config.project_key
 
         # Simple read operation to verify auth works
-        result = client.get_repository(
-            workspace=workspace, repo_slug=repo
-        )
+        result = client.get_repository(workspace=workspace, repo_slug=repo)
         assert result is not None

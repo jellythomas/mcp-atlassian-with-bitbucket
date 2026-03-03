@@ -9,7 +9,6 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, urljoin
 
 import httpx
 
@@ -70,9 +69,7 @@ class BitbucketClient:
                 headers["Authorization"] = f"Bearer {access_token}"
 
         proxy_url = (
-            self.config.https_proxy
-            or self.config.http_proxy
-            or self.config.socks_proxy
+            self.config.https_proxy or self.config.http_proxy or self.config.socks_proxy
         )
 
         # Connection pooling for performance
@@ -152,8 +149,11 @@ class BitbucketClient:
                     params=params,
                     json=json_data,
                 )
-                if response.status_code in _RETRY_STATUS_CODES and attempt < _MAX_RETRIES - 1:
-                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                if (
+                    response.status_code in _RETRY_STATUS_CODES
+                    and attempt < _MAX_RETRIES - 1
+                ):
+                    delay = _RETRY_BASE_DELAY * (2**attempt)
                     # Respect Retry-After header if present
                     retry_after = response.headers.get("Retry-After")
                     if retry_after:
@@ -184,7 +184,7 @@ class BitbucketClient:
             except httpx.ConnectError as e:
                 last_exc = e
                 if attempt < _MAX_RETRIES - 1:
-                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                    delay = _RETRY_BASE_DELAY * (2**attempt)
                     logger.warning(
                         f"Bitbucket API connection error: {e}, "
                         f"retrying in {delay:.1f}s (attempt {attempt + 1}/{_MAX_RETRIES})"
@@ -645,7 +645,9 @@ class BitbucketClient:
             repo = ref.get("repository", {})
             return {
                 "branch": branch.get("name") if isinstance(branch, dict) else None,
-                "repo": repo.get("full_name") or repo.get("slug") if isinstance(repo, dict) else None,
+                "repo": repo.get("full_name") or repo.get("slug")
+                if isinstance(repo, dict)
+                else None,
                 "commit": (ref.get("commit", {}) or {}).get("hash", "")[:12],
             }
 
@@ -656,10 +658,13 @@ class BitbucketClient:
             "id": data.get("id"),
             "title": data.get("title"),
             "state": data.get("state"),
-            "author": _user_name(data.get("author", {}).get("user") or data.get("author")),
+            "author": _user_name(
+                data.get("author", {}).get("user") or data.get("author")
+            ),
             "source": _branch_info(data.get("source")),
             "destination": _branch_info(data.get("destination")),
-            "description": data.get("description") or data.get("summary", {}).get("raw", ""),
+            "description": data.get("description")
+            or data.get("summary", {}).get("raw", ""),
             "created_on": data.get("created_on"),
             "updated_on": data.get("updated_on"),
             "comment_count": data.get("comment_count"),
@@ -687,7 +692,9 @@ class BitbucketClient:
         """Write content to a temp file, return metadata instead of content."""
         tmp = Path(tempfile.gettempdir()) / f"{prefix}{suffix}"
         tmp.write_text(content, encoding="utf-8")
-        line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+        line_count = content.count("\n") + (
+            1 if content and not content.endswith("\n") else 0
+        )
         return {
             "file_path": str(tmp),
             "size_bytes": tmp.stat().st_size,
@@ -886,7 +893,7 @@ class BitbucketClient:
         if self.config.is_cloud:
             if not workspace:
                 raise ValueError("Workspace is required for Bitbucket Cloud")
-            body = {"content": {"raw": content}}
+            body: dict[str, Any] = {"content": {"raw": content}}
             return self._request(
                 "POST",
                 f"/repositories/{workspace}/{repo_slug}/pullrequests/{pr_id}/comments",
@@ -896,11 +903,11 @@ class BitbucketClient:
             project = project_key or self.config.project_key
             if not project:
                 raise ValueError("Project key is required for Bitbucket Server/DC")
-            body = {"text": content}
+            body_server: dict[str, Any] = {"text": content}
             return self._request(
                 "POST",
                 f"/projects/{project}/repos/{repo_slug}/pull-requests/{pr_id}/comments",
-                json_data=body,
+                json_data=body_server,
             )
 
     def update_pull_request(
@@ -1432,10 +1439,9 @@ class BitbucketClient:
                 raise ValueError("Project key is required for Bitbucket Server/DC")
             # Server/DC: get merge status which includes build info
             pr = self.get_pull_request(repo_slug, pr_id, project_key=project)
-            source_hash = (
-                pr.get("fromRef", {}).get("latestCommit")
-                or pr.get("fromRef", {}).get("id", "")
-            )
+            source_hash = pr.get("fromRef", {}).get("latestCommit") or pr.get(
+                "fromRef", {}
+            ).get("id", "")
             if source_hash:
                 return self._paginate(
                     f"/projects/{project}/repos/{repo_slug}/commits/{source_hash}/builds",
@@ -1490,6 +1496,7 @@ class BitbucketClient:
         if save_to_file:
             if isinstance(diff_text, dict):
                 import json
+
                 diff_text = json.dumps(diff_text, indent=2)
             return self._save_content_to_file(
                 content=diff_text,
@@ -2303,9 +2310,7 @@ class BitbucketClient:
             commit_path = f"/projects/{project}/repos/{repo_slug}/commits"
             if ref:
                 params["until"] = ref
-            return self._paginate(
-                commit_path, params=params, max_results=max_results
-            )
+            return self._paginate(commit_path, params=params, max_results=max_results)
 
     # ------------------------------------------------------------------
     # Webhook operations (Cloud only)
@@ -2498,9 +2503,7 @@ class BitbucketClient:
     def _require_cloud(self, operation: str) -> None:
         """Raise error if not connected to Cloud."""
         if not self.config.is_cloud:
-            raise ValueError(
-                f"{operation} is only available on Bitbucket Cloud"
-            )
+            raise ValueError(f"{operation} is only available on Bitbucket Cloud")
 
     def list_pipelines(
         self,
@@ -2583,9 +2586,7 @@ class BitbucketClient:
             }
         }
         if variables:
-            body["variables"] = [
-                {"key": k, "value": v} for k, v in variables.items()
-            ]
+            body["variables"] = [{"key": k, "value": v} for k, v in variables.items()]
         return self._request(
             "POST",
             f"/repositories/{ws}/{repo_slug}/pipelines",

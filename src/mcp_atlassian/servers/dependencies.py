@@ -757,15 +757,11 @@ async def get_bitbucket_fetcher(ctx: Context) -> BitbucketClient:
             return client
 
     except RuntimeError:
-        logger.debug(
-            f"{fn_name}: Not in HTTP request context. Using global fallback."
-        )
+        logger.debug(f"{fn_name}: Not in HTTP request context. Using global fallback.")
 
     # Fallback to global config
     app_ctx = _get_app_lifespan_ctx(ctx)
-    global_config = (
-        getattr(app_ctx, "full_bitbucket_config", None) if app_ctx else None
-    )
+    global_config = getattr(app_ctx, "full_bitbucket_config", None) if app_ctx else None
     if global_config:
         logger.debug(
             f"{fn_name}: Using global BitbucketClient. Auth type: {global_config.auth_type}"
