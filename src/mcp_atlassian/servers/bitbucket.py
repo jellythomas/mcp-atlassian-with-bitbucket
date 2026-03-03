@@ -2,7 +2,7 @@
 
 import json
 import logging
-from typing import Annotated, Any
+from typing import Annotated
 
 from fastmcp import Context, FastMCP
 from pydantic import Field
@@ -49,7 +49,9 @@ async def list_repositories(
     ] = None,
     max_results: Annotated[
         int,
-        Field(description="Maximum number of results to return.", ge=1, le=100, default=25),
+        Field(
+            description="Maximum number of results to return.", ge=1, le=100, default=25
+        ),
     ] = 25,
 ) -> str:
     """List repositories in a workspace (Cloud) or project (Server/DC)."""
@@ -74,11 +76,16 @@ async def get_repository(
     ],
     workspace: Annotated[
         str | None,
-        Field(description="Workspace slug (Cloud). Uses default if omitted.", default=None),
+        Field(
+            description="Workspace slug (Cloud). Uses default if omitted.", default=None
+        ),
     ] = None,
     project_key: Annotated[
         str | None,
-        Field(description="Project key (Server/DC). Uses default if omitted.", default=None),
+        Field(
+            description="Project key (Server/DC). Uses default if omitted.",
+            default=None,
+        ),
     ] = None,
 ) -> str:
     """Get details of a specific repository."""
@@ -102,7 +109,9 @@ async def get_repository(
 @check_write_access
 async def create_repository(
     ctx: Context,
-    repo_slug: Annotated[str, Field(description="Repository slug (URL-friendly name).")],
+    repo_slug: Annotated[
+        str, Field(description="Repository slug (URL-friendly name).")
+    ],
     workspace: Annotated[
         str | None,
         Field(description="Workspace slug (Cloud).", default=None),
@@ -295,9 +304,7 @@ async def list_forks(
 )
 async def list_pull_requests(
     ctx: Context,
-    repo_slug: Annotated[
-        str, Field(description="Repository slug.")
-    ],
+    repo_slug: Annotated[str, Field(description="Repository slug.")],
     workspace: Annotated[
         str | None,
         Field(description="Workspace slug (Cloud).", default=None),
@@ -580,7 +587,10 @@ async def update_pull_request(
     ] = None,
     reviewers: Annotated[
         str | None,
-        Field(description="Comma-separated list of new reviewer usernames/UUIDs.", default=None),
+        Field(
+            description="Comma-separated list of new reviewer usernames/UUIDs.",
+            default=None,
+        ),
     ] = None,
 ) -> str:
     """Update a pull request's title, description, destination, or reviewers."""
@@ -823,7 +833,9 @@ async def add_inline_comment(
     ] = None,
     side: Annotated[
         str,
-        Field(description="Diff side: 'new' (added) or 'old' (removed).", default="new"),
+        Field(
+            description="Diff side: 'new' (added) or 'old' (removed).", default="new"
+        ),
     ] = "new",
 ) -> str:
     """Add an inline comment on a specific file and line in a pull request."""
@@ -854,7 +866,9 @@ async def reply_to_comment(
     ctx: Context,
     repo_slug: Annotated[str, Field(description="Repository slug.")],
     pr_id: Annotated[int, Field(description="Pull request ID.", ge=1)],
-    comment_id: Annotated[int, Field(description="Parent comment ID to reply to.", ge=1)],
+    comment_id: Annotated[
+        int, Field(description="Parent comment ID to reply to.", ge=1)
+    ],
     content: Annotated[str, Field(description="Reply text.")],
     workspace: Annotated[
         str | None,
@@ -1199,7 +1213,9 @@ async def list_commits(
 async def get_commit(
     ctx: Context,
     repo_slug: Annotated[str, Field(description="Repository slug.")],
-    commit_hash: Annotated[str, Field(description="Full or abbreviated commit SHA hash.")],
+    commit_hash: Annotated[
+        str, Field(description="Full or abbreviated commit SHA hash.")
+    ],
     workspace: Annotated[
         str | None,
         Field(description="Workspace slug (Cloud).", default=None),
@@ -1228,7 +1244,9 @@ async def compare_commits(
     ctx: Context,
     repo_slug: Annotated[str, Field(description="Repository slug.")],
     source: Annotated[str, Field(description="Source commit hash, branch, or tag.")],
-    destination: Annotated[str, Field(description="Destination commit hash, branch, or tag.")],
+    destination: Annotated[
+        str, Field(description="Destination commit hash, branch, or tag.")
+    ],
     workspace: Annotated[
         str | None,
         Field(description="Workspace slug (Cloud).", default=None),
@@ -1385,7 +1403,10 @@ async def get_file_content(
     file_path: Annotated[str, Field(description="Path to the file in the repository.")],
     ref: Annotated[
         str | None,
-        Field(description="Branch, tag, or commit hash. Defaults to default branch.", default=None),
+        Field(
+            description="Branch, tag, or commit hash. Defaults to default branch.",
+            default=None,
+        ),
     ] = None,
     workspace: Annotated[
         str | None,
@@ -1606,9 +1627,7 @@ async def create_tag(
     repo_slug: Annotated[str, Field(description="Repository slug.")],
     tag_name: Annotated[str, Field(description="Tag name.")],
     target_hash: Annotated[str, Field(description="Commit hash to tag.")],
-    message: Annotated[
-        str, Field(description="Tag message.", default="")
-    ] = "",
+    message: Annotated[str, Field(description="Tag message.", default="")] = "",
     workspace: Annotated[
         str | None,
         Field(description="Workspace slug (Cloud).", default=None),
@@ -2065,7 +2084,9 @@ async def create_webhook(
 async def update_webhook(
     ctx: Context,
     repo_slug: Annotated[str, Field(description="Repository slug.")],
-    webhook_id: Annotated[str, Field(description="Webhook UUID (Cloud) or ID (Server).")],
+    webhook_id: Annotated[
+        str, Field(description="Webhook UUID (Cloud) or ID (Server).")
+    ],
     workspace: Annotated[
         str | None,
         Field(description="Workspace slug (Cloud).", default=None),
@@ -2119,7 +2140,9 @@ async def update_webhook(
 async def delete_webhook(
     ctx: Context,
     repo_slug: Annotated[str, Field(description="Repository slug.")],
-    webhook_id: Annotated[str, Field(description="Webhook UUID (Cloud) or ID (Server).")],
+    webhook_id: Annotated[
+        str, Field(description="Webhook UUID (Cloud) or ID (Server).")
+    ],
     workspace: Annotated[
         str | None,
         Field(description="Workspace slug (Cloud).", default=None),
@@ -2170,11 +2193,16 @@ async def get_workspace(
     ctx: Context,
     workspace: Annotated[
         str | None,
-        Field(description="Workspace slug (Cloud). Uses default if omitted.", default=None),
+        Field(
+            description="Workspace slug (Cloud). Uses default if omitted.", default=None
+        ),
     ] = None,
     project_key: Annotated[
         str | None,
-        Field(description="Project key (Server/DC). Uses default if omitted.", default=None),
+        Field(
+            description="Project key (Server/DC). Uses default if omitted.",
+            default=None,
+        ),
     ] = None,
 ) -> str:
     """Get workspace (Cloud) or project (Server/DC) details."""

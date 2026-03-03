@@ -21,7 +21,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from mcp_atlassian.bitbucket.config import BitbucketConfig
+from mcp_atlassian.bitbucket.config import BitbucketConfig, _is_bitbucket_cloud_url
 from mcp_atlassian.confluence import ConfluenceFetcher
 from mcp_atlassian.confluence.config import ConfluenceConfig
 from mcp_atlassian.jira import JiraFetcher
@@ -42,7 +42,6 @@ from mcp_atlassian.utils.toolsets import (
     get_enabled_toolsets,
     should_include_tool_by_toolset,
 )
-from mcp_atlassian.bitbucket.config import _is_bitbucket_cloud_url
 from mcp_atlassian.utils.urls import is_atlassian_cloud_url, validate_url_for_ssrf
 
 from .bitbucket import bitbucket_mcp
@@ -570,9 +569,7 @@ class UserTokenMiddleware:
                 else None
             )
             bitbucket_url_str = (
-                bitbucket_url_header.decode("latin-1")
-                if bitbucket_url_header
-                else None
+                bitbucket_url_header.decode("latin-1") if bitbucket_url_header else None
             )
 
             # Validate URLs to prevent SSRF

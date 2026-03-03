@@ -11,17 +11,11 @@ Model Context Protocol (MCP) server for Atlassian products — **Jira**, **Confl
 
 ## Quick Start
 
-### 1. Install
+Choose **one** of the installation options below, then start using.
 
-```bash
-uvx mcp-atlassian-with-bitbucket
-# or
-pip install mcp-atlassian-with-bitbucket
-```
+### Option A: Using uvx (Recommended — No Install Required)
 
-### 2. Configure
-
-Add to your Claude Desktop, Cursor, or VS Code MCP configuration:
+Just add to your Claude Desktop, Cursor, VS Code, or Claude Code MCP configuration:
 
 ```json
 {
@@ -46,9 +40,49 @@ Add to your Claude Desktop, Cursor, or VS Code MCP configuration:
 }
 ```
 
+> **Why uvx?** `uvx` automatically downloads and runs the package on-demand — no manual installation needed. It creates an ephemeral environment, fetches from PyPI, and runs it all in one step.
+
+### Option B: Local Development (From Source)
+
+For contributing or running from a cloned repository:
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/jellythomas/mcp-atlassian-with-bitbucket.git
+cd mcp-atlassian-with-bitbucket
+
+# 2. Install dependencies with uv
+uv sync --frozen --all-extras
+```
+
+Then add to your MCP configuration:
+
+```json
+{
+  "mcpServers": {
+    "mcp-atlassian-with-bitbucket": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/mcp-atlassian-with-bitbucket", "mcp-atlassian"],
+      "env": {
+        "JIRA_URL": "https://your-company.atlassian.net",
+        "JIRA_USERNAME": "your.email@company.com",
+        "JIRA_API_TOKEN": "your_api_token",
+        "CONFLUENCE_URL": "https://your-company.atlassian.net/wiki",
+        "CONFLUENCE_USERNAME": "your.email@company.com",
+        "CONFLUENCE_API_TOKEN": "your_api_token",
+        "BITBUCKET_URL": "https://bitbucket.org",
+        "BITBUCKET_USERNAME": "your.email@company.com",
+        "BITBUCKET_API_TOKEN": "your_api_token",
+        "BITBUCKET_WORKSPACE": "your_workspace"
+      }
+    }
+  }
+}
+```
+
 > **Tip**: If you already have Jira/Confluence API tokens, the same token works for Bitbucket Cloud — no need to create a separate app password.
 
-### 3. Start Using
+### Start Using
 
 Ask your AI assistant to:
 - **"Find issues assigned to me in PROJ project"** (Jira)
@@ -445,7 +479,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 ```json
 {
   "mcpServers": {
-    "mcp-atlassian": {
+    "mcp-atlassian-with-bitbucket": {
       "command": "uvx",
       "args": ["mcp-atlassian-with-bitbucket"],
       "env": {
@@ -514,7 +548,7 @@ Add to `.cursor/mcp.json` or `.vscode/mcp.json`:
 ```json
 {
   "servers": {
-    "mcp-atlassian": {
+    "mcp-atlassian-with-bitbucket": {
       "command": "uvx",
       "args": ["mcp-atlassian-with-bitbucket"],
       "env": {
@@ -567,6 +601,42 @@ src/mcp_atlassian/
 | SSL errors (Server/DC) | Set `BITBUCKET_SSL_VERIFY=false` for self-signed certs |
 | Server name shows old name in `/mcp` | The name shown is the JSON key in your config, not the package name. Rename the key (e.g., `"mcp-atlassian"` → `"mcp-atlassian-with-bitbucket"`) and restart |
 | Bitbucket tools not appearing | Ensure `BITBUCKET_URL` and credentials are set. The server auto-detects available services based on which env vars are present |
+
+## LLM Context Optimization
+
+This fork includes features to reduce LLM context usage when working with large responses:
+
+### Compact PR Details
+
+Use `compact: true` when calling `get_pull_request` to return only essential fields instead of the full API response. Reduces output size by ~90%.
+
+**Essential fields returned:**
+- `id`, `title`, `state`, `description`
+- `author` (display name, account ID)
+- `source_branch`, `destination_branch`
+- `reviewers` (list with names and approval status)
+- `created_on`, `updated_on`
+
+**Example usage in your AI assistant:**
+> "Get PR #42 details in compact mode"
+
+### Save Diff to File
+
+Use `save_to_file: true` when calling `get_pull_request_diff` to write the diff to a temporary file (`/tmp/bitbucket.diff`) instead of returning the raw text. Returns a metadata object with:
+
+```json
+{
+  "file_path": "/tmp/bitbucket.diff",
+  "size_bytes": 125432,
+  "line_count": 2847,
+  "hint": "Use a file-read tool to view the diff content"
+}
+```
+
+This prevents large diffs from flooding the LLM context window. Read the file separately when needed.
+
+**Example usage in your AI assistant:**
+> "Get the diff for PR #42 and save it to a file"
 
 ## Security
 

@@ -1,8 +1,7 @@
 """Tests for Bitbucket client module."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import httpx
 import pytest
 
 from mcp_atlassian.bitbucket.client import BitbucketClient
@@ -63,7 +62,10 @@ class TestBuildUrl:
     def test_server_url(self, mock_validate, server_config):
         client = BitbucketClient(config=server_config)
         url = client._build_url("/projects/PROJ/repos/myrepo")
-        assert url == "https://bitbucket.company.com/rest/api/1.0/projects/PROJ/repos/myrepo"
+        assert (
+            url
+            == "https://bitbucket.company.com/rest/api/1.0/projects/PROJ/repos/myrepo"
+        )
 
     @patch.object(BitbucketClient, "_validate_connection")
     def test_url_leading_slash_handling(self, mock_validate, cloud_config):
@@ -156,7 +158,6 @@ class TestCloudOperations:
         commits = client.list_commits(repo_slug="my-repo")
         assert len(commits) == 1
 
-
     @patch.object(BitbucketClient, "_validate_connection")
     @patch.object(BitbucketClient, "_request")
     def test_create_repository(self, mock_request, mock_validate, cloud_config):
@@ -179,7 +180,9 @@ class TestCloudOperations:
         mock_request.return_value = None
         client = BitbucketClient(config=cloud_config)
         client.delete_repository(repo_slug="my-repo")
-        mock_request.assert_called_once_with("DELETE", "/repositories/my-workspace/my-repo")
+        mock_request.assert_called_once_with(
+            "DELETE", "/repositories/my-workspace/my-repo"
+        )
 
     @patch.object(BitbucketClient, "_validate_connection")
     @patch.object(BitbucketClient, "_request")
@@ -251,7 +254,9 @@ class TestCloudOperations:
 
     @patch.object(BitbucketClient, "_validate_connection")
     @patch.object(BitbucketClient, "_paginate")
-    def test_list_pull_request_comments(self, mock_paginate, mock_validate, cloud_config):
+    def test_list_pull_request_comments(
+        self, mock_paginate, mock_validate, cloud_config
+    ):
         mock_paginate.return_value = [{"id": 1, "content": {"raw": "LGTM"}}]
         client = BitbucketClient(config=cloud_config)
         comments = client.list_pull_request_comments(repo_slug="my-repo", pr_id=1)
@@ -263,8 +268,11 @@ class TestCloudOperations:
         mock_request.return_value = {"id": 1, "inline": {"path": "file.py"}}
         client = BitbucketClient(config=cloud_config)
         result = client.add_inline_comment(
-            repo_slug="my-repo", pr_id=1, content="Fix this",
-            file_path="file.py", line=10
+            repo_slug="my-repo",
+            pr_id=1,
+            content="Fix this",
+            file_path="file.py",
+            line=10,
         )
         assert result["inline"]["path"] == "file.py"
 
@@ -301,7 +309,10 @@ class TestCloudOperations:
     @patch.object(BitbucketClient, "_validate_connection")
     @patch.object(BitbucketClient, "_request")
     def test_get_branching_model(self, mock_request, mock_validate, cloud_config):
-        mock_request.return_value = {"type": "branching_model", "production": {"name": "main"}}
+        mock_request.return_value = {
+            "type": "branching_model",
+            "production": {"name": "main"},
+        }
         client = BitbucketClient(config=cloud_config)
         result = client.get_branching_model(repo_slug="my-repo")
         assert result["production"]["name"] == "main"
@@ -329,9 +340,7 @@ class TestCloudOperations:
     def test_list_commit_statuses(self, mock_paginate, mock_validate, cloud_config):
         mock_paginate.return_value = [{"state": "SUCCESSFUL", "key": "ci"}]
         client = BitbucketClient(config=cloud_config)
-        result = client.list_commit_statuses(
-            repo_slug="my-repo", commit_hash="abc123"
-        )
+        result = client.list_commit_statuses(repo_slug="my-repo", commit_hash="abc123")
         assert len(result) == 1
         assert result[0]["state"] == "SUCCESSFUL"
 
@@ -341,8 +350,11 @@ class TestCloudOperations:
         mock_request.return_value = {"state": "SUCCESSFUL", "key": "ci"}
         client = BitbucketClient(config=cloud_config)
         result = client.create_commit_status(
-            repo_slug="my-repo", commit_hash="abc123",
-            state="SUCCESSFUL", key="ci", url="https://ci.example.com"
+            repo_slug="my-repo",
+            commit_hash="abc123",
+            state="SUCCESSFUL",
+            key="ci",
+            url="https://ci.example.com",
         )
         assert result["state"] == "SUCCESSFUL"
 
@@ -382,7 +394,9 @@ class TestCloudOperations:
 
     @patch.object(BitbucketClient, "_validate_connection")
     @patch.object(BitbucketClient, "_paginate")
-    def test_list_pull_request_statuses(self, mock_paginate, mock_validate, cloud_config):
+    def test_list_pull_request_statuses(
+        self, mock_paginate, mock_validate, cloud_config
+    ):
         mock_paginate.return_value = [{"state": "SUCCESSFUL"}]
         client = BitbucketClient(config=cloud_config)
         result = client.list_pull_request_statuses(repo_slug="my-repo", pr_id=1)
@@ -402,9 +416,7 @@ class TestServerOperations:
         client = BitbucketClient(config=server_config)
         repo = client.get_repository(repo_slug="my-repo")
         assert repo["slug"] == "my-repo"
-        mock_request.assert_called_once_with(
-            "GET", "/projects/PROJ/repos/my-repo"
-        )
+        mock_request.assert_called_once_with("GET", "/projects/PROJ/repos/my-repo")
 
     @patch.object(BitbucketClient, "_validate_connection")
     @patch.object(BitbucketClient, "_request")
@@ -420,7 +432,9 @@ class TestServerOperations:
 
     @patch.object(BitbucketClient, "_validate_connection")
     @patch.object(BitbucketClient, "_request")
-    def test_create_pull_request_server(self, mock_request, mock_validate, server_config):
+    def test_create_pull_request_server(
+        self, mock_request, mock_validate, server_config
+    ):
         mock_request.return_value = {"id": 1, "title": "Server PR"}
         client = BitbucketClient(config=server_config)
         pr = client.create_pull_request(
@@ -430,7 +444,6 @@ class TestServerOperations:
             destination_branch="main",
         )
         assert pr["title"] == "Server PR"
-
 
     @patch.object(BitbucketClient, "_validate_connection")
     @patch.object(BitbucketClient, "_request")
@@ -446,7 +459,9 @@ class TestServerOperations:
 
     @patch.object(BitbucketClient, "_validate_connection")
     @patch.object(BitbucketClient, "_request")
-    def test_decline_pull_request_server(self, mock_request, mock_validate, server_config):
+    def test_decline_pull_request_server(
+        self, mock_request, mock_validate, server_config
+    ):
         # First call: get_pull_request for version, second: decline
         mock_request.side_effect = [
             {"id": 1, "version": 3},
@@ -459,7 +474,9 @@ class TestServerOperations:
 
     @patch.object(BitbucketClient, "_validate_connection")
     @patch.object(BitbucketClient, "_request")
-    def test_approve_pull_request_server(self, mock_request, mock_validate, server_config):
+    def test_approve_pull_request_server(
+        self, mock_request, mock_validate, server_config
+    ):
         mock_request.return_value = {"approved": True}
         client = BitbucketClient(config=server_config)
         result = client.approve_pull_request(repo_slug="my-repo", pr_id=1)
@@ -467,7 +484,9 @@ class TestServerOperations:
 
     @patch.object(BitbucketClient, "_validate_connection")
     @patch.object(BitbucketClient, "_request")
-    def test_update_pull_request_server(self, mock_request, mock_validate, server_config):
+    def test_update_pull_request_server(
+        self, mock_request, mock_validate, server_config
+    ):
         # First call: get_pull_request for version, second: update
         mock_request.side_effect = [
             {"id": 1, "version": 2, "title": "Old"},
@@ -496,7 +515,9 @@ class TestCloudOnlyOperations:
     @patch.object(BitbucketClient, "_validate_connection")
     @patch.object(BitbucketClient, "_paginate")
     def test_list_pipelines_cloud(self, mock_paginate, mock_validate, cloud_config):
-        mock_paginate.return_value = [{"uuid": "{pipe-1}", "state": {"name": "COMPLETED"}}]
+        mock_paginate.return_value = [
+            {"uuid": "{pipe-1}", "state": {"name": "COMPLETED"}}
+        ]
         client = BitbucketClient(config=cloud_config)
         result = client.list_pipelines(repo_slug="my-repo")
         assert len(result) == 1
