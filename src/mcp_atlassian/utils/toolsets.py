@@ -102,6 +102,71 @@ JIRA_TOOLSETS: dict[str, ToolsetDefinition] = {
     ),
 }
 
+# --- Bitbucket toolsets (11) ---
+
+BITBUCKET_TOOLSETS: dict[str, ToolsetDefinition] = {
+    "bitbucket_repositories": ToolsetDefinition(
+        name="bitbucket_repositories",
+        description="Repository CRUD, search, and settings",
+        default=True,
+    ),
+    "bitbucket_pull_requests": ToolsetDefinition(
+        name="bitbucket_pull_requests",
+        description="Pull request CRUD, review, merge, diff, and comments",
+        default=True,
+    ),
+    "bitbucket_branches": ToolsetDefinition(
+        name="bitbucket_branches",
+        description="Branch listing, creation, deletion, and restrictions",
+        default=True,
+    ),
+    "bitbucket_commits": ToolsetDefinition(
+        name="bitbucket_commits",
+        description="Commit history, details, and comments",
+        default=True,
+    ),
+    "bitbucket_source": ToolsetDefinition(
+        name="bitbucket_source",
+        description="File content browsing and directory listing",
+        default=True,
+    ),
+    "bitbucket_tags": ToolsetDefinition(
+        name="bitbucket_tags",
+        description="Tag listing and creation",
+        default=False,
+    ),
+    "bitbucket_webhooks": ToolsetDefinition(
+        name="bitbucket_webhooks",
+        description="Webhook CRUD and event management",
+        default=False,
+    ),
+    "bitbucket_pipelines": ToolsetDefinition(
+        name="bitbucket_pipelines",
+        description="CI/CD pipeline management (Cloud only)",
+        default=False,
+    ),
+    "bitbucket_deployments": ToolsetDefinition(
+        name="bitbucket_deployments",
+        description="Deployment environment management (Cloud only)",
+        default=False,
+    ),
+    "bitbucket_downloads": ToolsetDefinition(
+        name="bitbucket_downloads",
+        description="Repository download/artifact management",
+        default=False,
+    ),
+    "bitbucket_snippets": ToolsetDefinition(
+        name="bitbucket_snippets",
+        description="Code snippet management (Cloud only)",
+        default=False,
+    ),
+    "bitbucket_workspace": ToolsetDefinition(
+        name="bitbucket_workspace",
+        description="Workspace/project management, members, default reviewers",
+        default=False,
+    ),
+}
+
 # --- Confluence toolsets (6) ---
 
 CONFLUENCE_TOOLSETS: dict[str, ToolsetDefinition] = {
@@ -142,6 +207,7 @@ CONFLUENCE_TOOLSETS: dict[str, ToolsetDefinition] = {
 ALL_TOOLSETS: dict[str, ToolsetDefinition] = {
     **JIRA_TOOLSETS,
     **CONFLUENCE_TOOLSETS,
+    **BITBUCKET_TOOLSETS,
 }
 
 DEFAULT_TOOLSETS: set[str] = {

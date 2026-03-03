@@ -14,6 +14,7 @@ from fastmcp import Context
 from fastmcp.server.dependencies import get_access_token, get_http_request
 from starlette.requests import Request
 
+from mcp_atlassian.bitbucket import BitbucketClient, BitbucketConfig
 from mcp_atlassian.confluence import ConfluenceConfig, ConfluenceFetcher
 from mcp_atlassian.jira import JiraConfig, JiraFetcher
 from mcp_atlassian.servers.context import MainAppContext
@@ -704,3 +705,75 @@ async def get_confluence_fetcher(ctx: Context) -> ConfluenceFetcher:
         ValueError: If configuration or credentials are invalid.
     """
     return await _get_fetcher(ctx, _confluence_spec())
+
+
+# ---------------------------------------------------------------------------
+# Bitbucket fetcher (simpler path — no _ServiceSpec, uses BitbucketClient directly)
+# ---------------------------------------------------------------------------
+
+
+async def get_bitbucket_fetcher(ctx: Context) -> BitbucketClient:
+    """Returns a BitbucketClient instance for the current request context.
+
+    Uses the global BitbucketConfig from the lifespan context. Header-based
+    per-request auth may be added in the future.
+
+    Args:
+        ctx: The FastMCP context.
+
+    Returns:
+        BitbucketClient instance.
+
+    Raises:
+        ValueError: If Bitbucket is not configured.
+    """
+    fn_name = "get_bitbucket_fetcher"
+
+    # Try to get cached client from request state
+    try:
+        request: Request = get_http_request()
+        cached = getattr(request.state, "bitbucket_client", None)
+        if cached:
+            logger.debug(f"{fn_name}: Returning BitbucketClient from request.state.")
+            return cached
+
+        # Check for header-based auth
+        service_headers = getattr(request.state, "atlassian_service_headers", {})
+        bb_url = service_headers.get("X-Atlassian-Bitbucket-Url")
+        bb_token = service_headers.get("X-Atlassian-Bitbucket-Personal-Token")
+
+        if bb_url and bb_token:
+            logger.info(
+                f"{fn_name}: Creating header-based BitbucketClient with URL: {bb_url}"
+            )
+            header_config = BitbucketConfig(
+                url=bb_url,
+                auth_type="pat",
+                personal_token=bb_token,
+                ssl_verify=True,
+            )
+            client = BitbucketClient(config=header_config)
+            request.state.bitbucket_client = client
+            return client
+
+    except RuntimeError:
+        logger.debug(
+            f"{fn_name}: Not in HTTP request context. Using global fallback."
+        )
+
+    # Fallback to global config
+    app_ctx = _get_app_lifespan_ctx(ctx)
+    global_config = (
+        getattr(app_ctx, "full_bitbucket_config", None) if app_ctx else None
+    )
+    if global_config:
+        logger.debug(
+            f"{fn_name}: Using global BitbucketClient. Auth type: {global_config.auth_type}"
+        )
+        return BitbucketClient(config=global_config)
+
+    logger.error("Bitbucket configuration could not be resolved.")
+    raise ValueError(
+        "Bitbucket client not available. "
+        "Ensure BITBUCKET_URL and authentication are configured."
+    )

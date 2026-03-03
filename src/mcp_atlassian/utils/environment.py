@@ -167,6 +167,43 @@ def get_available_services(
             jira_is_setup = True
             logger.info("Using Jira authentication from header personal token")
 
+    # Bitbucket service detection
+    bitbucket_url = os.getenv("BITBUCKET_URL")
+    bitbucket_is_setup = False
+    if bitbucket_url:
+        # Bitbucket uses different auth env vars than Jira/Confluence
+        bb_username = os.getenv("BITBUCKET_USERNAME")
+        bb_app_password = os.getenv("BITBUCKET_APP_PASSWORD") or os.getenv(
+            "BITBUCKET_API_TOKEN"
+        )
+        bb_personal_token = os.getenv("BITBUCKET_PERSONAL_TOKEN")
+
+        if bb_username and bb_app_password:
+            bitbucket_is_setup = True
+            logger.info("Using Bitbucket authentication (username + app password)")
+        elif bb_personal_token:
+            bitbucket_is_setup = True
+            logger.info("Using Bitbucket authentication (personal/HTTP access token)")
+        else:
+            # Check for OAuth
+            bb_oauth_client_id = os.getenv("ATLASSIAN_OAUTH_CLIENT_ID") or os.getenv(
+                "BITBUCKET_OAUTH_CLIENT_ID"
+            )
+            bb_oauth_client_secret = os.getenv(
+                "ATLASSIAN_OAUTH_CLIENT_SECRET"
+            ) or os.getenv("BITBUCKET_OAUTH_CLIENT_SECRET")
+            if bb_oauth_client_id and bb_oauth_client_secret:
+                bitbucket_is_setup = True
+                logger.info("Using Bitbucket OAuth authentication")
+
+    if not bitbucket_is_setup:
+        bitbucket_token = headers.get("X-Atlassian-Bitbucket-Personal-Token")
+        bitbucket_url_header = headers.get("X-Atlassian-Bitbucket-Url")
+
+        if bitbucket_token and bitbucket_url_header:
+            bitbucket_is_setup = True
+            logger.info("Using Bitbucket authentication from header personal token")
+
     if not confluence_is_setup:
         logger.info(
             "Confluence is not configured or required environment variables are missing."
@@ -175,5 +212,13 @@ def get_available_services(
         logger.info(
             "Jira is not configured or required environment variables are missing."
         )
+    if not bitbucket_is_setup:
+        logger.info(
+            "Bitbucket is not configured or required environment variables are missing."
+        )
 
-    return {"confluence": confluence_is_setup, "jira": jira_is_setup}
+    return {
+        "confluence": confluence_is_setup,
+        "jira": jira_is_setup,
+        "bitbucket": bitbucket_is_setup,
+    }

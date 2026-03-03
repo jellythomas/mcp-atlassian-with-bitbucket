@@ -67,6 +67,13 @@ Tests with actual Atlassian APIs (requires `--use-real-data` flag).
 - **Rate Limiting**: API throttling behavior
 - **Cross-Service Linking**: Jira-Confluence integration
 
+### 8. Bitbucket API Tests (`test_bitbucket_api.py`)
+Tests with actual Bitbucket APIs (requires `--use-real-data` flag).
+
+- **Read Operations**: Repositories, branches, commits, PRs, tags, file content
+- **Cloud-Only Operations**: Pipelines, workspaces, environments
+- **Authentication**: Config validation, Cloud/Server detection, API auth verification
+
 ## Running Integration Tests
 
 ### Basic Execution
@@ -96,6 +103,25 @@ export CONFLUENCE_URL=https://your-domain.atlassian.net/wiki
 export CONFLUENCE_USERNAME=your-email@example.com
 export CONFLUENCE_API_TOKEN=your-api-token
 export CONFLUENCE_TEST_SPACE_KEY=TEST
+```
+
+### Bitbucket API Testing
+```bash
+# Run Bitbucket integration tests
+uv run pytest tests/integration/test_bitbucket_api.py --integration --use-real-data -v
+
+# Bitbucket Cloud:
+export BITBUCKET_URL=https://bitbucket.org
+export BITBUCKET_USERNAME=your_username
+export BITBUCKET_APP_PASSWORD=your_app_password
+export BITBUCKET_WORKSPACE=your_workspace
+export BITBUCKET_TEST_REPO=your_test_repo
+
+# Bitbucket Server/DC:
+export BITBUCKET_URL=https://bitbucket.your-company.com
+export BITBUCKET_PERSONAL_TOKEN=your_pat
+export BITBUCKET_PROJECT_KEY=PROJ
+export BITBUCKET_TEST_REPO=your_test_repo
 ```
 
 ### Test Markers

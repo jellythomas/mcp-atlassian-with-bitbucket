@@ -34,12 +34,12 @@ class TestGetEnabledToolsets:
         assert result == expected
 
     def test_all_keyword(self, monkeypatch):
-        """Test 'all' keyword returns all 21 toolset names."""
+        """Test 'all' keyword returns all 32 toolset names."""
         monkeypatch.setenv("TOOLSETS", "all")
         result = get_enabled_toolsets()
         assert result is not None
         assert result == set(ALL_TOOLSETS.keys())
-        assert len(result) == 21
+        assert len(result) == 33
 
     def test_all_keyword_case_insensitive(self, monkeypatch):
         """Test 'ALL' keyword is case-insensitive."""
@@ -47,16 +47,16 @@ class TestGetEnabledToolsets:
         result = get_enabled_toolsets()
         assert result is not None
         assert result == set(ALL_TOOLSETS.keys())
-        assert len(result) == 21
+        assert len(result) == 33
 
     def test_default_keyword(self, monkeypatch):
-        """Test 'default' keyword returns 6 default toolset names."""
+        """Test 'default' keyword returns 11 default toolset names."""
         monkeypatch.setenv("TOOLSETS", "default")
         result = get_enabled_toolsets()
         assert result is not None
         assert result == DEFAULT_TOOLSETS
-        # 4 Jira defaults + 2 Confluence defaults
-        assert len(result) == 6
+        # 4 Jira defaults + 2 Confluence defaults + 5 Bitbucket defaults
+        assert len(result) == 11
 
     def test_default_plus_extra(self, monkeypatch):
         """Test 'default,jira_agile' returns defaults + jira_agile."""
@@ -87,19 +87,26 @@ class TestGetEnabledToolsets:
             "jira_transitions",
             "confluence_pages",
             "confluence_comments",
+            "bitbucket_repositories",
+            "bitbucket_pull_requests",
+            "bitbucket_branches",
+            "bitbucket_commits",
+            "bitbucket_source",
         }
         assert DEFAULT_TOOLSETS == expected_defaults
 
     def test_all_toolsets_count(self):
-        """Verify ALL_TOOLSETS has exactly 21 entries."""
-        assert len(ALL_TOOLSETS) == 21
+        """Verify ALL_TOOLSETS has exactly 32 entries (15 Jira + 6 Confluence + 11 Bitbucket)."""
+        assert len(ALL_TOOLSETS) == 33
 
-    def test_all_toolsets_contains_jira_and_confluence(self):
-        """Verify ALL_TOOLSETS has both Jira and Confluence toolsets."""
+    def test_all_toolsets_contains_all_services(self):
+        """Verify ALL_TOOLSETS has Jira, Confluence, and Bitbucket toolsets."""
         jira_toolsets = {k for k in ALL_TOOLSETS if k.startswith("jira_")}
         confluence_toolsets = {k for k in ALL_TOOLSETS if k.startswith("confluence_")}
+        bitbucket_toolsets = {k for k in ALL_TOOLSETS if k.startswith("bitbucket_")}
         assert len(jira_toolsets) == 15
         assert len(confluence_toolsets) == 6
+        assert len(bitbucket_toolsets) == 12
 
 
 class TestShouldIncludeToolByToolset:

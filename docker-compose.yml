@@ -1,0 +1,64 @@
+# Docker Compose for running the MCP Atlassian + Bitbucket server.
+#
+# Usage:
+#   1. Copy .env.example to .env and fill in your credentials
+#   2. docker compose up -d
+#   3. The MCP server will be available on port 3000
+#
+# Configure only the services you need — unconfigured services are skipped.
+
+services:
+  mcp-atlassian:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+    environment:
+      # --- Transport ---
+      TRANSPORT: ${TRANSPORT:-stdio}
+      HOST: "0.0.0.0"
+      PORT: ${PORT:-3000}
+
+      # --- Global Settings ---
+      READ_ONLY_MODE: ${READ_ONLY_MODE:-false}
+      TOOLSETS: ${TOOLSETS:-all}
+      MCP_VERBOSE: ${MCP_VERBOSE:-false}
+
+      # --- Jira ---
+      JIRA_URL: ${JIRA_URL:-}
+      JIRA_USERNAME: ${JIRA_USERNAME:-}
+      JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
+      JIRA_PERSONAL_TOKEN: ${JIRA_PERSONAL_TOKEN:-}
+      JIRA_SSL_VERIFY: ${JIRA_SSL_VERIFY:-true}
+
+      # --- Confluence ---
+      CONFLUENCE_URL: ${CONFLUENCE_URL:-}
+      CONFLUENCE_USERNAME: ${CONFLUENCE_USERNAME:-}
+      CONFLUENCE_API_TOKEN: ${CONFLUENCE_API_TOKEN:-}
+      CONFLUENCE_PERSONAL_TOKEN: ${CONFLUENCE_PERSONAL_TOKEN:-}
+      CONFLUENCE_SSL_VERIFY: ${CONFLUENCE_SSL_VERIFY:-true}
+
+      # --- Bitbucket ---
+      BITBUCKET_URL: ${BITBUCKET_URL:-}
+      BITBUCKET_USERNAME: ${BITBUCKET_USERNAME:-}
+      BITBUCKET_APP_PASSWORD: ${BITBUCKET_APP_PASSWORD:-}
+      BITBUCKET_PERSONAL_TOKEN: ${BITBUCKET_PERSONAL_TOKEN:-}
+      BITBUCKET_WORKSPACE: ${BITBUCKET_WORKSPACE:-}
+      BITBUCKET_PROJECT_KEY: ${BITBUCKET_PROJECT_KEY:-}
+      BITBUCKET_SSL_VERIFY: ${BITBUCKET_SSL_VERIFY:-true}
+      BITBUCKET_TIMEOUT: ${BITBUCKET_TIMEOUT:-75}
+
+      # --- OAuth Proxy (optional) ---
+      ATLASSIAN_OAUTH_PROXY_ENABLE: ${ATLASSIAN_OAUTH_PROXY_ENABLE:-false}
+      ATLASSIAN_OAUTH_CLIENT_ID: ${ATLASSIAN_OAUTH_CLIENT_ID:-}
+      ATLASSIAN_OAUTH_CLIENT_SECRET: ${ATLASSIAN_OAUTH_CLIENT_SECRET:-}
+      ATLASSIAN_OAUTH_REDIRECT_URI: ${ATLASSIAN_OAUTH_REDIRECT_URI:-}
+      ATLASSIAN_OAUTH_SCOPE: ${ATLASSIAN_OAUTH_SCOPE:-}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:${PORT:-3000}/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
