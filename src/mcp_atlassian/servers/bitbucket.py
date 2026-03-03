@@ -324,6 +324,15 @@ async def list_pull_requests(
         int,
         Field(description="Maximum results.", ge=1, le=100, default=25),
     ] = 25,
+    compact: Annotated[
+        bool,
+        Field(
+            description="Return only essential fields (id, title, author, branches, "
+            "state, reviewers) instead of the full API response. "
+            "Reduces output size by ~90%. Recommended for LLM consumption.",
+            default=False,
+        ),
+    ] = False,
 ) -> str:
     """List pull requests for a repository."""
     client = await get_bitbucket_fetcher(ctx)
@@ -333,6 +342,7 @@ async def list_pull_requests(
         project_key=project_key,
         state=state,
         max_results=max_results,
+        compact=compact,
     )
     return json.dumps(result, indent=2, ensure_ascii=False)
 

@@ -597,6 +597,7 @@ class BitbucketClient:
         project_key: str | None = None,
         state: str = "OPEN",
         max_results: int = 25,
+        compact: bool = False,
     ) -> list[dict[str, Any]]:
         """List pull requests for a repository.
 
@@ -606,6 +607,7 @@ class BitbucketClient:
             project_key: Project key (Server/DC).
             state: Filter by state (OPEN, MERGED, DECLINED, SUPERSEDED).
             max_results: Maximum results.
+            compact: Return only essential fields per PR (~90% smaller).
 
         Returns:
             List of pull request objects.
@@ -623,7 +625,10 @@ class BitbucketClient:
                 raise ValueError("Project key is required for Bitbucket Server/DC")
             path = f"/projects/{project}/repos/{repo_slug}/pull-requests"
 
-        return self._paginate(path, params=params, max_results=max_results)
+        results = self._paginate(path, params=params, max_results=max_results)
+        if compact:
+            return [self._compact_pull_request(pr) for pr in results]
+        return results
 
     @staticmethod
     def _compact_pull_request(data: dict[str, Any]) -> dict[str, Any]:
@@ -1229,13 +1234,14 @@ class BitbucketClient:
         if self.config.is_cloud:
             if not workspace:
                 raise ValueError("Workspace is required for Bitbucket Cloud")
+            inline: dict[str, Any] = {"path": file_path}
+            if side == "new":
+                inline["to"] = line
+            else:
+                inline["from"] = line
             body: dict[str, Any] = {
                 "content": {"raw": content},
-                "inline": {
-                    "path": file_path,
-                    "to": line if side == "new" else None,
-                    "from": line if side == "old" else None,
-                },
+                "inline": inline,
             }
             return self._request(
                 "POST",
