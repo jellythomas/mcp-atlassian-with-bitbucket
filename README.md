@@ -11,59 +11,11 @@ Model Context Protocol (MCP) server for Atlassian products — **Jira**, **Confl
 
 ## Quick Start
 
-### 1. Install
+Choose **one** of the installation options below, then start using.
 
-**From GitHub (recommended for this fork):**
+### Option A: Using uvx (Recommended — No Install Required)
 
-```bash
-# Clone the repository
-git clone https://github.com/jellythomas/mcp-atlassian-with-bitbucket.git
-cd mcp-atlassian-with-bitbucket
-
-# Install dependencies with uv
-uv sync --frozen --all-extras
-```
-
-**From PyPI (when published):**
-
-```bash
-# Using uvx (runs without installing)
-uvx mcp-atlassian-with-bitbucket
-
-# Or install with pip/uv
-uv pip install mcp-atlassian-with-bitbucket
-```
-
-### 2. Configure
-
-Add to your Claude Desktop, Cursor, or VS Code MCP configuration.
-
-**For local development** (when running from a cloned repository):
-
-```json
-{
-  "mcpServers": {
-    "mcp-atlassian-with-bitbucket": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/mcp-atlassian-with-bitbucket", "mcp-atlassian"],
-      "env": {
-        "JIRA_URL": "https://your-company.atlassian.net",
-        "JIRA_USERNAME": "your.email@company.com",
-        "JIRA_API_TOKEN": "your_api_token",
-        "CONFLUENCE_URL": "https://your-company.atlassian.net/wiki",
-        "CONFLUENCE_USERNAME": "your.email@company.com",
-        "CONFLUENCE_API_TOKEN": "your_api_token",
-        "BITBUCKET_URL": "https://bitbucket.org",
-        "BITBUCKET_USERNAME": "your.email@company.com",
-        "BITBUCKET_API_TOKEN": "your_api_token",
-        "BITBUCKET_WORKSPACE": "your_workspace"
-      }
-    }
-  }
-}
-```
-
-**For published package** (when installed via uvx/pip):
+Just add to your Claude Desktop, Cursor, VS Code, or Claude Code MCP configuration:
 
 ```json
 {
@@ -88,9 +40,49 @@ Add to your Claude Desktop, Cursor, or VS Code MCP configuration.
 }
 ```
 
+> **Why uvx?** `uvx` automatically downloads and runs the package on-demand — no manual installation needed. It creates an ephemeral environment, fetches from PyPI, and runs it all in one step.
+
+### Option B: Local Development (From Source)
+
+For contributing or running from a cloned repository:
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/jellythomas/mcp-atlassian-with-bitbucket.git
+cd mcp-atlassian-with-bitbucket
+
+# 2. Install dependencies with uv
+uv sync --frozen --all-extras
+```
+
+Then add to your MCP configuration:
+
+```json
+{
+  "mcpServers": {
+    "mcp-atlassian-with-bitbucket": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/mcp-atlassian-with-bitbucket", "mcp-atlassian"],
+      "env": {
+        "JIRA_URL": "https://your-company.atlassian.net",
+        "JIRA_USERNAME": "your.email@company.com",
+        "JIRA_API_TOKEN": "your_api_token",
+        "CONFLUENCE_URL": "https://your-company.atlassian.net/wiki",
+        "CONFLUENCE_USERNAME": "your.email@company.com",
+        "CONFLUENCE_API_TOKEN": "your_api_token",
+        "BITBUCKET_URL": "https://bitbucket.org",
+        "BITBUCKET_USERNAME": "your.email@company.com",
+        "BITBUCKET_API_TOKEN": "your_api_token",
+        "BITBUCKET_WORKSPACE": "your_workspace"
+      }
+    }
+  }
+}
+```
+
 > **Tip**: If you already have Jira/Confluence API tokens, the same token works for Bitbucket Cloud — no need to create a separate app password.
 
-### 3. Start Using
+### Start Using
 
 Ask your AI assistant to:
 - **"Find issues assigned to me in PROJ project"** (Jira)
