@@ -478,11 +478,26 @@ async def create_page(
     ],
     title: Annotated[str, Field(description="The title of the page")],
     content: Annotated[
-        str,
+        str | None,
         Field(
-            description="The content of the page. Format depends on content_format parameter. Can be Markdown (default), wiki markup, or storage format"
+            description=(
+                "The content of the page. Format depends on content_format parameter. "
+                "Either 'content' or 'content_file' must be provided."
+            ),
+            default=None,
         ),
-    ],
+    ] = None,
+    content_file: Annotated[
+        str | None,
+        Field(
+            description=(
+                "(Optional) Path to a file containing the page content. "
+                "Use this for large content that cannot be passed directly. "
+                "Either 'content' or 'content_file' must be provided."
+            ),
+            default=None,
+        ),
+    ] = None,
     parent_id: Annotated[
         str | None,
         Field(
@@ -520,6 +535,7 @@ async def create_page(
         space_key: The key of the space.
         title: The title of the page.
         content: The content of the page (format depends on content_format).
+        content_file: Path to a file containing the page content (alternative to content).
         parent_id: Optional parent page ID.
         content_format: The format of the content ('markdown', 'wiki', or 'storage').
         enable_heading_anchors: Whether to enable heading anchors (markdown only).
@@ -530,8 +546,24 @@ async def create_page(
 
     Raises:
         ValueError: If in read-only mode, Confluence client is unavailable, or invalid content_format.
+        ValueError: If neither content nor content_file is provided.
+        FileNotFoundError: If content_file is specified but the file does not exist.
     """
+    import os
+
     confluence_fetcher = await get_confluence_fetcher(ctx)
+
+    # Resolve content from content_file if provided
+    if content_file is not None:
+        if not os.path.isfile(content_file):
+            msg = f"Content file not found: {content_file}"
+            raise FileNotFoundError(msg)
+        with open(content_file, encoding="utf-8") as f:
+            page_content = f.read()
+    elif content is not None:
+        page_content = content
+    else:
+        raise ValueError("Either 'content' or 'content_file' must be provided")
 
     # Validate content_format
     if content_format not in ["markdown", "wiki", "storage"]:
@@ -550,7 +582,7 @@ async def create_page(
     page = confluence_fetcher.create_page(
         space_key=space_key,
         title=title,
-        body=content,
+        body=page_content,
         parent_id=parent_id,
         is_markdown=is_markdown,
         enable_heading_anchors=enable_heading_anchors
@@ -577,11 +609,26 @@ async def update_page(
     page_id: Annotated[str, Field(description="The ID of the page to update")],
     title: Annotated[str, Field(description="The new title of the page")],
     content: Annotated[
-        str,
+        str | None,
         Field(
-            description="The new content of the page. Format depends on content_format parameter"
+            description=(
+                "The new content of the page. Format depends on content_format parameter. "
+                "Either 'content' or 'content_file' must be provided."
+            ),
+            default=None,
         ),
-    ],
+    ] = None,
+    content_file: Annotated[
+        str | None,
+        Field(
+            description=(
+                "(Optional) Path to a file containing the page content. "
+                "Use this for large content that cannot be passed directly. "
+                "Either 'content' or 'content_file' must be provided."
+            ),
+            default=None,
+        ),
+    ] = None,
     is_minor_edit: Annotated[
         bool, Field(description="Whether this is a minor edit", default=False)
     ] = False,
@@ -622,6 +669,7 @@ async def update_page(
         page_id: The ID of the page to update.
         title: The new title of the page.
         content: The new content of the page (format depends on content_format).
+        content_file: Path to a file containing the page content (alternative to content).
         is_minor_edit: Whether this is a minor edit.
         version_comment: Optional comment for this version.
         parent_id: Optional new parent page ID.
@@ -634,8 +682,24 @@ async def update_page(
 
     Raises:
         ValueError: If Confluence client is not configured, available, or invalid content_format.
+        ValueError: If neither content nor content_file is provided.
+        FileNotFoundError: If content_file is specified but the file does not exist.
     """
+    import os
+
     confluence_fetcher = await get_confluence_fetcher(ctx)
+
+    # Resolve content from content_file if provided
+    if content_file is not None:
+        if not os.path.isfile(content_file):
+            msg = f"Content file not found: {content_file}"
+            raise FileNotFoundError(msg)
+        with open(content_file, encoding="utf-8") as f:
+            page_content = f.read()
+    elif content is not None:
+        page_content = content
+    else:
+        raise ValueError("Either 'content' or 'content_file' must be provided")
 
     # Validate content_format
     if content_format not in ["markdown", "wiki", "storage"]:
@@ -654,7 +718,7 @@ async def update_page(
     updated_page = confluence_fetcher.update_page(
         page_id=page_id,
         title=title,
-        body=content,
+        body=page_content,
         is_minor_edit=is_minor_edit,
         version_comment=version_comment,
         is_markdown=is_markdown,

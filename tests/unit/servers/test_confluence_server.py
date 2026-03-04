@@ -853,3 +853,141 @@ async def test_get_page_images_fetch_failure(client, mock_confluence_fetcher):
     summary = json.loads(response.content[0].text)
     assert summary["downloaded"] == 0
     assert len(summary["failed"]) == 1
+
+
+# Tests for content_file parameter
+@pytest.mark.anyio
+async def test_create_page_with_content_file(client, mock_confluence_fetcher, tmp_path):
+    """Test creating a page with content_file parameter."""
+    # Create a temporary file with test content
+    content_file = tmp_path / "test_content.md"
+    content_file.write_text("# Test Content\n\nThis is test content from file.")
+
+    response = await client.call_tool(
+        "confluence_create_page",
+        {
+            "space_key": "TEST",
+            "title": "Page from File",
+            "content_file": str(content_file),
+        },
+    )
+
+    mock_confluence_fetcher.create_page.assert_called_once()
+    call_kwargs = mock_confluence_fetcher.create_page.call_args.kwargs
+    assert call_kwargs["body"] == "# Test Content\n\nThis is test content from file."
+    assert call_kwargs["title"] == "Page from File"
+
+    result_data = json.loads(response.content[0].text)
+    assert result_data["message"] == "Page created successfully"
+
+
+@pytest.mark.anyio
+async def test_update_page_with_content_file(client, mock_confluence_fetcher, tmp_path):
+    """Test updating a page with content_file parameter."""
+    # Create a temporary file with test content
+    content_file = tmp_path / "test_content.html"
+    content_file.write_text("<h1>Updated Content</h1><p>From file.</p>")
+
+    response = await client.call_tool(
+        "confluence_update_page",
+        {
+            "page_id": "123456",
+            "title": "Updated Page from File",
+            "content_file": str(content_file),
+            "content_format": "storage",
+        },
+    )
+
+    mock_confluence_fetcher.update_page.assert_called_once()
+    call_kwargs = mock_confluence_fetcher.update_page.call_args.kwargs
+    assert call_kwargs["body"] == "<h1>Updated Content</h1><p>From file.</p>"
+    assert call_kwargs["title"] == "Updated Page from File"
+    assert call_kwargs["content_representation"] == "storage"
+
+    result_data = json.loads(response.content[0].text)
+    assert result_data["message"] == "Page updated successfully"
+
+
+@pytest.mark.anyio
+async def test_create_page_requires_content_or_content_file(client, mock_confluence_fetcher):
+    """Test that create_page raises error when neither content nor content_file provided."""
+    with pytest.raises(Exception) as exc_info:
+        await client.call_tool(
+            "confluence_create_page",
+            {
+                "space_key": "TEST",
+                "title": "Page without content",
+            },
+        )
+    # The error message should indicate that content is required
+    assert "content" in str(exc_info.value).lower() or "required" in str(exc_info.value).lower()
+
+
+@pytest.mark.anyio
+async def test_update_page_requires_content_or_content_file(client, mock_confluence_fetcher):
+    """Test that update_page raises error when neither content nor content_file provided."""
+    with pytest.raises(Exception) as exc_info:
+        await client.call_tool(
+            "confluence_update_page",
+            {
+                "page_id": "123456",
+                "title": "Page without content",
+            },
+        )
+    # The error message should indicate that content is required
+    assert "content" in str(exc_info.value).lower() or "required" in str(exc_info.value).lower()
+
+
+@pytest.mark.anyio
+async def test_create_page_content_file_not_found(client, mock_confluence_fetcher):
+    """Test that create_page raises FileNotFoundError for missing content_file."""
+    with pytest.raises(Exception) as exc_info:
+        await client.call_tool(
+            "confluence_create_page",
+            {
+                "space_key": "TEST",
+                "title": "Page with missing file",
+                "content_file": "/nonexistent/path/to/file.md",
+            },
+        )
+    assert "not found" in str(exc_info.value).lower() or "no such file" in str(exc_info.value).lower()
+
+
+@pytest.mark.anyio
+async def test_update_page_content_file_not_found(client, mock_confluence_fetcher):
+    """Test that update_page raises FileNotFoundError for missing content_file."""
+    with pytest.raises(Exception) as exc_info:
+        await client.call_tool(
+            "confluence_update_page",
+            {
+                "page_id": "123456",
+                "title": "Page with missing file",
+                "content_file": "/nonexistent/path/to/file.md",
+            },
+        )
+    assert "not found" in str(exc_info.value).lower() or "no such file" in str(exc_info.value).lower()
+
+
+@pytest.mark.anyio
+async def test_create_page_content_takes_precedence_over_file(
+    client, mock_confluence_fetcher, tmp_path
+):
+    """Test that inline content takes precedence when both content and content_file provided."""
+    # Create a temporary file with different content
+    content_file = tmp_path / "test_content.md"
+    content_file.write_text("Content from file")
+
+    response = await client.call_tool(
+        "confluence_create_page",
+        {
+            "space_key": "TEST",
+            "title": "Page with both",
+            "content": "Inline content",
+            "content_file": str(content_file),
+        },
+    )
+
+    mock_confluence_fetcher.create_page.assert_called_once()
+    call_kwargs = mock_confluence_fetcher.create_page.call_args.kwargs
+    # content_file takes precedence as it's checked first
+    assert call_kwargs["body"] == "Content from file"
