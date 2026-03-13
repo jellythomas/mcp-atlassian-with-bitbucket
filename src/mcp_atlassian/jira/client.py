@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 from typing import Any, Literal
 
 from atlassian import Jira
@@ -240,8 +241,16 @@ class JiraClient:
         _ = self.config.url if hasattr(self, "config") else ""
         return self.preprocessor.clean_jira_text(text)
 
+    # Regex to detect Markdown image syntax: ![alt](file_or_url)
+    _MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+
     def _markdown_to_jira(self, markdown_text: str) -> str | dict[str, Any]:
         """Convert Markdown to Jira format (ADF for Cloud, wiki markup for Server).
+
+        For Cloud: uses ADF (v3 API) by default, but falls back to wiki markup
+        (v2 API) when the text contains image references, since ADF media nodes
+        require pre-resolved attachment IDs that aren't available at conversion
+        time. Wiki markup ``!filename.png!`` is natively resolved by Jira Cloud.
 
         Args:
             markdown_text: Text in Markdown format
@@ -253,6 +262,18 @@ class JiraClient:
             return markdown_to_adf("") if self.config.is_cloud else ""
 
         if self.config.is_cloud:
+            # Fall back to wiki markup when images are present, because ADF
+            # media nodes need collection/id from the upload response whereas
+            # wiki markup !filename! is resolved by Jira automatically.
+            if self._MD_IMAGE_RE.search(markdown_text):
+                try:
+                    return self.preprocessor.markdown_to_jira(markdown_text)
+                except Exception as e:
+                    logger.warning(
+                        f"Error converting markdown (with images) to wiki: {e}"
+                    )
+                    return markdown_text
+
             try:
                 return markdown_to_adf(markdown_text)
             except Exception as e:
