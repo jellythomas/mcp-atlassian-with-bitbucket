@@ -19,6 +19,9 @@ _MAX_RETRIES = 3
 _RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 _RETRY_BASE_DELAY = 1.0  # seconds
 
+# Server/DC search returns at most this many hits per request
+_SERVER_SEARCH_PAGE_SIZE = 25
+
 logger = logging.getLogger("mcp-atlassian.bitbucket.client")
 
 
@@ -101,16 +104,19 @@ class BitbucketClient:
         except Exception as e:
             logger.warning(f"Bitbucket connection validation failed: {e}")
 
-    def _build_url(self, path: str) -> str:
+    def _build_url(self, path: str, base_url: str | None = None) -> str:
         """Build full URL from relative path.
 
         Args:
             path: API path (e.g., /repositories/{workspace}/{repo_slug}).
+            base_url: Optional base URL to use instead of the default API base
+                URL. Needed for APIs that live outside /rest/api/1.0 on
+                Server/DC, such as the search API.
 
         Returns:
             Full URL with base API path prepended.
         """
-        base = self.config.api_base_url.rstrip("/")
+        base = (base_url or self.config.api_base_url).rstrip("/")
         path = path.lstrip("/")
         return f"{base}/{path}"
 
@@ -121,6 +127,7 @@ class BitbucketClient:
         params: dict[str, Any] | None = None,
         json_data: dict[str, Any] | None = None,
         raw_response: bool = False,
+        base_url: str | None = None,
     ) -> Any:
         """Make an HTTP request to the Bitbucket API.
 
@@ -130,6 +137,8 @@ class BitbucketClient:
             params: Query parameters.
             json_data: JSON body for POST/PUT requests.
             raw_response: If True, return the httpx.Response object.
+            base_url: Optional base URL to use instead of the default API base
+                URL.
 
         Returns:
             Parsed JSON response or raw response object.
@@ -137,7 +146,7 @@ class BitbucketClient:
         Raises:
             httpx.HTTPStatusError: On HTTP error responses.
         """
-        url = self._build_url(path)
+        url = self._build_url(path, base_url=base_url)
         logger.debug(f"Bitbucket API {method} {url}")
 
         last_exc: Exception | None = None
@@ -2194,41 +2203,136 @@ class BitbucketClient:
     ) -> list[dict[str, Any]]:
         """Search for code in repositories.
 
+        Both platforms scope a search through modifiers inside the query
+        string rather than through dedicated endpoints or query parameters.
+
         Args:
             query: Search query string.
-            repo_slug: Optional repository slug to limit search.
+            repo_slug: Optional repository slug to limit search. On Server/DC
+                this requires a project as well, either via project_key or by
+                passing the slug as "PROJECT/repository".
             workspace: Workspace slug (Cloud).
-            project_key: Project key (Server/DC).
+            project_key: Project key (Server/DC). Optional; without it the
+                search covers every project the user can see.
             max_results: Maximum results.
 
         Returns:
             List of search result objects.
-        """
-        workspace = workspace or self.config.workspace
-        params: dict[str, Any] = {"search_query": query}
 
+        Raises:
+            ValueError: If required scope information is missing.
+        """
         if self.config.is_cloud:
+            workspace = workspace or self.config.workspace
             if not workspace:
                 raise ValueError("Workspace is required for Bitbucket Cloud")
-            if repo_slug:
-                path = f"/repositories/{workspace}/{repo_slug}/search/code"
-            else:
-                path = f"/workspaces/{workspace}/search/code"
-            return self._paginate(path, params=params, max_results=max_results)
-        else:
-            project = project_key or self.config.project_key
-            if not project:
-                raise ValueError("Project key is required for Bitbucket Server/DC")
-            # Server/DC code search requires the code-search plugin
-            search_params: dict[str, Any] = {"query": query, "type": "content"}
-            if repo_slug:
-                search_params["repository"] = repo_slug
-            search_params["project"] = project
+            search_query = query if not repo_slug else f"{query} repo:{repo_slug}"
             return self._paginate(
-                "/search",
-                params=search_params,
+                f"/workspaces/{workspace}/search/code",
+                params={"search_query": search_query},
                 max_results=max_results,
             )
+
+        return self._search_code_server(
+            query,
+            repo_slug=repo_slug,
+            project_key=project_key or self.config.project_key,
+            max_results=max_results,
+        )
+
+    def _search_code_server(
+        self,
+        query: str,
+        repo_slug: str | None = None,
+        project_key: str | None = None,
+        max_results: int = 25,
+    ) -> list[dict[str, Any]]:
+        """Search for code on Bitbucket Server/DC.
+
+        Server/DC exposes search as a POST endpoint in its own REST namespace
+        (/rest/search/latest/search) that takes the query and the requested
+        entities as a JSON body, and returns hits under "code".
+
+        Args:
+            query: Search query string.
+            repo_slug: Optional repository slug, or "PROJECT/repository".
+            project_key: Optional project key.
+            max_results: Maximum results.
+
+        Returns:
+            List of code search result objects.
+
+        Raises:
+            ValueError: If a repository is given without a project.
+        """
+        search_query = self._build_server_search_query(query, project_key, repo_slug)
+
+        results: list[dict[str, Any]] = []
+        start = 0
+        while len(results) < max_results:
+            payload = {
+                "query": search_query,
+                "entities": {
+                    "code": {
+                        "start": start,
+                        "limit": min(
+                            max_results - len(results), _SERVER_SEARCH_PAGE_SIZE
+                        ),
+                    }
+                },
+            }
+            data = self._request(
+                "POST",
+                "/search",
+                json_data=payload,
+                base_url=self.config.search_api_base_url,
+            )
+            code = (data or {}).get("code") or {}
+            values = code.get("values") or []
+            if not values:
+                break
+
+            results.extend(values)
+            if code.get("isLastPage", True):
+                break
+
+            next_start = code.get("nextStart")
+            if next_start is None or next_start <= start:
+                break
+            start = next_start
+
+        return results[:max_results]
+
+    @staticmethod
+    def _build_server_search_query(
+        query: str, project_key: str | None, repo_slug: str | None
+    ) -> str:
+        """Build a Server/DC search query including scope modifiers.
+
+        Args:
+            query: Search query string.
+            project_key: Optional project key.
+            repo_slug: Optional repository slug, or "PROJECT/repository".
+
+        Returns:
+            Query string with project/repo modifiers appended.
+
+        Raises:
+            ValueError: If a bare repository slug is given without a project.
+                Bitbucket rejects such a query with HTTP 400.
+        """
+        terms = [query]
+        if project_key:
+            terms.append(f"project:{project_key}")
+        if repo_slug:
+            if not project_key and "/" not in repo_slug:
+                raise ValueError(
+                    "Bitbucket Server/DC only accepts the 'repo:' modifier "
+                    "together with a project. Pass project_key, or use "
+                    "'PROJECT/repository' as repo_slug."
+                )
+            terms.append(f"repo:{repo_slug}")
+        return " ".join(term for term in terms if term)
 
     def get_file_blame(
         self,

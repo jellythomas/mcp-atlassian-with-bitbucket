@@ -391,6 +391,13 @@ class TestCloudOperations:
         client = BitbucketClient(config=cloud_config)
         result = client.search_code(query="def main", repo_slug="my-repo")
         assert len(result) == 1
+        # Cloud only has a workspace-level endpoint; a repository is selected
+        # through the repo: modifier inside the query.
+        mock_paginate.assert_called_once_with(
+            "/workspaces/my-workspace/search/code",
+            params={"search_query": "def main repo:my-repo"},
+            max_results=25,
+        )
 
     @patch.object(BitbucketClient, "_validate_connection")
     @patch.object(BitbucketClient, "_paginate")
@@ -629,3 +636,161 @@ class TestRequiredParams:
         client = BitbucketClient(config=config)
         with pytest.raises(ValueError, match="Project key is required"):
             client.get_repository(repo_slug="my-repo")
+
+
+class TestCodeSearch:
+    """Tests for code search on Cloud and Server/DC."""
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_cloud_without_repo(self, mock_paginate, mock_validate, cloud_config):
+        mock_paginate.return_value = []
+        client = BitbucketClient(config=cloud_config)
+        client.search_code(query="def main", max_results=10)
+        mock_paginate.assert_called_once_with(
+            "/workspaces/my-workspace/search/code",
+            params={"search_query": "def main"},
+            max_results=10,
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_cloud_explicit_workspace(self, mock_paginate, mock_validate, cloud_config):
+        mock_paginate.return_value = []
+        client = BitbucketClient(config=cloud_config)
+        client.search_code(query="def main", workspace="other-ws")
+        assert mock_paginate.call_args[0][0] == "/workspaces/other-ws/search/code"
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    def test_cloud_requires_workspace(self, mock_validate):
+        config = BitbucketConfig(
+            url="https://bitbucket.org",
+            auth_type="basic",
+            username="user",
+            app_password="pass",
+            workspace=None,
+        )
+        client = BitbucketClient(config=config)
+        with pytest.raises(ValueError, match="Workspace is required"):
+            client.search_code(query="def main")
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_posts_to_search_api(
+        self, mock_request, mock_validate, server_config
+    ):
+        mock_request.return_value = {
+            "code": {"values": [{"file": "app/main.py"}], "isLastPage": True}
+        }
+        client = BitbucketClient(config=server_config)
+        result = client.search_code(query="def main", max_results=5)
+
+        assert result == [{"file": "app/main.py"}]
+        mock_request.assert_called_once_with(
+            "POST",
+            "/search",
+            json_data={
+                "query": "def main project:PROJ",
+                "entities": {"code": {"start": 0, "limit": 5}},
+            },
+            base_url="https://bitbucket.company.com/rest/search/latest",
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_without_project_searches_globally(
+        self, mock_request, mock_validate
+    ):
+        config = BitbucketConfig(
+            url="https://bitbucket.company.com",
+            auth_type="pat",
+            personal_token="test-pat",
+            project_key=None,
+        )
+        mock_request.return_value = {"code": {"values": [], "isLastPage": True}}
+        client = BitbucketClient(config=config)
+        client.search_code(query="def main")
+        assert mock_request.call_args.kwargs["json_data"]["query"] == "def main"
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_repo_modifier(self, mock_request, mock_validate, server_config):
+        mock_request.return_value = {"code": {"values": [], "isLastPage": True}}
+        client = BitbucketClient(config=server_config)
+        client.search_code(query="def main", repo_slug="my-repo")
+        assert (
+            mock_request.call_args.kwargs["json_data"]["query"]
+            == "def main project:PROJ repo:my-repo"
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_qualified_repo_without_project(self, mock_request, mock_validate):
+        config = BitbucketConfig(
+            url="https://bitbucket.company.com",
+            auth_type="pat",
+            personal_token="test-pat",
+            project_key=None,
+        )
+        mock_request.return_value = {"code": {"values": [], "isLastPage": True}}
+        client = BitbucketClient(config=config)
+        client.search_code(query="def main", repo_slug="PROJ/my-repo")
+        assert (
+            mock_request.call_args.kwargs["json_data"]["query"]
+            == "def main repo:PROJ/my-repo"
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    def test_server_bare_repo_without_project_raises(self, mock_validate):
+        config = BitbucketConfig(
+            url="https://bitbucket.company.com",
+            auth_type="pat",
+            personal_token="test-pat",
+            project_key=None,
+        )
+        client = BitbucketClient(config=config)
+        with pytest.raises(ValueError, match="together with a project"):
+            client.search_code(query="def main", repo_slug="my-repo")
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_pagination(self, mock_request, mock_validate, server_config):
+        mock_request.side_effect = [
+            {
+                "code": {
+                    "values": [{"file": f"f{i}.py"} for i in range(25)],
+                    "isLastPage": False,
+                    "nextStart": 25,
+                }
+            },
+            {
+                "code": {
+                    "values": [{"file": f"f{i}.py"} for i in range(25, 30)],
+                    "isLastPage": True,
+                }
+            },
+        ]
+        client = BitbucketClient(config=server_config)
+        result = client.search_code(query="def main", max_results=30)
+
+        assert len(result) == 30
+        assert mock_request.call_count == 2
+        first, second = mock_request.call_args_list
+        assert first.kwargs["json_data"]["entities"]["code"] == {
+            "start": 0,
+            "limit": 25,
+        }
+        assert second.kwargs["json_data"]["entities"]["code"] == {
+            "start": 25,
+            "limit": 5,
+        }
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_stops_on_empty_page(
+        self, mock_request, mock_validate, server_config
+    ):
+        mock_request.return_value = {"code": {"values": [], "isLastPage": False}}
+        client = BitbucketClient(config=server_config)
+        assert client.search_code(query="nothing", max_results=50) == []
+        assert mock_request.call_count == 1

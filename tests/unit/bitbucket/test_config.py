@@ -167,3 +167,30 @@ class TestBitbucketConfig:
             personal_token="test-token",
         )
         assert config.is_auth_configured() is True
+
+
+class TestSearchApiBaseUrl:
+    """Tests for the search API base URL."""
+
+    def test_cloud_uses_api_base_url(self):
+        """Cloud serves search from the regular API base."""
+        config = BitbucketConfig(
+            url="https://bitbucket.org",
+            auth_type="basic",
+            username="user",
+            app_password="pass",
+            workspace="my-workspace",
+        )
+        assert config.search_api_base_url == config.api_base_url
+
+    def test_server_uses_own_namespace(self):
+        """Server/DC serves search outside of /rest/api/1.0."""
+        config = BitbucketConfig(
+            url="https://bitbucket.company.com/",
+            auth_type="pat",
+            personal_token="test-pat",
+        )
+        assert (
+            config.search_api_base_url
+            == "https://bitbucket.company.com/rest/search/latest"
+        )

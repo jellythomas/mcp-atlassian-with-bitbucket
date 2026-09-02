@@ -97,6 +97,21 @@ class BitbucketConfig:
             return "https://api.bitbucket.org/2.0"
         return f"{self.url.rstrip('/')}/rest/api/1.0"
 
+    @property
+    def search_api_base_url(self) -> str:
+        """Get the base URL for search requests.
+
+        Server/DC serves the search API from its own REST namespace instead of
+        /rest/api/1.0.
+
+        Returns:
+            For Cloud: https://api.bitbucket.org/2.0
+            For Server/DC: {url}/rest/search/latest
+        """
+        if self.is_cloud:
+            return self.api_base_url
+        return f"{self.url.rstrip('/')}/rest/search/latest"
+
     @classmethod
     def from_env(cls) -> "BitbucketConfig":
         """Create configuration from environment variables.

@@ -1487,7 +1487,14 @@ async def search_code(
     query: Annotated[str, Field(description="Search query string.")],
     repo_slug: Annotated[
         str | None,
-        Field(description="Optional repository slug to limit search.", default=None),
+        Field(
+            description=(
+                "Optional repository slug to limit search. On Server/DC this "
+                "needs a project as well: either pass project_key or use "
+                "'PROJECT/repository'."
+            ),
+            default=None,
+        ),
     ] = None,
     workspace: Annotated[
         str | None,
@@ -1495,7 +1502,13 @@ async def search_code(
     ] = None,
     project_key: Annotated[
         str | None,
-        Field(description="Project key (Server/DC).", default=None),
+        Field(
+            description=(
+                "Optional project key (Server/DC). Without it the search "
+                "covers every project the user can see."
+            ),
+            default=None,
+        ),
     ] = None,
     max_results: Annotated[
         int,
