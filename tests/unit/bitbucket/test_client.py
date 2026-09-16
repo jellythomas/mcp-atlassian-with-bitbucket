@@ -629,3 +629,110 @@ class TestRequiredParams:
         client = BitbucketClient(config=config)
         with pytest.raises(ValueError, match="Project key is required"):
             client.get_repository(repo_slug="my-repo")
+
+
+class TestPullRequestStatusesServer:
+    """Tests for list_pull_request_statuses on Server/DC."""
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "get_pull_request")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_server_lists_build_statuses(
+        self, mock_paginate, mock_get_pr, mock_validate, server_config
+    ):
+        """Server/DC uses build-status API with correct base URL."""
+        mock_get_pr.return_value = {
+            "fromRef": {"latestCommit": "abc123def456"}
+        }
+        mock_paginate.return_value = [
+            {"state": "SUCCESSFUL", "key": "ci-build"}
+        ]
+        client = BitbucketClient(config=server_config)
+        result = client.list_pull_request_statuses(
+            repo_slug="my-repo", pr_id=42, project_key="PROJ"
+        )
+
+        assert len(result) == 1
+        assert result[0]["state"] == "SUCCESSFUL"
+        # Verify _paginate was called with the correct base_url
+        mock_paginate.assert_called_once_with(
+            "/commits/abc123def456",
+            max_results=25,
+            base_url="https://bitbucket.company.com/rest/build-status/latest",
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "get_pull_request")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_server_empty_commit_hash_returns_empty(
+        self, mock_paginate, mock_get_pr, mock_validate, server_config
+    ):
+        """Server/DC returns empty list if commit hash not found."""
+        mock_get_pr.return_value = {"fromRef": {}}
+        client = BitbucketClient(config=server_config)
+        result = client.list_pull_request_statuses(
+            repo_slug="my-repo", pr_id=42, project_key="PROJ"
+        )
+
+        assert result == []
+        mock_paginate.assert_not_called()
+
+
+class TestBranchRestrictionsServer:
+    """Tests for list_branch_restrictions on Server/DC."""
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_server_lists_restrictions(
+        self, mock_paginate, mock_validate, server_config
+    ):
+        """Server/DC uses branch-permissions API with correct base URL."""
+        mock_paginate.return_value = [
+            {"id": 1, "type": "PUSH_DENY", "scope": {"repositoryId": 123}}
+        ]
+        client = BitbucketClient(config=server_config)
+        result = client.list_branch_restrictions(
+            repo_slug="my-repo", project_key="PROJ"
+        )
+
+        assert len(result) == 1
+        # Verify _paginate was called with the correct base_url
+        mock_paginate.assert_called_once_with(
+            "/projects/PROJ/repos/my-repo/restrictions",
+            max_results=25,
+            base_url="https://bitbucket.company.com/rest/branch-permissions/2.0",
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_server_pagination_multiple_pages(
+        self, mock_paginate, mock_validate, server_config
+    ):
+        """Server/DC paginates through multiple pages of restrictions."""
+        # Simulate paginating through 50 restrictions
+        mock_paginate.return_value = [{"id": i} for i in range(50)]
+        client = BitbucketClient(config=server_config)
+        result = client.list_branch_restrictions(
+            repo_slug="my-repo", project_key="PROJ", max_results=50
+        )
+
+        assert len(result) == 50
+        mock_paginate.assert_called_once_with(
+            "/projects/PROJ/repos/my-repo/restrictions",
+            max_results=50,
+            base_url="https://bitbucket.company.com/rest/branch-permissions/2.0",
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_server_empty_restrictions(
+        self, mock_paginate, mock_validate, server_config
+    ):
+        """Server/DC returns empty list if no restrictions."""
+        mock_paginate.return_value = []
+        client = BitbucketClient(config=server_config)
+        result = client.list_branch_restrictions(
+            repo_slug="my-repo", project_key="PROJ"
+        )
+
+        assert result == []
