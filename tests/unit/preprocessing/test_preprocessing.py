@@ -2,8 +2,10 @@ import re
 
 import pytest
 
-from mcp_atlassian.preprocessing.confluence import ConfluencePreprocessor
-from mcp_atlassian.preprocessing.jira import JiraPreprocessor
+from mcp_atlassian_with_bitbucket_and_privacy.preprocessing.confluence import (
+    ConfluencePreprocessor,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.preprocessing.jira import JiraPreprocessor
 from tests.fixtures.confluence_mocks import MOCK_COMMENTS_RESPONSE, MOCK_PAGE_RESPONSE
 from tests.fixtures.jira_mocks import MOCK_JIRA_ISSUE_RESPONSE
 from tests.utils.mocks import MockConfluenceClient
@@ -89,6 +91,20 @@ def test_process_html_content_basic(preprocessor_with_confluence):
     assert processed_markdown.strip() == "Simple text"
 
 
+def test_process_html_content_preserves_confluence_date_lozenge(
+    preprocessor_with_confluence,
+):
+    """Date lozenges retain values stored only in datetime attributes."""
+    html = '<p>Meeting date: <time datetime="2026-02-04" /></p>'
+
+    processed_html, processed_markdown = (
+        preprocessor_with_confluence.process_html_content(html)
+    )
+
+    assert '<time datetime="2026-02-04">2026-02-04</time>' in processed_html
+    assert processed_markdown.strip() == "Meeting date: 2026-02-04"
+
+
 def test_process_html_content_with_user_mentions(preprocessor_with_confluence):
     """Test HTML content processing with user mentions."""
     html = """
@@ -137,6 +153,53 @@ def test_clean_jira_text_smart_links(preprocessor_with_jira):
     text = f"[Meeting Notes|{confluence_url}|smart-link]"
     cleaned = preprocessor_with_jira.clean_jira_text(text)
     assert cleaned == f"[Example Meeting Notes]({processed_url})"
+
+
+@pytest.mark.parametrize(
+    ("issue_key", "expected"),
+    [
+        (
+            "B7-214-68901",
+            "[B7-214-68901](https://example.atlassian.net/browse/B7-214-68901)",
+        ),
+        (
+            "B7-214--68901",
+            "[Issue](https://example.atlassian.net/browse/B7-214--68901)",
+        ),
+        (
+            "B7-214-",
+            "[Issue](https://example.atlassian.net/browse/B7-214-)",
+        ),
+        (
+            "B7-214-68901A",
+            "[Issue](https://example.atlassian.net/browse/B7-214-68901A)",
+        ),
+    ],
+)
+def test_clean_jira_text_smart_links_validate_hyphenated_issue_keys(
+    preprocessor_with_jira, issue_key, expected
+):
+    """Smart links preserve valid keys and reject malformed suffix segments."""
+    base_url = "https://example.atlassian.net"
+    text = f"[Issue|{base_url}/browse/{issue_key}|smart-link]"
+
+    assert preprocessor_with_jira.clean_jira_text(text) == expected
+
+
+def test_clean_jira_text_smart_links_strip_complete_hyphenated_issue_key(
+    preprocessor_with_jira,
+):
+    """Confluence smart-link titles strip the complete issue key."""
+    base_url = "https://example.atlassian.net"
+    confluence_url = (
+        f"{base_url}/wiki/spaces/PROJ/pages/987654321/"
+        "B7-214-68901+Example+Meeting+Notes"
+    )
+    text = f"[Meeting Notes|{confluence_url}|smart-link]"
+
+    assert preprocessor_with_jira._process_smart_links(text) == (
+        f"[Example Meeting Notes]({confluence_url})"
+    )
 
 
 def test_clean_jira_text_html_content(preprocessor_with_jira):
@@ -190,6 +253,24 @@ def test_jira_to_markdown(preprocessor_with_jira):
     assert preprocessor_with_jira.jira_to_markdown("*bold text*") == "**bold text**"
     assert preprocessor_with_jira.jira_to_markdown("_italic text_") == "*italic text*"
 
+    # Test escaped delimiters are preserved, not paired as emphasis (issue #1610)
+    assert (
+        preprocessor_with_jira.jira_to_markdown(r"QUALITY\_GATES\_LLM\_ENABLED")
+        == r"QUALITY\_GATES\_LLM\_ENABLED"
+    )
+    assert preprocessor_with_jira.jira_to_markdown(r"foo\_bar") == r"foo\_bar"
+    assert (
+        preprocessor_with_jira.jira_to_markdown(r"my\_var\_x and her\_var")
+        == r"my\_var\_x and her\_var"
+    )
+    assert "*" not in preprocessor_with_jira.jira_to_markdown(
+        r"my\_var\_x and her\_var"
+    )
+    assert (
+        preprocessor_with_jira.jira_to_markdown(r"escaped \*stars\* stay literal")
+        == r"escaped \*stars\* stay literal"
+    )
+
     # Test code blocks
     assert preprocessor_with_jira.jira_to_markdown("{{code}}") == "`code`"
 
@@ -231,6 +312,26 @@ For more information, see [our website|https://example.com].
     assert "- Feature 1" in converted
     assert "```python" in converted
     assert "[our website](https://example.com)" in converted
+
+
+@pytest.mark.parametrize(
+    ("wiki", "expected"),
+    [
+        ("* Item with *bold text*.", "- Item with **bold text**."),
+        ("* Item with *two* bold *spans*.", "- Item with **two** bold **spans**."),
+        ("* Item with a lone * asterisk.", "- Item with a lone * asterisk."),
+        ("** Level two.", "  - Level two."),
+        ("*** Level three.", "    - Level three."),
+        ("** Nested *bold* and _italic_.", "  - Nested **bold** and *italic*."),
+        ("*# Ordered *child*.", "  1. Ordered **child**."),
+        ("#* Unordered *child*.", "  - Unordered **child**."),
+    ],
+)
+def test_jira_to_markdown_list_markers_are_not_emphasis(
+    preprocessor_with_jira, wiki, expected
+):
+    """Preserve list depth and format emphasis within the item body (#1651)."""
+    assert preprocessor_with_jira.jira_to_markdown(wiki) == expected
 
 
 def test_jira_to_markdown_citation(preprocessor_with_jira):
@@ -435,7 +536,9 @@ def test_process_confluence_profile_macro_malformed(preprocessor_with_confluence
 
 def test_process_confluence_profile_macro_fallback():
     """Test fallback when confluence_client is None."""
-    from mcp_atlassian.preprocessing.confluence import ConfluencePreprocessor
+    from mcp_atlassian_with_bitbucket_and_privacy.preprocessing.confluence import (
+        ConfluencePreprocessor,
+    )
 
     html = (
         '<ac:structured-macro ac:name="profile">'
@@ -453,8 +556,10 @@ def test_process_confluence_profile_macro_fallback():
 
 
 def test_process_user_profile_macro_multiple():
-    """Test processing multiple User Profile Macros with account-id and userkey."""
-    from mcp_atlassian.preprocessing.confluence import ConfluencePreprocessor
+    """Test processing multiple User Profile Macros with account-id, userkey, and username."""
+    from mcp_atlassian_with_bitbucket_and_privacy.preprocessing.confluence import (
+        ConfluencePreprocessor,
+    )
 
     html = (
         "<p>This page mentions a user via profile macro: "
@@ -468,6 +573,12 @@ def test_process_user_profile_macro_multiple():
         '<ac:parameter ac:name="user">'
         '<ri:user ri:userkey="test-userkey-456" />'
         "</ac:parameter>"
+        "</ac:structured-macro>. "
+        "And a third: "
+        '<ac:structured-macro ac:name="profile" ac:schema-version="1">'
+        '<ac:parameter ac:name="user">'
+        '<ri:user ri:username="test-username-789" />'
+        "</ac:parameter>"
         "</ac:structured-macro>."
         "</p>"
     )
@@ -480,10 +591,17 @@ def test_process_user_profile_macro_multiple():
                 else {}
             )
 
-        def get_user_details_by_username(self, username):
+        def get_user_details_by_userkey(self, userkey):
             return (
                 {"displayName": "Test User Two"}
-                if username == "test-userkey-456"
+                if userkey == "test-userkey-456"
+                else {}
+            )
+
+        def get_user_details_by_username(self, username):
+            return (
+                {"displayName": "Test User Three"}
+                if username == "test-username-789"
                 else {}
             )
 
@@ -493,13 +611,17 @@ def test_process_user_profile_macro_multiple():
     )
     assert "@Test User One" in processed_html
     assert "@Test User Two" in processed_html
+    assert "@Test User Three" in processed_html
     assert "@Test User One" in processed_markdown
     assert "@Test User Two" in processed_markdown
+    assert "@Test User Three" in processed_markdown
 
 
 def test_markdown_to_confluence_no_automatic_anchors():
     """Test that heading_anchors=False prevents automatic anchor generation (regression for issue #488)."""
-    from mcp_atlassian.preprocessing.confluence import ConfluencePreprocessor
+    from mcp_atlassian_with_bitbucket_and_privacy.preprocessing.confluence import (
+        ConfluencePreprocessor,
+    )
 
     markdown_with_headings = """
 # Main Title
@@ -528,7 +650,9 @@ Final content.
 
 def test_markdown_to_confluence_style_preservation():
     """Test that styled content is preserved during conversion."""
-    from mcp_atlassian.preprocessing.confluence import ConfluencePreprocessor
+    from mcp_atlassian_with_bitbucket_and_privacy.preprocessing.confluence import (
+        ConfluencePreprocessor,
+    )
 
     markdown_with_styles = """
 # Title with **bold** text
@@ -558,12 +682,14 @@ def hello():
     assert '<a href="https://example.com">Link text</a>' in result
     assert "ac:structured-macro" in result  # Code block macro
     assert 'ac:name="code"' in result
-    assert "python" in result
+    assert '<ac:parameter ac:name="language">py</ac:parameter>' in result
 
 
 def test_markdown_to_confluence_optional_anchor_generation():
     """Test that enable_heading_anchors parameter controls anchor generation."""
-    from mcp_atlassian.preprocessing.confluence import ConfluencePreprocessor
+    from mcp_atlassian_with_bitbucket_and_privacy.preprocessing.confluence import (
+        ConfluencePreprocessor,
+    )
 
     markdown_with_headings = """
 # Main Title
@@ -590,6 +716,125 @@ More content.
     # Note: md2conf may use different anchor formats, so we check for presence of id attributes
     assert "<h1>" in result_with_anchors
     assert "<h2>" in result_with_anchors
+
+
+# Regression tests: bare-filename images produce "Preview unavailable"
+
+
+class TestFixAttachmentImages:
+    """Unit tests for ConfluencePreprocessor._fix_attachment_images."""
+
+    def setup_method(self):
+        from mcp_atlassian_with_bitbucket_and_privacy.preprocessing.confluence import (
+            ConfluencePreprocessor,
+        )
+
+        self.fix = ConfluencePreprocessor._fix_attachment_images
+
+    def test_bare_filename_replaced_with_attachment_macro(self):
+        html = '<img src="chart.png" alt="Revenue chart"/>'
+        result = self.fix(html)
+        assert 'ac:alt="Revenue chart"' in result
+        assert 'ri:filename="chart.png"' in result
+        assert "<img" not in result
+
+    def test_alt_text_preserved(self):
+        html = '<img alt="My diagram" src="diagram.svg"/>'
+        result = self.fix(html)
+        assert 'ac:alt="My diagram"' in result
+        assert 'ri:filename="diagram.svg"' in result
+
+    def test_missing_alt_defaults_to_empty_string(self):
+        html = '<img src="figure.png"/>'
+        result = self.fix(html)
+        assert 'ac:alt=""' in result
+        assert 'ri:filename="figure.png"' in result
+
+    def test_https_url_left_untouched(self):
+        html = '<img src="https://example.com/logo.png" alt="logo"/>'
+        assert self.fix(html) == html
+
+    def test_http_url_left_untouched(self):
+        html = '<img src="http://example.com/img.jpg" alt="x"/>'
+        assert self.fix(html) == html
+
+    def test_data_uri_left_untouched(self):
+        html = '<img src="data:image/png;base64,abc123" alt="inline"/>'
+        assert self.fix(html) == html
+
+    def test_absolute_path_left_untouched(self):
+        html = '<img src="/images/logo.png" alt="logo"/>'
+        assert self.fix(html) == html
+
+    def test_protocol_relative_url_left_untouched(self):
+        html = '<img src="//cdn.example.com/logo.png" alt="logo"/>'
+        assert self.fix(html) == html
+
+    def test_anchor_reference_left_untouched(self):
+        html = '<img src="#inline-image" alt="logo"/>'
+        assert self.fix(html) == html
+
+    def test_relative_path_uses_md2conf_attachment_name(self):
+        html = '<img src="images/chart 1.png" alt="Chart"/>'
+        result = self.fix(html)
+        assert 'ri:filename="images_chart_1.png"' in result
+
+    def test_xml_sensitive_values_are_escaped(self):
+        html = '<img src="chart & q.png" alt="A & B"/>'
+        result = self.fix(html)
+        assert 'ac:alt="A &amp; B"' in result
+        assert 'ri:filename="chart___q.png"' in result
+
+    def test_dimensions_are_preserved(self):
+        html = '<img src="chart.png" alt="Chart" width="600" height="400"/>'
+        result = self.fix(html)
+        assert 'ac:width="600"' in result
+        assert 'ac:height="400"' in result
+
+    def test_mixed_content_only_bare_filenames_rewritten(self):
+        html = (
+            '<img src="local.png" alt="local"/>'
+            '<img src="https://cdn.example.com/remote.png" alt="remote"/>'
+        )
+        result = self.fix(html)
+        assert "ri:filename" in result
+        assert "https://cdn.example.com/remote.png" in result
+        assert '<img src="local.png"' not in result
+
+    def test_no_img_tags_unchanged(self):
+        html = "<p>No images here</p>"
+        assert self.fix(html) == html
+
+
+def test_markdown_to_confluence_storage_attachment_image():
+    """Regression: bare-filename images must produce ac:image attachment macros."""
+    from mcp_atlassian_with_bitbucket_and_privacy.preprocessing.confluence import (
+        ConfluencePreprocessor,
+    )
+
+    preprocessor = ConfluencePreprocessor(base_url="https://example.atlassian.net")
+    result = preprocessor.markdown_to_confluence_storage("![Revenue chart](chart.png)")
+    assert "ri:filename" in result, (
+        "Expected Confluence attachment macro, got: " + result
+    )
+    assert 'ri:filename="chart.png"' in result
+    assert "<img" not in result, (
+        "Raw <img> tag found - will show as 'Preview unavailable'"
+    )
+
+
+def test_markdown_to_confluence_storage_external_image_unchanged():
+    """External image URLs must not be rewritten to attachment macros."""
+    from mcp_atlassian_with_bitbucket_and_privacy.preprocessing.confluence import (
+        ConfluencePreprocessor,
+    )
+
+    preprocessor = ConfluencePreprocessor(base_url="https://example.atlassian.net")
+    result = preprocessor.markdown_to_confluence_storage(
+        "![Logo](https://example.com/logo.png)"
+    )
+    assert "https://example.com/logo.png" in result
+    assert 'ri:filename="https://example.com/logo.png"' not in result
 
 
 # Issue #786 regression tests - Wiki Markup Corruption
@@ -640,11 +885,96 @@ def test_markdown_to_jira_bold_without_space_still_converts(preprocessor_with_ji
     assert preprocessor_with_jira.markdown_to_jira("*italic text*") == "_italic text_"
 
 
-def test_md2conf_elements_from_string_available():
-    """Test that elements_from_string is importable with fallback (issue #817)."""
-    from mcp_atlassian.preprocessing.confluence import elements_from_string
+def test_markdown_to_jira_preserves_intraword_underscores(preprocessor_with_jira):
+    """Intraword underscores are literal per CommonMark, not emphasis.
 
-    assert callable(elements_from_string)
+    The Jira wiki renderer italicizes ``_word_``, so identifiers containing
+    underscores (snake_case, customfield IDs, etc.) must be emitted with the
+    underscores escaped (``\\_``) — otherwise ``foo_bar_baz`` renders with a
+    spurious italic span around ``bar``.
+    """
+    # Single intraword underscore.
+    assert (
+        preprocessor_with_jira.markdown_to_jira("the foo_bar identifier")
+        == "the foo\\_bar identifier"
+    )
+    # Multiple intraword underscores in one token.
+    assert (
+        preprocessor_with_jira.markdown_to_jira("baseline_samples_5m paused")
+        == "baseline\\_samples\\_5m paused"
+    )
+    # Custom field IDs are a common real-world case.
+    assert (
+        preprocessor_with_jira.markdown_to_jira("set customfield_10101 to 5")
+        == "set customfield\\_10101 to 5"
+    )
+    # Two identifiers on one line must not pair into a cross-token italic span.
+    assert (
+        preprocessor_with_jira.markdown_to_jira("netflow_ap and sre_analytics")
+        == "netflow\\_ap and sre\\_analytics"
+    )
+    # Double underscore runs inside identifiers are also literal in CommonMark.
+    assert (
+        preprocessor_with_jira.markdown_to_jira("the foo__bar__baz identifier")
+        == "the foo\\_\\_bar\\_\\_baz identifier"
+    )
+    # Jira list lines still need escaping inside the item text.
+    assert (
+        preprocessor_with_jira.markdown_to_jira("* customfield_10101 item")
+        == "* customfield\\_10101 item"
+    )
+
+
+def test_markdown_to_jira_word_boundary_underscore_still_italicizes(
+    preprocessor_with_jira,
+):
+    """Genuine ``_emphasis_`` at word boundaries must still convert to italic."""
+    assert (
+        preprocessor_with_jira.markdown_to_jira("an _italic phrase_ here")
+        == "an _italic phrase_ here"
+    )
+    assert preprocessor_with_jira.markdown_to_jira("_italic text_") == "_italic text_"
+    assert preprocessor_with_jira.markdown_to_jira("__bold text__") == "*bold text*"
+
+
+def test_markdown_to_jira_underscore_in_inline_code_untouched(preprocessor_with_jira):
+    """Underscores inside inline code spans stay inside monospace, unescaped."""
+    assert (
+        preprocessor_with_jira.markdown_to_jira("call `find_provider_by_url` now")
+        == "call {{find_provider_by_url}} now"
+    )
+
+
+def test_markdown_to_jira_preserves_underscores_in_url_targets(
+    preprocessor_with_jira,
+):
+    """URL targets keep literal underscores while visible text is escaped."""
+    assert (
+        preprocessor_with_jira.markdown_to_jira(
+            "[runbook](https://example.com/foo_bar)"
+        )
+        == "[runbook|https://example.com/foo_bar]"
+    )
+    assert (
+        preprocessor_with_jira.markdown_to_jira(
+            "[foo_bar](https://example.com/foo_bar)"
+        )
+        == "[foo\\_bar|https://example.com/foo_bar]"
+    )
+    assert (
+        preprocessor_with_jira.markdown_to_jira(
+            "![diagram](https://example.com/foo_bar.png)"
+        )
+        == "!https://example.com/foo_bar.png|alt=diagram!"
+    )
+    assert (
+        preprocessor_with_jira.markdown_to_jira("![](https://example.com/foo_bar.png)")
+        == "!https://example.com/foo_bar.png!"
+    )
+    assert (
+        preprocessor_with_jira.markdown_to_jira("<https://example.com/foo_bar>")
+        == "[https://example.com/foo_bar]"
+    )
 
 
 # Issue #893 regression tests - Code Block Content Corruption
@@ -777,6 +1107,24 @@ def test_normalize_code_language_mapped_languages(preprocessor_with_jira):
     assert preprocessor_with_jira._normalize_code_language("make") == "bash"
 
 
+@pytest.mark.parametrize(
+    ("language", "expected"),
+    [
+        ("csharp", "c#"),
+        ("cs", "c#"),
+        ("objective-c", "objc"),
+        ("py", "python"),
+        ("rb", "ruby"),
+        ("yml", "yaml"),
+    ],
+)
+def test_normalize_code_language_jira_aliases(
+    preprocessor_with_jira, language, expected
+):
+    """Test markdown aliases map to formatter tags accepted by Jira."""
+    assert preprocessor_with_jira._normalize_code_language(language) == expected
+
+
 def test_normalize_code_language_unmapped_returns_none(preprocessor_with_jira):
     """Test that unmapped languages return None for plain {code} blocks."""
     # Languages with no good JIRA alternative should return None
@@ -803,6 +1151,40 @@ def hello():
     assert "{code:python}" in result
     assert "def hello():" in result
     assert "{code}" in result
+
+
+def test_markdown_to_jira_code_block_preserves_newline_after_opener(
+    preprocessor_with_jira,
+):
+    """Test fenced code content starts on the line after the Jira opener."""
+    markdown = "```python\nprint('hello')\n```"
+
+    assert preprocessor_with_jira.markdown_to_jira(markdown) == (
+        "{code:python}\nprint('hello')\n{code}"
+    )
+
+
+@pytest.mark.parametrize("language", ["c#", "c++"])
+def test_markdown_to_jira_code_block_accepts_nonword_language_tags(
+    preprocessor_with_jira, language
+):
+    """Test Jira formatter tags containing punctuation remain fenced blocks."""
+    markdown = f"```{language}\nvoid Run() {{}}\n```"
+
+    assert preprocessor_with_jira.markdown_to_jira(markdown) == (
+        f"{{code:{language}}}\nvoid Run() {{}}\n{{code}}"
+    )
+
+
+def test_markdown_to_jira_invalid_jira_language_falls_back_to_plain_code(
+    preprocessor_with_jira,
+):
+    """Test formatter tags Jira rejects fall back to an untyped code macro."""
+    markdown = "```coldfusion\nwriteOutput('hello')\n```"
+
+    assert preprocessor_with_jira.markdown_to_jira(markdown) == (
+        "{code}\nwriteOutput('hello')\n{code}"
+    )
 
 
 def test_markdown_to_jira_code_block_dockerfile_maps_to_bash(preprocessor_with_jira):
@@ -899,6 +1281,48 @@ some code
 
 
 # Confluence ac:image tag processing tests
+
+
+class TestSetextHeadings:
+    """Setext headings must not swallow blank lines (issue #1587)."""
+
+    def test_horizontal_rule_after_blank_line_is_preserved(
+        self, preprocessor_with_jira
+    ):
+        """`----` on its own line is a horizontal rule, not an empty heading."""
+        result = preprocessor_with_jira.markdown_to_jira("before\n\n----\n\nafter")
+        assert "h2." not in result
+        assert "----" in result
+        assert result == "before\n\n----\n\nafter"
+
+    def test_horizontal_rule_at_start_of_text_is_preserved(
+        self, preprocessor_with_jira
+    ):
+        """A leading rule has no preceding line to consume."""
+        result = preprocessor_with_jira.markdown_to_jira("----\n\nafter")
+        assert "h2." not in result
+        assert result.startswith("----")
+
+    def test_whitespace_only_line_is_not_a_heading(self, preprocessor_with_jira):
+        """A line of spaces is not heading text either."""
+        result = preprocessor_with_jira.markdown_to_jira("before\n   \n----\nafter")
+        assert "h2." not in result
+        assert "----" in result
+
+    def test_setext_h2_still_converts(self, preprocessor_with_jira):
+        """The legitimate `text` over `---` heading is unaffected."""
+        result = preprocessor_with_jira.markdown_to_jira("My Heading\n---\nbody")
+        assert "h2. My Heading" in result
+
+    def test_setext_h1_still_converts(self, preprocessor_with_jira):
+        """The legitimate `text` over `===` heading is unaffected."""
+        result = preprocessor_with_jira.markdown_to_jira("My Heading\n===\nbody")
+        assert "h1. My Heading" in result
+
+    def test_rule_directly_under_text_is_still_a_heading(self, preprocessor_with_jira):
+        """No blank line means it is a setext underline, per CommonMark."""
+        result = preprocessor_with_jira.markdown_to_jira("Some text\n----\nbody")
+        assert "h2. Some text" in result
 
 
 class TestImageProcessing:

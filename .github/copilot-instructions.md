@@ -1,4 +1,4 @@
-# MCP Atlassian - Development Guide
+# MCP Atlassian with Bitbucket and Privacy - Development Guide
 
 Model Context Protocol (MCP) server for Atlassian products (Jira & Confluence). Python ≥3.10.
 
@@ -20,7 +20,7 @@ pre-commit run --all-files           # Run all checks: ruff, prettier, mypy
 uv run pytest
 
 # Run with coverage
-uv run pytest --cov=mcp_atlassian
+uv run pytest --cov=mcp_atlassian_with_bitbucket_and_privacy
 
 # Run single test file
 uv run pytest tests/unit/test_preprocessing.py
@@ -31,9 +31,9 @@ uv run pytest tests/unit/test_preprocessing.py::test_specific_function
 
 **Running the Server**:
 ```bash
-uv run mcp-atlassian                 # Start MCP server
-uv run mcp-atlassian --oauth-setup   # OAuth configuration wizard
-uv run mcp-atlassian -v              # Verbose logging mode
+uv run mcp-atlassian-with-bitbucket-and-privacy                 # Start MCP server
+uv run mcp-atlassian-with-bitbucket-and-privacy --oauth-setup   # OAuth configuration wizard
+uv run mcp-atlassian-with-bitbucket-and-privacy -v              # Verbose logging mode
 ```
 
 ## Architecture
@@ -43,7 +43,7 @@ Functionality is organized into **focused mixins** that compose together:
 - **Jira**: `JiraFetcher` inherits from 13 feature mixins (ProjectsMixin, IssuesMixin, WorklogMixin, etc.)
 - **Confluence**: `ConfluenceFetcher` inherits from 7 feature mixins (SearchMixin, PagesMixin, SpacesMixin, etc.)
 
-Each mixin lives in its own module under `src/mcp_atlassian/jira/` or `src/mcp_atlassian/confluence/`.
+Each mixin lives in its own module under `src/mcp_atlassian_with_bitbucket_and_privacy/jira/` or `src/mcp_atlassian_with_bitbucket_and_privacy/confluence/`.
 
 ### Client + Fetcher Pattern
 - **Client classes** (`JiraClient`, `ConfluenceClient`): Authentication, configuration, and API session management
@@ -63,10 +63,10 @@ The final Fetcher class satisfies all protocols through multiple inheritance.
 - All models extend `ApiModel` base class with `from_api_response()` for deserialization
 - Use `TimestampMixin` for timestamp handling across Jira/Confluence models
 - Models support `to_simplified_dict()` for MCP tool responses
-- Located in `src/mcp_atlassian/models/`
+- Located in `src/mcp_atlassian_with_bitbucket_and_privacy/models/`
 
 ### MCP Server Layer
-Servers (`src/mcp_atlassian/servers/`) use FastMCP framework:
+Servers (`src/mcp_atlassian_with_bitbucket_and_privacy/servers/`) use FastMCP framework:
 - Instantiate Fetchers via dependency injection (`get_jira_fetcher()`, `get_confluence_fetcher()`)
 - Wrap fetcher methods as MCP tools using `@mcp.tool()` decorator
 - Handle error conversion and response serialization
@@ -122,7 +122,7 @@ The codebase supports multiple authentication methods:
 - **Personal Access Tokens (PAT)**: Server/Data Center deployments
 - **OAuth 2.0**: Interactive user authentication with consent flow
 
-Auth configuration lives in `src/mcp_atlassian/utils/auth.py`.
+Auth configuration lives in `src/mcp_atlassian_with_bitbucket_and_privacy/utils/auth.py`.
 
 ## Pre-commit Hooks
 Pre-commit runs:

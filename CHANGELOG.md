@@ -6,6 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+**Structured Identity Privacy (opt-in)**
+
+- Final FastMCP response guard for Jira, Confluence, and Bitbucket structured
+  identities, disabled by default
+- Configurable anonymization or UTC-rotating HMAC pseudonymization with
+  deployment-, connector-, or instance-scoped correlation
+- Private policy file for affiliation, human/service classification, service
+  clear-text exceptions, and selected Jira custom text fields
+- Request-local self-identification, explicit raw/mixed response policies, and
+  fail-closed transformation behavior
+- Optional caller- and tenant-bound alias roundtrip for Jira assignee/watcher
+  and Bitbucket reviewer writes, with epoch expiry and fail-closed rejection
+- Versioned pseudonym keyring with one active key, bounded predecessor
+  acceptance, `pid:v2` key IDs, and controlled key retirement
+- Reproducible German/English free-text PII/NER evaluation and public synthetic
+  Golden Set; general text scanning remains disabled because measured
+  precision/recall did not meet the release gates
+- Historical identity-log inventory and controlled retention/purge runbook;
+  no production deletion is performed without CISO/DPO and operations approval
+
 **Bitbucket Cloud & Server/DC Support (64 tools)**
 
 - **Bitbucket client** (`bitbucket/client.py`) — Unified client supporting both Cloud (API 2.0) and Server/Data Center (API 1.0) with automatic platform detection
@@ -57,9 +77,26 @@ All notable changes to this project will be documented in this file.
 - Total: 33 toolsets across Jira (15), Confluence (6), and Bitbucket (12)
 - Cloud-only toolsets (`bitbucket_pipelines`, `bitbucket_deployments`) with clear Server/DC error messages
 
+### Fixed
+
+- Identity privacy: Bitbucket blame and compare responses are parsed, so author
+  and committer identities are pseudonymized instead of passing through as text
+- Identity privacy: Confluence page mentions, profile macros, and Jira mentions use
+  the pseudonymous alias or a neutral placeholder; no REST name lookup in privacy mode
+- Identity privacy: Jira component lead and real assignee logins are pseudonymized
+- Identity privacy: /healthz reports identity_privacy (off, anonymize or pseudonymize); the startup log shows mode, correlation scope and rotation without key material
+
 ### Changed
 
-- Renamed package from `mcp-atlassian` to `mcp-atlassian-with-bitbucket`
+- Identity privacy: tool errors are returned and logged completely (exception
+  class, message and, for known classes, a remedy hint) instead of being reduced
+  to the exception type; response data stays pseudonymized. Set
+  `IDENTITY_PRIVACY_REDACT_ERRORS=true` to restore the redacted error texts
+- Renamed distribution, CLI, and Python import package to
+  `mcp-atlassian-with-bitbucket-and-privacy`; retained the existing GitHub
+  repository identity
+- Existing OAuth tokens remain readable from the pre-rename keyring service
+  and fallback directory
 - Added `httpx` dependency for Bitbucket API communication
 - Extended `MainAppContext` to include `BitbucketConfig`
 - Updated `ALL_TOOLSETS` count from 21 to 33

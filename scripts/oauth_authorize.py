@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 """
-OAuth 2.0 Authorization Flow Helper for MCP Atlassian
+OAuth 2.0 Authorization Flow Helper for MCP Atlassian with Bitbucket and Privacy
 
 This script helps with the OAuth 2.0 (3LO) authorization flow for Atlassian Cloud:
 1. Opens a browser to the authorization URL
 2. Starts a local server to receive the callback with the authorization code
 3. Exchanges the authorization code for access and refresh tokens
-4. Saves the tokens for later use by MCP Atlassian
+4. Saves the tokens for later use by MCP Atlassian with Bitbucket and Privacy
 
 Usage:
     python oauth_authorize.py --client-id YOUR_CLIENT_ID --client-secret YOUR_CLIENT_SECRET
@@ -38,7 +38,7 @@ import webbrowser
 # Add the parent directory to the path so we can import the package
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.mcp_atlassian.utils.oauth import OAuthConfig
+from src.mcp_atlassian_with_bitbucket_and_privacy.utils.oauth import OAuthConfig
 
 # Configure logging (basicConfig should be called only once, ideally at the very start)
 # Adding lineno for better debugging.
@@ -51,7 +51,9 @@ logging.basicConfig(
 
 logger = logging.getLogger("oauth-authorize")
 logger.setLevel(logging.DEBUG)
-logging.getLogger("mcp-atlassian.oauth").setLevel(logging.DEBUG)
+logging.getLogger("mcp-atlassian-with-bitbucket-and-privacy.oauth").setLevel(
+    logging.DEBUG
+)
 
 # Global variables for callback handling
 authorization_code = None
@@ -296,7 +298,7 @@ def run_oauth_flow(args: argparse.Namespace) -> bool:
 def main() -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="OAuth 2.0 Authorization Flow Helper for MCP Atlassian"
+        description="OAuth 2.0 Authorization Flow Helper for MCP Atlassian with Bitbucket and Privacy"
     )
     parser.add_argument("--client-id", help="OAuth Client ID")
     parser.add_argument("--client-secret", help="OAuth Client Secret")

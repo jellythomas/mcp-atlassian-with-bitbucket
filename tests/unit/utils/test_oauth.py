@@ -3,17 +3,18 @@
 import json
 import time
 import urllib.parse
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import requests
 
-from mcp_atlassian.utils.oauth import (
+from mcp_atlassian_with_bitbucket_and_privacy.utils.oauth import (
     CLOUD_AUTHORIZE_URL,
     CLOUD_TOKEN_URL,
     DC_AUTHORIZE_PATH,
     DC_TOKEN_PATH,
     KEYRING_SERVICE_NAME,
+    LEGACY_KEYRING_SERVICE_NAME,
     TOKEN_EXPIRY_MARGIN,
     BYOAccessTokenOAuthConfig,
     OAuthConfig,
@@ -440,36 +441,35 @@ class TestOAuthConfig:
         # Verify fallback to file was used
         mock_save_to_file.assert_called_once()
 
-    @patch("pathlib.Path.mkdir")
-    @patch("json.dump")
-    def test_save_tokens_to_file(self, mock_dump, mock_mkdir):
-        """Test _save_tokens_to_file method."""
-        # Mock open
-        mock_open = MagicMock()
-        with patch("builtins.open", mock_open):
-            config = OAuthConfig(
-                client_id="test-client-id",
-                client_secret="test-client-secret",
-                redirect_uri="https://example.com/callback",
-                scope="read:jira-work write:jira-work",
-                cloud_id="test-cloud-id",
-                refresh_token="test-refresh-token",
-                access_token="test-access-token",
-                expires_at=1234567890,
-            )
+    def test_save_tokens_to_file(self, tmp_path):
+        """Test _save_tokens_to_file writes the token JSON to the fallback file."""
+        config = OAuthConfig(
+            client_id="test-client-id",
+            client_secret="test-client-secret",
+            redirect_uri="https://example.com/callback",
+            scope="read:jira-work write:jira-work",
+            cloud_id="test-cloud-id",
+            refresh_token="test-refresh-token",
+            access_token="test-access-token",
+            expires_at=1234567890,
+        )
+        with patch(
+            "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.Path.home",
+            return_value=tmp_path,
+        ):
             config._save_tokens_to_file()
 
-            # Should create directory and save tokens
-            mock_mkdir.assert_called_once()
-            mock_open.assert_called_once()
-            mock_dump.assert_called_once()
-
-            # Check saved data
-            saved_data = mock_dump.call_args[0][0]
-            assert saved_data["refresh_token"] == "test-refresh-token"
-            assert saved_data["access_token"] == "test-access-token"
-            assert saved_data["expires_at"] == 1234567890
-            assert saved_data["cloud_id"] == "test-cloud-id"
+        token_path = (
+            tmp_path
+            / ".mcp-atlassian-with-bitbucket-and-privacy"
+            / "oauth-test-client-id.json"
+        )
+        assert token_path.exists()
+        saved_data = json.loads(token_path.read_text())
+        assert saved_data["refresh_token"] == "test-refresh-token"
+        assert saved_data["access_token"] == "test-access-token"
+        assert saved_data["expires_at"] == 1234567890
+        assert saved_data["cloud_id"] == "test-cloud-id"
 
     @patch("keyring.get_password")
     @patch.object(OAuthConfig, "_load_tokens_from_file")
@@ -518,8 +518,9 @@ class TestOAuthConfig:
 
         result = OAuthConfig.load_tokens("test-client-id")
 
-        # Should have tried keyring
-        mock_get_password.assert_called_once()
+        mock_get_password.assert_called_once_with(
+            KEYRING_SERVICE_NAME, "oauth-test-client-id"
+        )
 
         # Should have fallen back to file
         mock_load_from_file.assert_called_once_with("test-client-id")
@@ -528,7 +529,26 @@ class TestOAuthConfig:
         assert result["refresh_token"] == "file-refresh-token"
         assert result["access_token"] == "file-access-token"
         assert result["expires_at"] == 9876543210
-        assert result["cloud_id"] == "file-cloud-id"
+
+    @patch("keyring.get_password")
+    @patch.object(OAuthConfig, "_load_tokens_from_file")
+    def test_load_tokens_from_legacy_keyring(
+        self, mock_load_from_file, mock_get_password
+    ):
+        """Tokens saved before the product rename remain available."""
+        token_data = {"refresh_token": "legacy-refresh-token"}
+        mock_get_password.side_effect = [None, json.dumps(token_data)]
+
+        result = OAuthConfig.load_tokens("test-client-id")
+
+        assert result == token_data
+        mock_get_password.assert_has_calls(
+            [
+                call(KEYRING_SERVICE_NAME, "oauth-test-client-id"),
+                call(LEGACY_KEYRING_SERVICE_NAME, "oauth-test-client-id"),
+            ]
+        )
+        mock_load_from_file.assert_not_called()
 
     @patch("keyring.get_password")
     @patch.object(OAuthConfig, "_load_tokens_from_file")
@@ -547,8 +567,12 @@ class TestOAuthConfig:
 
         result = OAuthConfig.load_tokens("test-client-id")
 
-        # Should have tried keyring
-        mock_get_password.assert_called_once()
+        mock_get_password.assert_has_calls(
+            [
+                call(KEYRING_SERVICE_NAME, "oauth-test-client-id"),
+                call(LEGACY_KEYRING_SERVICE_NAME, "oauth-test-client-id"),
+            ]
+        )
 
         # Should have fallen back to file
         mock_load_from_file.assert_called_once_with("test-client-id")
@@ -590,6 +614,21 @@ class TestOAuthConfig:
 
         # Should return empty dict
         assert result == {}
+
+    def test_load_tokens_from_legacy_file(self, tmp_path):
+        """Tokens in the previous fallback directory remain available."""
+        token_data = {"refresh_token": "legacy-refresh-token"}
+        legacy_token_path = tmp_path / ".mcp-atlassian" / "oauth-test-client-id.json"
+        legacy_token_path.parent.mkdir()
+        legacy_token_path.write_text(json.dumps(token_data), encoding="utf-8")
+
+        with patch(
+            "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.Path.home",
+            return_value=tmp_path,
+        ):
+            result = OAuthConfig._load_tokens_from_file("test-client-id")
+
+        assert result == token_data
 
     @patch("os.getenv")
     def test_from_env_success(self, mock_getenv):
@@ -757,8 +796,10 @@ class TestBYOAccessTokenOAuthConfig:
         assert config is None
 
 
-@patch("mcp_atlassian.utils.oauth.BYOAccessTokenOAuthConfig.from_env")
-@patch("mcp_atlassian.utils.oauth.OAuthConfig.from_env")
+@patch(
+    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.BYOAccessTokenOAuthConfig.from_env"
+)
+@patch("mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.OAuthConfig.from_env")
 def test_get_oauth_config_prefers_byo_when_both_present(
     mock_oauth_from_env, mock_byo_from_env
 ):
@@ -774,8 +815,10 @@ def test_get_oauth_config_prefers_byo_when_both_present(
     mock_oauth_from_env.assert_not_called()  # Standard OAuth should not be called if BYO is found
 
 
-@patch("mcp_atlassian.utils.oauth.BYOAccessTokenOAuthConfig.from_env")
-@patch("mcp_atlassian.utils.oauth.OAuthConfig.from_env")
+@patch(
+    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.BYOAccessTokenOAuthConfig.from_env"
+)
+@patch("mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.OAuthConfig.from_env")
 def test_get_oauth_config_falls_back_to_standard_oauth_config(
     mock_oauth_from_env, mock_byo_from_env
 ):
@@ -790,8 +833,10 @@ def test_get_oauth_config_falls_back_to_standard_oauth_config(
     mock_oauth_from_env.assert_called_once()
 
 
-@patch("mcp_atlassian.utils.oauth.BYOAccessTokenOAuthConfig.from_env")
-@patch("mcp_atlassian.utils.oauth.OAuthConfig.from_env")
+@patch(
+    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.BYOAccessTokenOAuthConfig.from_env"
+)
+@patch("mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.OAuthConfig.from_env")
 def test_get_oauth_config_returns_none_if_both_unavailable(
     mock_oauth_from_env, mock_byo_from_env
 ):
@@ -851,7 +896,7 @@ def test_configure_oauth_session_success_with_byo_config():
     assert session.headers["Authorization"] == "Bearer byo-valid-token"
 
 
-@patch("mcp_atlassian.utils.oauth.logger")
+@patch("mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.logger")
 def test_configure_oauth_session_byo_config_empty_token_logs_warning(mock_logger):
     """Test configure_oauth_session with BYO config and empty token returns False."""
     session = requests.Session()
@@ -866,7 +911,7 @@ def test_configure_oauth_session_byo_config_empty_token_logs_warning(mock_logger
     mock_logger.warning.assert_called_once()
 
 
-@patch("mcp_atlassian.utils.oauth.logger")
+@patch("mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.logger")
 def test_configure_oauth_session_byo_config_no_refresh_token_direct_use(mock_logger):
     """Test BYO config (with access_token, no refresh_token) uses token directly."""
     session = requests.Session()
@@ -1043,7 +1088,7 @@ class TestDataCenterOAuth:
 
     # --- Token exchange (DC vs Cloud) ---
 
-    @patch("mcp_atlassian.utils.oauth.requests.post")
+    @patch("mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.requests.post")
     def test_dc_token_exchange_no_refresh_required(self, mock_post):
         """DC token exchange succeeds without refresh_token in response."""
         mock_response = MagicMock()
@@ -1066,7 +1111,7 @@ class TestDataCenterOAuth:
         assert config.access_token == "dc-access-token"
         assert config.refresh_token is None
 
-    @patch("mcp_atlassian.utils.oauth.requests.post")
+    @patch("mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.requests.post")
     def test_cloud_token_exchange_requires_refresh(self, mock_post):
         """Cloud token exchange fails without refresh_token in response."""
         mock_response = MagicMock()
@@ -1164,7 +1209,7 @@ class TestDataCenterOAuth:
 
     # --- configure_oauth_session: no tokens early return (#858) ---
 
-    @patch("mcp_atlassian.utils.oauth.logger")
+    @patch("mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.logger")
     def test_configure_oauth_session_no_tokens_returns_false(self, mock_logger):
         """configure_oauth_session returns False when no tokens are available."""
         session = requests.Session()
@@ -1183,7 +1228,7 @@ class TestDataCenterOAuth:
         mock_logger.warning.assert_called_once()
         assert "No access_token or refresh_token" in str(mock_logger.warning.call_args)
 
-    @patch("mcp_atlassian.utils.oauth.logger")
+    @patch("mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.logger")
     def test_configure_oauth_session_minimal_oauth_no_tokens(self, mock_logger):
         """Regression: minimal OAuth config (ATLASSIAN_OAUTH_ENABLE=true) with no
         tokens should return False with clear warning, not crash (#858)."""
@@ -1219,3 +1264,55 @@ class TestDataCenterOAuth:
         token_json = mock_set_pw.call_args[0][2]
         data = json.loads(token_json)
         assert data["base_url"] == self.DC_BASE_URL
+
+
+class TestTokenFilePermissionsRegression:
+    """Regression (GHSA-g5xv, GHSA-76pr, GHSA-4596) — the OAuth token file must
+    not be world/group-readable.
+
+    ``_save_tokens_to_file`` used to create ``~/.mcp-atlassian-with-bitbucket-and-privacy`` with
+    ``mkdir(exist_ok=True)`` (no mode) and write ``oauth-<client>.json`` with
+    ``open(..., "w")`` (no chmod), so the refresh and access tokens landed with the
+    process umask's default permissions (commonly 0o644, i.e. group/world-readable).
+    This test forces a permissive umask so the result is deterministic regardless
+    of the runner, then asserts the file is owner-only (0o600).
+    """
+
+    @pytest.mark.security_regression
+    def test_saved_token_file_is_not_group_or_world_readable(self, tmp_path) -> None:
+        """The persisted OAuth token file must be owner-only (0o600)."""
+        import os
+        import stat
+
+        config = OAuthConfig(
+            client_id="test-client-id",
+            client_secret="test-client-secret",
+            redirect_uri="https://example.com/callback",
+            scope="read:jira-work",
+            cloud_id="test-cloud-id",
+            refresh_token="secret-refresh-token",
+            access_token="secret-access-token",
+            expires_at=1234567890,
+        )
+
+        old_umask = os.umask(0o022)  # permissive -> pre-fix file would be 0o644
+        try:
+            with patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.Path.home",
+                return_value=tmp_path,
+            ):
+                config._save_tokens_to_file()
+        finally:
+            os.umask(old_umask)
+
+        token_path = (
+            tmp_path
+            / ".mcp-atlassian-with-bitbucket-and-privacy"
+            / "oauth-test-client-id.json"
+        )
+        assert token_path.exists(), "token file was not written"
+        mode = stat.S_IMODE(token_path.stat().st_mode)
+        assert mode & 0o077 == 0, (
+            "OAuth token file must not be group/world-readable (expected 0o600); "
+            f"got {oct(mode)}"
+        )

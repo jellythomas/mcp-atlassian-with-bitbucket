@@ -1,7 +1,11 @@
 """Tests for the Confluence utility functions."""
 
-from mcp_atlassian.confluence.constants import RESERVED_CQL_WORDS
-from mcp_atlassian.confluence.utils import quote_cql_identifier_if_needed
+from mcp_atlassian_with_bitbucket_and_privacy.confluence.constants import (
+    RESERVED_CQL_WORDS,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.confluence.utils import (
+    quote_cql_identifier_if_needed,
+)
 
 
 class TestCQLQuoting:

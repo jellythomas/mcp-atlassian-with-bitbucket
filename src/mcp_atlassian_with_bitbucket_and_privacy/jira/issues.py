@@ -1,0 +1,2210 @@
+"""Module for Jira issue operations."""
+
+import json
+import logging
+import time
+from collections import defaultdict
+from typing import Any
+
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import HTTPError
+
+from ..exceptions import MCPAtlassianAuthenticationError
+from ..models.jira import JiraIssue
+from ..models.jira.adf import merge_adf_with_preserved_media
+from ..models.jira.common import JiraChangelog
+from ..privacy.runtime import is_identity_privacy_runtime_active
+from ..utils import parse_date
+from .client import JiraClient
+from .constants import DEFAULT_READ_JIRA_FIELDS
+from .protocols import (
+    AttachmentsOperationsProto,
+    EpicOperationsProto,
+    FieldsOperationsProto,
+    FormsOperationsProto,
+    IssueOperationsProto,
+    ProjectsOperationsProto,
+    UsersOperationsProto,
+)
+
+logger = logging.getLogger("mcp-jira")
+
+# Friendly aliases that users may pass for the epic link custom field
+_EPIC_LINK_ALIASES = frozenset({"epickey", "epic_link", "epiclink", "epic link"})
+_EPIC_NAME_FIELD_SCHEMA = "com.pyxis.greenhopper.jira:gh-epic-label"
+
+
+def _privacy_issue_expand(expand: str | None) -> str | None:
+    if not is_identity_privacy_runtime_active():
+        return expand
+    values = [value.strip() for value in (expand or "").split(",") if value.strip()]
+    for required in ("names", "schema"):
+        if required not in values:
+            values.append(required)
+    return ",".join(values)
+
+
+def _privacy_issue_metadata_kwargs() -> dict[str, str]:
+    expand = _privacy_issue_expand(None)
+    return {"expand": expand} if expand is not None else {}
+
+
+class IssuesMixin(
+    JiraClient,
+    AttachmentsOperationsProto,
+    EpicOperationsProto,
+    FieldsOperationsProto,
+    FormsOperationsProto,
+    IssueOperationsProto,
+    ProjectsOperationsProto,
+    UsersOperationsProto,
+):
+    """Mixin for Jira issue operations."""
+
+    def _preserve_cloud_description_media(
+        self,
+        issue_key: str,
+        description_adf: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Preserve existing Cloud description media during Markdown rewrites."""
+        try:
+            issue_data = self.jira.get(
+                f"rest/api/3/issue/{issue_key}",
+                params={"fields": "description", "updateHistory": "false"},
+            )
+            if not isinstance(issue_data, dict):
+                return description_adf
+
+            issue_fields = issue_data.get("fields")
+            if not isinstance(issue_fields, dict):
+                return description_adf
+
+            current_description = issue_fields.get("description")
+            if not isinstance(current_description, dict):
+                return description_adf
+
+            return merge_adf_with_preserved_media(
+                target_adf=description_adf,
+                source_adf=current_description,
+            )
+        except (HTTPError, OSError, TypeError, ValueError) as exc:
+            logger.warning(
+                "Failed to preserve existing Jira media nodes for %s: %s",
+                issue_key,
+                exc,
+            )
+            return description_adf
+
+    def get_issue(
+        self,
+        issue_key: str,
+        expand: str | None = None,
+        comment_limit: int | str | None = 10,
+        fields: str | list[str] | tuple[str, ...] | set[str] | None = None,
+        properties: str | list[str] | None = None,
+        update_history: bool = True,
+    ) -> JiraIssue:
+        """
+        Get a Jira issue by key.
+
+        Args:
+            issue_key: The issue key (e.g., PROJECT-123)
+            expand: Fields to expand in the response
+            comment_limit: Maximum number of comments to include, or "all"
+            fields: Fields to return (comma-separated string, list, tuple, set, or "*all")
+            properties: Issue properties to return (comma-separated string or list)
+            update_history: Whether to update the issue view history
+
+        Returns:
+            JiraIssue model with issue data and metadata
+
+        Raises:
+            MCPAtlassianAuthenticationError: If authentication fails with the Jira API (401/403)
+            Exception: If there is an error retrieving the issue
+        """
+        try:
+            # Obtain the projects filter from the config.
+            # These should NOT be overridden by the request.
+            filter_to_use = self.config.projects_filter
+
+            # Apply projects filter if present
+            if filter_to_use:
+                # Split projects filter by commas and handle possible whitespace
+                projects = [p.strip() for p in filter_to_use.split(",")]
+
+                # Obtain the project key from issue_key
+                issue_key_project = issue_key.split("-")[0]
+
+                if issue_key_project not in projects:
+                    # If the project key not in the filter, return an empty issue
+                    msg = (
+                        "Issue with project prefix "
+                        f"'{issue_key_project}' are restricted by configuration"
+                    )
+                    raise ValueError(msg)
+
+            # Determine fields_param: use provided fields or default from constant
+            fields_param = fields
+            if fields_param is None:
+                fields_param = ",".join(sorted(DEFAULT_READ_JIRA_FIELDS))
+            elif isinstance(fields_param, list | tuple | set):
+                fields_param = ",".join(fields_param)
+
+            # Compare as sets to avoid hash randomization issues across processes
+            fields_set = (
+                set(fields_param.split(",")) if fields_param != "*all" else None
+            )
+            if fields_set == DEFAULT_READ_JIRA_FIELDS:
+                # Default fields are being used - preserve the order
+                default_fields_list = fields_param.split(",")
+                additional_fields = []
+
+                # Add appropriate fields based on expand parameter
+                if expand:
+                    expand_params = expand.split(",")
+                    if (
+                        "changelog" in expand_params
+                        and "changelog" not in default_fields_list
+                        and "changelog" not in additional_fields
+                    ):
+                        additional_fields.append("changelog")
+                    if (
+                        "renderedFields" in expand_params
+                        and "rendered" not in default_fields_list
+                        and "rendered" not in additional_fields
+                    ):
+                        additional_fields.append("rendered")
+
+                # Add appropriate fields based on properties parameter
+                if (
+                    properties
+                    and "properties" not in default_fields_list
+                    and "properties" not in additional_fields
+                ):
+                    additional_fields.append("properties")
+
+                comment_limit_int = self._normalize_comment_limit(comment_limit)
+                if (
+                    (comment_limit_int is None or comment_limit_int > 0)
+                    and "comment" not in default_fields_list
+                    and "comment" not in additional_fields
+                ):
+                    additional_fields.append("comment")
+
+                # Combine default fields with additional fields, preserving order
+                if additional_fields:
+                    fields_param = ",".join(default_fields_list + additional_fields)
+            # Handle non-default fields string
+
+            # Build expand parameter if provided
+            expand_param = _privacy_issue_expand(expand)
+
+            # Convert properties to proper format if it's a list
+            properties_param: str | None = None
+            if isinstance(properties, str):
+                properties_param = properties
+            elif isinstance(properties, list | tuple | set):
+                properties_param = ",".join(properties)
+
+            # Get the issue data with all parameters
+            issue = self.jira.get_issue(
+                issue_key,
+                expand=expand_param,
+                fields=fields_param,
+                properties=properties_param,
+                update_history=update_history,
+            )
+            if not issue:
+                msg = (
+                    f"Issue {issue_key} not found. "
+                    "Verify the issue key and project access."
+                )
+                raise ValueError(msg)
+            if not isinstance(issue, dict):
+                msg = (
+                    f"Unexpected return value type from `jira.get_issue`: {type(issue)}"
+                )
+                logger.error(msg)
+                raise TypeError(msg)
+
+            # Extract fields data, safely handling None
+            fields_data = issue.get("fields", {}) or {}
+
+            # Clean description field (convert Jira wiki markup to Markdown)
+            # Note: ADF format (dict) is handled in the model layer
+            if "description" in fields_data:
+                raw_description = fields_data["description"]
+                # Only clean string descriptions (wiki markup)
+                # Dict descriptions (ADF) are handled by the model
+                if isinstance(raw_description, str) and raw_description:
+                    fields_data["description"] = self._clean_text(raw_description)
+
+            # Get comments if needed
+            if "comment" in fields_data:
+                comment_limit_int = self._normalize_comment_limit(comment_limit)
+                comments = self._get_issue_comments_if_needed(
+                    issue_key, comment_limit_int
+                )
+                # Add comments to the issue data for processing by the model
+                fields_data["comment"]["comments"] = comments
+
+            # Clean comment bodies (convert Jira wiki markup/HTML to Markdown)
+            # Must happen AFTER _get_issue_comments_if_needed which may replace comments
+            if "comment" in fields_data and isinstance(fields_data["comment"], dict):
+                comments_list = fields_data["comment"].get("comments", [])
+                if isinstance(comments_list, list):
+                    for comment in comments_list:
+                        if isinstance(comment, dict) and "body" in comment:
+                            raw_body = comment["body"]
+                            # Only clean string bodies (wiki markup/HTML)
+                            # Dict bodies (ADF) are handled by the model
+                            if isinstance(raw_body, str) and raw_body:
+                                comment["body"] = self._clean_text(raw_body)
+
+            # Extract epic information
+            try:
+                epic_info = self._extract_epic_information(issue)
+            except Exception as e:
+                logger.warning(f"Error extracting epic information: {str(e)}")
+                epic_info = {"epic_key": None, "epic_name": None}
+
+            # If this is linked to an epic, add the epic information to the fields
+            if epic_info.get("epic_key"):
+                try:
+                    # Get field IDs for epic fields
+                    field_ids = self.get_field_ids_to_epic()
+
+                    # Add epic link field if it doesn't exist
+                    if (
+                        "epic_link" in field_ids
+                        and field_ids["epic_link"] not in fields_data
+                    ):
+                        fields_data[field_ids["epic_link"]] = epic_info["epic_key"]
+
+                    # Add epic name field if it doesn't exist
+                    if (
+                        epic_info.get("epic_name")
+                        and "epic_name" in field_ids
+                        and field_ids["epic_name"] not in fields_data
+                    ):
+                        fields_data[field_ids["epic_name"]] = epic_info["epic_name"]
+                except Exception as e:
+                    logger.warning(f"Error setting epic fields: {str(e)}")
+
+            # Update the issue data with the fields
+            issue["fields"] = fields_data
+
+            # Create and return the JiraIssue model, passing requested_fields
+            model_fields = "*all" if fields == "*all" else fields_param
+            return JiraIssue.from_api_response(
+                issue,
+                base_url=self.config.url if hasattr(self, "config") else None,
+                requested_fields=model_fields,
+            )
+        except HTTPError as http_err:
+            status_code = (
+                http_err.response.status_code if http_err.response is not None else None
+            )
+            if status_code in [401, 403]:
+                error_msg = (
+                    f"Authentication failed for Jira API ({status_code}). "
+                    "Token may be expired or invalid. Please verify credentials."
+                )
+                logger.error(error_msg)
+                raise MCPAtlassianAuthenticationError(error_msg) from http_err
+            if status_code == 404:
+                error_msg = (
+                    f"Issue {issue_key} not found. "
+                    "Verify the issue key and project access."
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg) from http_err
+            if status_code == 429:
+                from mcp_atlassian_with_bitbucket_and_privacy.utils.http import (
+                    format_rate_limit_error,
+                )
+
+                error_msg = format_rate_limit_error(http_err, service="Jira")
+                logger.error(error_msg)
+                raise ValueError(error_msg) from http_err
+            else:
+                logger.error(f"HTTP error during API call: {http_err}", exc_info=False)
+                raise
+        except RequestsConnectionError as e:
+            error_msg = (
+                f"Could not connect to Jira at {self.config.url}. "
+                "Check that JIRA_URL is correct and the instance is reachable."
+            )
+            logger.error(error_msg)
+            raise Exception(error_msg) from e
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error retrieving issue {issue_key}: {error_msg}")
+            raise Exception(f"Error retrieving issue {issue_key}: {error_msg}") from e
+
+    def _normalize_comment_limit(self, comment_limit: int | str | None) -> int | None:
+        """
+        Normalize the comment limit to an integer or None.
+
+        Args:
+            comment_limit: The comment limit as int, string, or None
+
+        Returns:
+            Normalized comment limit as int or None
+        """
+        if comment_limit is None:
+            return None
+
+        if isinstance(comment_limit, int):
+            return comment_limit
+
+        if comment_limit == "all":
+            return None  # No limit
+
+        # Try to convert to int
+        try:
+            return int(comment_limit)
+        except ValueError:
+            # If conversion fails, default to 10
+            return 10
+
+    def _get_issue_comments_if_needed(
+        self, issue_key: str, comment_limit: int | None
+    ) -> list[dict]:
+        """
+        Get comments for an issue if needed.
+
+        Args:
+            issue_key: The issue key
+            comment_limit: Maximum number of comments to include
+
+        Returns:
+            List of comments
+        """
+        if comment_limit is None or comment_limit > 0:
+            try:
+                response = self.jira.issue_get_comments(issue_key)
+                if not isinstance(response, dict):
+                    msg = f"Unexpected return value type from `jira.issue_get_comments`: {type(response)}"
+                    logger.error(msg)
+                    raise TypeError(msg)
+
+                comments = response["comments"]
+
+                # Jira returns comments oldest-first; keep the newest comments.
+                if comment_limit is not None:
+                    comments = comments[-comment_limit:]
+
+                return comments
+            except Exception as e:
+                logger.warning(f"Error getting comments for {issue_key}: {str(e)}")
+                return []
+        return []
+
+    def _extract_epic_information(self, issue: dict) -> dict[str, str | None]:
+        """
+        Extract epic information from an issue.
+
+        Args:
+            issue: The issue data
+
+        Returns:
+            Dictionary with epic information
+        """
+        # Initialize with default values
+        epic_info = {
+            "epic_key": None,
+            "epic_name": None,
+            "epic_summary": None,
+            "is_epic": False,
+        }
+
+        try:
+            fields = issue.get("fields", {}) or {}
+            issue_type = fields.get("issuetype", {}).get("name", "").lower()
+
+            # Get field IDs for epic fields
+            try:
+                field_ids = self.get_field_ids_to_epic()
+            except Exception as e:
+                logger.warning(f"Error getting Jira fields: {str(e)}")
+                field_ids = {}
+
+            # Check if this is an epic
+            if issue_type == "epic":
+                epic_info["is_epic"] = True
+
+                # Use the discovered field ID for epic name
+                if "epic_name" in field_ids and field_ids["epic_name"] in fields:
+                    epic_info["epic_name"] = fields.get(field_ids["epic_name"], "")
+
+            # If not an epic, check for epic link
+            elif "epic_link" in field_ids:
+                epic_link_field = field_ids["epic_link"]
+
+                if epic_link_field in fields and fields[epic_link_field]:
+                    epic_key = fields[epic_link_field]
+                    epic_info["epic_key"] = epic_key
+
+                    # Try to get epic details
+                    try:
+                        epic = self.jira.get_issue(
+                            epic_key,
+                            expand=None,
+                            fields=None,
+                            properties=None,
+                            update_history=True,
+                        )
+                        if not isinstance(epic, dict):
+                            msg = f"Unexpected return value type from `jira.get_issue`: {type(epic)}"
+                            logger.error(msg)
+                            raise TypeError(msg)
+
+                        epic_fields = epic.get("fields", {}) or {}
+
+                        # Get epic name using the discovered field ID
+                        if "epic_name" in field_ids:
+                            epic_info["epic_name"] = epic_fields.get(
+                                field_ids["epic_name"], ""
+                            )
+
+                        epic_info["epic_summary"] = epic_fields.get("summary", "")
+                    except Exception as e:
+                        logger.warning(
+                            f"Error getting epic details for {epic_key}: {str(e)}"
+                        )
+        except Exception as e:
+            logger.warning(f"Error extracting epic information: {str(e)}")
+
+        return epic_info
+
+    def _format_issue_content(
+        self,
+        issue_key: str,
+        issue: dict,
+        description: str,
+        comments: list[dict],
+        created_date: str,
+        epic_info: dict[str, str | None],
+    ) -> str:
+        """
+        Format issue content for display.
+
+        Args:
+            issue_key: The issue key
+            issue: The issue data
+            description: The issue description
+            comments: The issue comments
+            created_date: The formatted creation date
+            epic_info: Epic information
+
+        Returns:
+            Formatted issue content
+        """
+        fields = issue.get("fields", {})
+
+        # Basic issue information
+        summary = fields.get("summary", "")
+        status = fields.get("status", {}).get("name", "")
+        issue_type = fields.get("issuetype", {}).get("name", "")
+
+        # Format content
+        content = [f"# {issue_key}: {summary}"]
+        content.append(f"**Type**: {issue_type}")
+        content.append(f"**Status**: {status}")
+        content.append(f"**Created**: {created_date}")
+
+        # Add reporter
+        reporter = fields.get("reporter", {})
+        reporter_name = reporter.get("displayName", "") or reporter.get("name", "")
+        if reporter_name:
+            content.append(f"**Reporter**: {reporter_name}")
+
+        # Add assignee
+        assignee = fields.get("assignee", {})
+        assignee_name = assignee.get("displayName", "") or assignee.get("name", "")
+        if assignee_name:
+            content.append(f"**Assignee**: {assignee_name}")
+
+        # Add epic information
+        if epic_info["is_epic"]:
+            content.append(f"**Epic Name**: {epic_info['epic_name']}")
+        elif epic_info["epic_key"]:
+            content.append(
+                f"**Epic**: [{epic_info['epic_key']}] {epic_info['epic_summary']}"
+            )
+
+        # Add description
+        if description:
+            content.append("\n## Description\n")
+            content.append(description)
+
+        # Add comments
+        if comments:
+            content.append("\n## Comments\n")
+            for comment in comments:
+                author = comment.get("author", {})
+                author_name = author.get("displayName", "") or author.get("name", "")
+                comment_body = self._clean_text(comment.get("body", ""))
+
+                if author_name and comment_body:
+                    comment_date = comment.get("created", "")
+                    if comment_date:
+                        comment_date = parse_date(comment_date)
+                        content.append(f"**{author_name}** ({comment_date}):")
+                    else:
+                        content.append(f"**{author_name}**:")
+
+                    content.append(f"{comment_body}\n")
+
+        return "\n".join(content)
+
+    def _create_issue_metadata(
+        self,
+        issue_key: str,
+        issue: dict,
+        comments: list[dict],
+        created_date: str,
+        epic_info: dict[str, str | None],
+    ) -> dict[str, Any]:
+        """
+        Create metadata for a Jira issue.
+
+        Args:
+            issue_key: The issue key
+            issue: The issue data
+            comments: The issue comments
+            created_date: The formatted creation date
+            epic_info: Epic information
+
+        Returns:
+            Metadata dictionary
+        """
+        fields = issue.get("fields", {})
+
+        # Initialize metadata
+        metadata = {
+            "key": issue_key,
+            "title": fields.get("summary", ""),
+            "status": fields.get("status", {}).get("name", ""),
+            "type": fields.get("issuetype", {}).get("name", ""),
+            "created": created_date,
+            "url": f"{self.config.url}/browse/{issue_key}",
+        }
+
+        # Add assignee if available
+        assignee = fields.get("assignee", {})
+        if assignee:
+            metadata["assignee"] = assignee.get("displayName", "") or assignee.get(
+                "name", ""
+            )
+
+        # Add epic information
+        if epic_info["is_epic"]:
+            metadata["is_epic"] = True
+            metadata["epic_name"] = epic_info["epic_name"]
+        elif epic_info["epic_key"]:
+            metadata["epic_key"] = epic_info["epic_key"]
+            metadata["epic_name"] = epic_info["epic_name"]
+            metadata["epic_summary"] = epic_info["epic_summary"]
+
+        # Add comment count
+        metadata["comment_count"] = len(comments)
+
+        return metadata
+
+    def create_issue(
+        self,
+        project_key: str,
+        summary: str,
+        issue_type: str,
+        description: str = "",
+        assignee: str | None = None,
+        components: list[str] | None = None,
+        **kwargs: Any,  # noqa: ANN401 - Dynamic field types are necessary for Jira API
+    ) -> JiraIssue:
+        """
+        Create a new Jira issue.
+
+        Args:
+            project_key: The key of the project
+            summary: The issue summary
+            issue_type: The type of issue to create
+            description: The issue description
+            assignee: The username or account ID of the assignee
+            components: List of component names to assign (e.g., ["Frontend", "API"])
+            **kwargs: Additional fields to set on the issue
+
+        Returns:
+            JiraIssue model representing the created issue
+
+        Raises:
+            Exception: If there is an error creating the issue
+        """
+        try:
+            # Validate required fields
+            if not project_key:
+                raise ValueError(
+                    "Project key is required to create an issue. "
+                    "Provide project_key like 'PROJ'."
+                )
+            if not summary:
+                raise ValueError(
+                    "Summary is required to create an issue. "
+                    "Provide a non-empty summary."
+                )
+            if not issue_type:
+                raise ValueError(
+                    "Issue type is required to create an issue. "
+                    "Provide issue_type like 'Task', 'Story', or 'Bug'."
+                )
+
+            # Handle Epic and Subtask issue type names across different languages
+            actual_issue_id = None
+            if self._is_epic_issue_type(issue_type) and issue_type.lower() == "epic":
+                # If the user provided "Epic" but we need to find the localized name
+                epic_type_id = self._find_epic_issue_type_id(project_key)
+                if epic_type_id:
+                    actual_issue_id = epic_type_id
+                    logger.info(f"Using localized Epic issue type id: {epic_type_id}")
+            elif self._normalize_issue_type_name(issue_type) == "subtask":
+                # If the user provided "Subtask" but we need to find the localized name
+                subtask_type_id = self._find_subtask_issue_type_id(project_key)
+                if subtask_type_id:
+                    actual_issue_id = subtask_type_id
+                    logger.info(
+                        f"Using localized Subtask issue type id: {subtask_type_id}"
+                    )
+
+            # Prepare fields
+            fields: dict[str, Any] = {
+                "project": {"key": project_key},
+                "summary": summary,
+                "issuetype": {"name": issue_type}
+                if actual_issue_id is None
+                else {"id": actual_issue_id, "name": issue_type},
+            }
+
+            # Add description if provided (convert from Markdown to Jira format)
+            if description:
+                fields["description"] = self._markdown_to_jira(description)
+
+            # Resolve and set assignee in the create fields, and also store
+            # the identifier for a post-creation assign_issue() call.
+            # Some Jira Server/DC configurations silently ignore the assignee
+            # field during creation, so the post-creation call acts as a safety
+            # net (similar to the epic two-step pattern).
+            assignee_identifier = None
+            if assignee:
+                try:
+                    assignee_identifier = self._get_account_id(assignee)
+                    self._add_assignee_to_fields(fields, assignee_identifier)
+                except ValueError as e:
+                    logger.warning(f"Could not resolve assignee: {str(e)}")
+
+            # Add components if provided
+            if components:
+                if isinstance(components, list):
+                    # Filter out any None or empty/whitespace-only strings
+                    valid_components = [
+                        comp_name.strip()
+                        for comp_name in components
+                        if isinstance(comp_name, str) and comp_name.strip()
+                    ]
+                    if valid_components:
+                        # Format as list of {"name": ...} dicts for the API
+                        fields["components"] = [
+                            {"name": comp_name} for comp_name in valid_components
+                        ]
+
+            # Resolve epic link aliases (epicKey, epic_link, etc.) before
+            # kwargs_copy so the alias is not double-processed.
+            self._prepare_epic_link_fields(fields, kwargs)
+
+            # Make a copy of kwargs to preserve original values for two-step Epic creation
+            kwargs_copy = kwargs.copy()
+
+            # Prepare epic fields if this is an epic
+            # This step now stores epic-specific fields in kwargs for post-creation update
+            if self._is_epic_issue_type(issue_type):
+                self._prepare_epic_fields(fields, summary, kwargs)
+
+            # Prepare parent field if this is a subtask
+            if issue_type.lower() == "subtask" or issue_type.lower() == "sub-task":
+                self._prepare_parent_fields(fields, kwargs)
+            # Allow parent field for all issue types when explicitly provided
+            elif "parent" in kwargs:
+                self._prepare_parent_fields(fields, kwargs)
+
+            # Process **kwargs using the dynamic field map
+            self._process_additional_fields(fields, kwargs_copy)
+
+            # Create the issue (use v3 API on Cloud for any ADF field)
+            has_adf = self._contains_adf_document(fields)
+            if has_adf and self.config.is_cloud:
+                response = self._post_api3("issue", {"fields": fields})
+            else:
+                response = self.jira.create_issue(fields=fields)
+            if not isinstance(response, dict):
+                msg = f"Unexpected return value type from `jira.create_issue`: {type(response)}"
+                logger.error(msg)
+                raise TypeError(msg)
+
+            # Get the created issue key
+            issue_key = response.get("key")
+            if not issue_key:
+                error_msg = "No issue key in response"
+                raise ValueError(error_msg)
+
+            # Assign the issue post-creation using the dedicated API endpoint
+            if assignee_identifier:
+                try:
+                    self.jira.assign_issue(issue_key, assignee_identifier)
+                except Exception as e:
+                    logger.warning(
+                        f"Could not assign issue {issue_key} to {assignee}: {e}"
+                    )
+
+            # For Epics, perform the second step: update Epic-specific fields
+            if self._is_epic_issue_type(issue_type):
+                # Check if we have any stored Epic fields to update
+                has_epic_fields = any(k.startswith("__epic_") for k in kwargs)
+                if has_epic_fields:
+                    logger.info(
+                        f"Performing post-creation update for Epic {issue_key} with Epic-specific fields"
+                    )
+                    try:
+                        return self.update_epic_fields(issue_key, kwargs)
+                    except Exception as update_error:
+                        logger.error(
+                            f"Error during post-creation update of Epic {issue_key}: {str(update_error)}"
+                        )
+                        logger.info(
+                            "Continuing with the original Epic that was successfully created"
+                        )
+
+            # Get the full issue data and convert to JiraIssue model
+            issue_data = self.jira.get_issue(
+                issue_key,
+                **_privacy_issue_metadata_kwargs(),
+            )
+            if not isinstance(issue_data, dict):
+                msg = f"Unexpected return value type from `jira.get_issue`: {type(issue_data)}"
+                logger.error(msg)
+                raise TypeError(msg)
+            return JiraIssue.from_api_response(issue_data)
+
+        except Exception as e:
+            self._handle_create_issue_error(e, issue_type)
+            raise  # Re-raise after logging
+
+    def _is_epic_issue_type(self, issue_type: str) -> bool:
+        """
+        Check if an issue type is an Epic, handling localized names.
+
+        Args:
+            issue_type: The issue type name to check
+
+        Returns:
+            True if the issue type is an Epic, False otherwise
+        """
+        # Common Epic names in different languages
+        epic_names = {
+            "epic",  # English
+            "에픽",  # Korean
+            "エピック",  # Japanese
+            "史诗",  # Chinese (Simplified)
+            "史詩",  # Chinese (Traditional)
+            "épica",  # Spanish/Portuguese
+            "épique",  # French
+            "epik",  # Turkish
+            "эпик",  # Russian
+            "епік",  # Ukrainian
+        }
+
+        return issue_type.lower() in epic_names or "epic" in issue_type.lower()
+
+    def _find_epic_issue_type_id(self, project_key: str) -> str | None:
+        """Find the Epic issue type ID for a project.
+
+        Args:
+            project_key: The project key
+
+        Returns:
+            The Epic issue type ID if found, None otherwise
+        """
+        try:
+            issue_types = self.get_project_issue_types(project_key)
+            # First pass: prefer exact match on "Epic" (case-insensitive)
+            for issue_type in issue_types:
+                type_name = issue_type.get("name", "")
+                if type_name.lower() == "epic":
+                    type_id = issue_type.get("id")
+                    return str(type_id) if type_id is not None else None
+
+            # Second pass: identify the type structurally from its create fields.
+            # Jira Server/DC localizes issue type names but keeps the GreenHopper
+            # Epic Name field schema stable.
+            for issue_type in issue_types:
+                if issue_type.get("subtask") is True:
+                    continue
+                type_id = issue_type.get("id")
+                if type_id is None:
+                    continue
+                type_id_str = str(type_id)
+                create_fields = self.get_create_fields(project_key, type_id_str)
+                for field in create_fields:
+                    schema = field.get("schema", {})
+                    if (
+                        isinstance(schema, dict)
+                        and schema.get("custom") == _EPIC_NAME_FIELD_SCHEMA
+                    ):
+                        return type_id_str
+
+            # Final pass: retain the existing localized-name heuristic when
+            # create metadata is unavailable (for example, some Cloud projects).
+            for issue_type in issue_types:
+                type_name = issue_type.get("name", "")
+                if self._is_epic_issue_type(type_name):
+                    type_id = issue_type.get("id")
+                    return str(type_id) if type_id is not None else None
+            return None
+        except Exception as e:
+            logger.warning(f"Could not get issue types for project {project_key}: {e}")
+            return None
+
+    def _normalize_issue_type_name(self, issue_type: str) -> str:
+        """
+        Normalize an issue type name for comparison.
+
+        Args:
+            issue_type: The issue type name to normalize
+
+        Returns:
+            Normalized issue type name
+        """
+        return issue_type.lower().replace("-", "").replace(" ", "")
+
+    def _find_subtask_issue_type_id(self, project_key: str) -> str | None:
+        """
+        Find the best matching subtask issue type id for a project.
+
+        Args:
+            project_key: The project key
+
+        Returns:
+            The best matching subtask issue type id if found, None otherwise
+        """
+        try:
+            issue_types = self.get_project_issue_types(project_key)
+
+            # Prefer a server-returned subtask issue type name that
+            # normalizes to "subtask" before falling back.
+            for issue_type in issue_types:
+                type_name = issue_type.get("name", "")
+                if (
+                    issue_type.get("subtask", False)
+                    and self._normalize_issue_type_name(type_name) == "subtask"
+                ):
+                    return issue_type.get("id")
+
+            # Final fallback: first available subtask-capable issue type.
+            for issue_type in issue_types:
+                if issue_type.get("subtask", False):
+                    return issue_type.get("id")
+            return None
+        except Exception as e:
+            logger.warning(f"Could not get issue types for project {project_key}: {e}")
+            return None
+
+    def _prepare_epic_fields(
+        self, fields: dict[str, Any], summary: str, kwargs: dict[str, Any]
+    ) -> None:
+        """
+        Prepare fields for epic creation.
+
+        This method delegates to the prepare_epic_fields method in EpicsMixin.
+
+        Args:
+            fields: The fields dictionary to update
+            summary: The epic summary
+            kwargs: Additional fields from the user
+        """
+        # Extract project_key from fields if available
+        project_key = None
+        if "project" in fields:
+            if isinstance(fields["project"], dict):
+                project_key = fields["project"].get("key")
+            elif isinstance(fields["project"], str):
+                project_key = fields["project"]
+
+        # Delegate to EpicsMixin.prepare_epic_fields with project_key
+        # Since JiraFetcher inherits from both IssuesMixin and EpicsMixin,
+        # this will correctly use the prepare_epic_fields method from EpicsMixin
+        # which implements the two-step Epic creation approach
+        if not isinstance(project_key, str) or not project_key:
+            raise ValueError("Project key is required for epic preparation")
+        self.prepare_epic_fields(fields, summary, kwargs, project_key)
+
+    def _prepare_parent_fields(
+        self, fields: dict[str, Any], kwargs: dict[str, Any]
+    ) -> None:
+        """
+        Prepare fields for parent relationship.
+
+        Args:
+            fields: The fields dictionary to update
+            kwargs: Additional fields from the user
+
+        Raises:
+            ValueError: If parent issue key is not specified for a subtask
+        """
+        if "parent" in kwargs:
+            parent_key = kwargs.get("parent")
+            if parent_key:
+                fields["parent"] = {"key": parent_key}
+            # Remove parent from kwargs to avoid double processing
+            kwargs.pop("parent", None)
+        elif "issuetype" in fields and fields["issuetype"]["name"].lower() in (
+            "subtask",
+            "sub-task",
+        ):
+            # Only raise error if issue type is subtask and parent is missing
+            raise ValueError(
+                "Issue type is a sub-task but parent issue key or id not specified. Please provide a 'parent' parameter with the parent issue key."
+            )
+
+    def _prepare_epic_link_fields(
+        self, fields: dict[str, Any], kwargs: dict[str, Any]
+    ) -> None:
+        """Resolve epic link aliases (epicKey, epic_link, etc.) to the actual custom field ID.
+
+        Checks kwargs for known epic link aliases, discovers the real
+        custom field ID via ``get_field_ids_to_epic()``, and sets it in
+        *fields*.  On Cloud, falls back to the ``parent`` field when no
+        epic link custom field is discovered (team-managed projects use
+        parent for epic relationships).
+
+        Args:
+            fields: The issue fields dict (mutated in place).
+            kwargs: Caller-provided keyword arguments (matched alias is popped).
+        """
+        epic_key_value = None
+        matched_alias = None
+        for key in list(kwargs.keys()):
+            if key.lower() in _EPIC_LINK_ALIASES:
+                epic_key_value = kwargs.pop(key)
+                matched_alias = key
+                break
+
+        if not epic_key_value:
+            return
+
+        # Discover the epic link custom field ID
+        try:
+            field_ids = self.get_field_ids_to_epic()
+            epic_link_field_id = field_ids.get("epic_link")
+        except Exception as e:
+            logger.debug(f"Could not discover epic link field: {e}")
+            epic_link_field_id = None
+
+        if epic_link_field_id:
+            fields[epic_link_field_id] = epic_key_value
+            logger.info(
+                f"Set epic link field {epic_link_field_id}={epic_key_value} "
+                f"from alias '{matched_alias}'"
+            )
+        elif self.config.is_cloud and "parent" not in fields:
+            fields["parent"] = {"key": epic_key_value}
+            logger.info(
+                f"No epic link field found, using parent field for "
+                f"epic link '{epic_key_value}' (Cloud fallback)"
+            )
+        else:
+            logger.warning(
+                f"Could not resolve epic link alias '{matched_alias}'="
+                f"{epic_key_value}. No epic link custom field discovered. "
+                f"Try using the exact custom field ID (e.g., customfield_10014)."
+            )
+
+    def _validate_parent_clear_supported(self, value: Any) -> None:
+        """Reject parent clearing on Jira Server/Data Center.
+
+        Jira Cloud accepts ``{"parent": null}`` for clearing a parent. Jira
+        Server/Data Center rejects the same request shape, so users must
+        update the Epic Link custom field directly instead.
+
+        Args:
+            value: The requested parent value.
+
+        Raises:
+            ValueError: If the value requests a parent clear on Server/DC.
+        """
+        if (value is None or value == "") and not self.config.is_cloud:
+            raise ValueError(
+                "Clearing an issue's parent with parent=None, parent='', or "
+                '{"parent": null} is supported only on Jira Cloud. Jira '
+                "Server/Data Center rejects this parent update format. To "
+                "clear an Epic Link on Server/DC, update its custom field "
+                'directly, for example {"customfield_10014": null}, using '
+                "the field ID returned by jira_search_fields."
+            )
+
+    def _add_assignee_to_fields(self, fields: dict[str, Any], assignee: str) -> None:
+        """
+        Add assignee to issue fields.
+
+        Args:
+            fields: The fields dictionary to update
+            assignee: The assignee account ID
+        """
+        # Cloud instance uses accountId
+        if self.config.is_cloud:
+            fields["assignee"] = {"accountId": assignee}
+        else:
+            # Server/DC might use name instead of accountId
+            fields["assignee"] = {"name": assignee}
+
+    def _process_additional_fields(
+        self, fields: dict[str, Any], kwargs: dict[str, Any]
+    ) -> None:
+        """
+        Processes keyword arguments to add standard or custom fields to the issue fields dictionary.
+        Uses the dynamic field map from FieldsMixin to identify field IDs.
+
+        Args:
+            fields: The fields dictionary to update
+            kwargs: Additional fields provided via **kwargs
+        """
+        # Ensure field map is loaded/cached
+        field_map = (
+            self._generate_field_map()
+        )  # Ensure map is ready (method from FieldsMixin)
+        if not field_map:
+            logger.error(
+                "Could not generate field map. Cannot process additional fields."
+            )
+            return
+
+        # Process each kwarg
+        # Iterate over a copy to allow modification of the original kwargs if needed elsewhere
+        for key, value in kwargs.copy().items():
+            # Skip fields handled explicitly in create_issue()/update_issue()
+            # (e.g., assignee requires account ID lookup via _get_account_id).
+            # Other array fields like components, fixVersions, etc. flow through
+            # _format_field_value_for_write() which handles their formatting.
+            if key.startswith("__epic_") or key in ("parent", "assignee"):
+                continue
+
+            normalized_key = key.lower()
+            api_field_id = None
+
+            # 1. Check if key is a known field name in the map
+            if normalized_key in field_map:
+                api_field_id = field_map[normalized_key]
+                logger.debug(
+                    f"Identified field '{key}' as '{api_field_id}' via name map."
+                )
+
+            # 2. Check if key is a direct custom field ID
+            elif key.startswith("customfield_"):
+                api_field_id = key
+                logger.debug(f"Identified field '{key}' as direct custom field ID.")
+
+            # 3. Check if key is a standard system field ID (like 'summary', 'priority')
+            elif key in field_map:  # Check original case for system fields
+                api_field_id = field_map[key]
+                logger.debug(f"Identified field '{key}' as standard system field ID.")
+
+            if api_field_id:
+                # Allow None values to pass through for clearing fields
+                if value is None:
+                    fields[api_field_id] = None
+                    logger.debug(
+                        f"Setting field '{api_field_id}' to None from kwarg '{key}' (clearing field)."
+                    )
+                    continue
+
+                # Get the full field definition for formatting context if needed
+                field_definition = self.get_field_by_id(
+                    api_field_id
+                )  # From FieldsMixin
+                formatted_value = self._format_field_value_for_write(
+                    api_field_id, value, field_definition
+                )
+                if formatted_value is not None:  # Only add if formatting didn't fail
+                    fields[api_field_id] = formatted_value
+                    logger.debug(
+                        f"Added field '{api_field_id}' from kwarg '{key}': {formatted_value}"
+                    )
+                else:
+                    logger.warning(
+                        f"Skipping field '{key}' due to formatting error or invalid value."
+                    )
+            else:
+                # 4. Unrecognized key - log a warning and skip
+                logger.warning(
+                    f"Ignoring unrecognized field '{key}' passed via kwargs."
+                )
+
+    def _handle_create_issue_error(self, exception: Exception, issue_type: str) -> None:
+        """
+        Handle errors when creating an issue.
+
+        Args:
+            exception: The exception that occurred
+            issue_type: The type of issue being created
+        """
+        error_msg = str(exception)
+
+        # Check for specific error types
+        if "epic name" in error_msg.lower() or "epicname" in error_msg.lower():
+            logger.error(
+                f"Error creating {issue_type}: {error_msg}. "
+                "Try specifying an epic_name in the additional fields"
+            )
+        elif "customfield" in error_msg.lower():
+            logger.error(
+                f"Error creating {issue_type}: {error_msg}. "
+                "This may be due to a required custom field"
+            )
+        else:
+            logger.error(f"Error creating {issue_type}: {error_msg}")
+
+    @staticmethod
+    def _contains_adf_document(fields: dict[str, Any]) -> bool:
+        """Check whether issue fields contain an Atlassian Document Format value.
+
+        Args:
+            fields: Issue fields prepared for a create or update request.
+
+        Returns:
+            True when a top-level field is an ADF document.
+        """
+        return any(
+            isinstance(value, dict)
+            and value.get("version") == 1
+            and value.get("type") == "doc"
+            for value in fields.values()
+        )
+
+    @staticmethod
+    def _normalize_return_fields(
+        return_fields: str | list[str] | tuple[str, ...] | set[str] | None,
+    ) -> str | None:
+        """Normalize a return-fields selector into a value for the Jira API.
+
+        Args:
+            return_fields: Fields to request on the post-update re-fetch as a
+                comma-separated string, a collection of field names, ``"*all"``,
+                or None.
+
+        Returns:
+            A comma-separated field string (or ``"*all"``) to pass to the Jira
+            API, or None to let the API return its default field set.
+        """
+        if return_fields is None:
+            return None
+        if isinstance(return_fields, list | tuple | set):
+            return ",".join(return_fields)
+        return return_fields
+
+    @staticmethod
+    def _merge_attachment_results(
+        first: dict[str, Any] | None, second: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Merge two attachment upload reports into a single one.
+
+        Path-based and in-memory uploads are independent sources that can be
+        used in the same call, but callers read one ``attachment_results``
+        entry, so their reports are combined.
+
+        Args:
+            first: Report of the first upload batch, or None
+            second: Report of the second upload batch, or None
+
+        Returns:
+            The combined report, or whichever side is not None
+        """
+        if not first:
+            return second
+        if not second:
+            return first
+
+        uploaded = list(first.get("uploaded", [])) + list(second.get("uploaded", []))
+        failed = list(first.get("failed", [])) + list(second.get("failed", []))
+        return {
+            "success": bool(uploaded),
+            "issue_key": first.get("issue_key") or second.get("issue_key"),
+            "total": first.get("total", 0) + second.get("total", 0),
+            "uploaded": uploaded,
+            "failed": failed,
+        }
+
+    def update_issue(
+        self,
+        issue_key: str,
+        fields: dict[str, Any] | None = None,
+        return_fields: str | list[str] | tuple[str, ...] | set[str] | None = None,
+        **kwargs: Any,  # noqa: ANN401 - Dynamic field types are necessary for Jira API
+    ) -> JiraIssue:
+        """
+        Update a Jira issue.
+
+        Args:
+            issue_key: The key of the issue to update
+            fields: Dictionary of fields to update
+            return_fields: Fields to include on the issue returned after the
+                update (comma-separated string, collection, or ``"*all"``).
+                None lets the API return its default field set. Narrowing this
+                reduces the size of the returned issue.
+            **kwargs: Additional fields to update. Special fields include:
+                - attachments: List of file paths to upload as attachments
+                - attachments_base64: List of dicts with 'filename' and
+                  'content' (bytes) keys, uploaded without reading from disk
+                - status: New status for the issue (handled via transitions)
+                - assignee: New assignee for the issue
+                - parent: Parent issue key (str or {"key": "..."} dict)
+                - epicKey/epic_link/epicLink: Epic link alias
+                Pass None to clear a field (e.g., priority=None).
+
+        Returns:
+            JiraIssue model representing the updated issue
+
+        Raises:
+            Exception: If there is an error updating the issue
+        """
+        try:
+            # Validate required fields
+            if not issue_key:
+                raise ValueError("Issue key is required")
+
+            return_fields_param = self._normalize_return_fields(return_fields)
+            update_fields = fields or {}
+            attachments_result = None
+            preserve_description_media = False
+
+            # Convert description from Markdown to Jira format if present
+            if "description" in update_fields and isinstance(
+                update_fields["description"], str
+            ):
+                preserve_description_media = bool(update_fields["description"].strip())
+                update_fields["description"] = self._markdown_to_jira(
+                    update_fields["description"]
+                )
+
+            # Resolve epic link aliases before processing kwargs
+            kwargs_mutable = dict(kwargs)
+            self._prepare_epic_link_fields(update_fields, kwargs_mutable)
+
+            # Jira Server/Data Center rejects the Cloud parent-clearing
+            # payload. Validate before any update or follow-up REST request.
+            if "parent" in kwargs_mutable:
+                self._validate_parent_clear_supported(kwargs_mutable["parent"])
+            elif "parent" in update_fields:
+                parent_value = update_fields["parent"]
+                self._validate_parent_clear_supported(parent_value)
+                if parent_value == "":
+                    update_fields["parent"] = None
+
+            # Process kwargs
+            for key, value in kwargs_mutable.items():
+                if key == "status":
+                    # Status changes are handled separately via transitions
+                    # Add status to fields so _update_issue_with_status can find it
+                    update_fields["status"] = value
+                    return self._update_issue_with_status(
+                        issue_key, update_fields, return_fields=return_fields
+                    )
+
+                elif key in ("attachments", "attachments_base64"):
+                    # Handled separately - they're not part of fields update.
+                    # Note both are skipped entirely when a "status" kwarg
+                    # returns above via _update_issue_with_status.
+                    if not value or not isinstance(value, list | tuple):
+                        logger.warning(f"Invalid {key} value: {value}")
+
+                elif key == "assignee":
+                    # Handle assignee updates, allow unassignment with None or empty string
+                    if value is None or value == "":
+                        update_fields["assignee"] = None
+                    elif isinstance(value, dict):
+                        # Caller already has a fully-shaped assignee — most
+                        # commonly the output of search_assignable_users /
+                        # get_user_profile. Forward it as-is without going
+                        # through _get_account_id: the lookup endpoints used
+                        # there (/user/search, /user/permission/search) need
+                        # the global "Browse Users" permission that many bot
+                        # accounts on hardened DC instances lack, and we
+                        # already have the canonical shape Jira wants.
+                        update_fields["assignee"] = value
+                    else:
+                        try:
+                            account_id = self._get_account_id(value)
+                            self._add_assignee_to_fields(update_fields, account_id)
+                        except ValueError as e:
+                            # An explicit assignee update that cannot be resolved
+                            # must fail loudly. Swallowing it here means the PUT is
+                            # skipped (or runs without the assignee) while the call
+                            # still reports the issue as updated successfully.
+                            raise ValueError(
+                                f"Could not update assignee: {str(e)}"
+                            ) from e
+                elif key == "parent":
+                    # Jira Cloud accepts an explicit null to clear the parent.
+                    if value is None or value == "":
+                        update_fields["parent"] = None
+                    elif isinstance(value, dict) and value.get("key"):
+                        update_fields["parent"] = {"key": str(value["key"])}
+                    elif isinstance(value, str) and value:
+                        update_fields["parent"] = {"key": value}
+                    else:
+                        logger.warning(
+                            f"Invalid parent value for issue {issue_key}: {value}"
+                        )
+                elif key == "description":
+                    # Handle description with markdown conversion
+                    preserve_description_media = isinstance(value, str) and bool(
+                        value.strip()
+                    )
+                    update_fields["description"] = self._markdown_to_jira(value)
+                else:
+                    # Process regular fields using _process_additional_fields
+                    # Create a temporary dict with just this field
+                    field_kwargs = {key: value}
+                    self._process_additional_fields(update_fields, field_kwargs)
+
+            # Update the issue fields (use v3 API on Cloud for any ADF field)
+            if update_fields:
+                has_adf = self._contains_adf_document(update_fields)
+                if has_adf and self.config.is_cloud:
+                    if preserve_description_media:
+                        update_fields["description"] = (
+                            self._preserve_cloud_description_media(
+                                issue_key=issue_key,
+                                description_adf=update_fields["description"],
+                            )
+                        )
+                    self._put_api3(
+                        f"issue/{issue_key}",
+                        {"fields": update_fields},
+                    )
+                else:
+                    self.jira.update_issue(
+                        issue_key=issue_key, update={"fields": update_fields}
+                    )
+
+            # Handle attachments if provided
+            if "attachments" in kwargs and kwargs["attachments"]:
+                try:
+                    attachments_result = self.upload_attachments(
+                        issue_key, kwargs["attachments"]
+                    )
+                    logger.info(
+                        f"Uploaded attachments to {issue_key}: {attachments_result}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Error uploading attachments to {issue_key}: {str(e)}"
+                    )
+                    # Continue with the update even if attachments fail
+
+            # Handle in-memory attachments if provided. Both sources are
+            # additive, so their results are merged into a single report.
+            if "attachments_base64" in kwargs and kwargs["attachments_base64"]:
+                try:
+                    content_result = self.upload_attachments_from_content(
+                        issue_key, kwargs["attachments_base64"]
+                    )
+                    logger.info(
+                        f"Uploaded in-memory attachments to {issue_key}: "
+                        f"{content_result}"
+                    )
+                    attachments_result = self._merge_attachment_results(
+                        attachments_result, content_result
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Error uploading in-memory attachments to "
+                        f"{issue_key}: {str(e)}"
+                    )
+                    # Continue with the update even if attachments fail
+
+            # Get the updated issue data and convert to JiraIssue model
+            issue_data = self.jira.get_issue(
+                issue_key,
+                fields=return_fields_param,
+                **_privacy_issue_metadata_kwargs(),
+            )
+            if isinstance(issue_data, str):
+                # atlassian-python-api can return a string on Jira Server/DC
+                # when response.json() fails. Try parsing it as JSON first.
+                try:
+                    issue_data = json.loads(issue_data)
+                except (ValueError, TypeError):
+                    logger.warning(
+                        f"get_issue returned a string for {issue_key}, "
+                        f"re-fetching via direct GET"
+                    )
+                    issue_data = self.jira.get(
+                        self.jira.resource_url("issue/" + issue_key)
+                    )
+            if not isinstance(issue_data, dict):
+                msg = (
+                    f"Unexpected return value type from `jira.get_issue`: "
+                    f"{type(issue_data)}"
+                )
+                logger.error(msg)
+                raise TypeError(msg)
+            issue = JiraIssue.from_api_response(
+                issue_data, requested_fields=return_fields_param
+            )
+
+            # Add attachment results to the response if available
+            if attachments_result:
+                issue.custom_fields["attachment_results"] = attachments_result
+
+            return issue
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error updating issue {issue_key}: {error_msg}")
+            raise ValueError(f"Failed to update issue {issue_key}: {error_msg}") from e
+
+    def assign_issue(
+        self,
+        issue_key: str,
+        assignee: str | dict[str, Any] | None,
+    ) -> JiraIssue:
+        """
+        Assign a Jira issue to a user using the dedicated assignment endpoint.
+
+        Unlike update_issue (which sets assignee via the fields update and is
+        silently ignored by some Jira configurations), this method calls
+        PUT /rest/api/3/issue/{key}/assignee directly.
+
+        Pass None or empty string to unassign.
+
+        Args:
+            issue_key: The key of the issue to assign (e.g., 'PROJ-123')
+            assignee: User identifier (email, display name, or account ID), or a
+                resolved user dict containing ``accountId``/``account_id`` for
+                Cloud or ``name``/``username``/``key`` for Server/DC. Pass None
+                or "" to unassign.
+
+        Returns:
+            JiraIssue model representing the updated issue
+
+        Raises:
+            ValueError: If the user cannot be resolved or assignment fails
+        """
+        try:
+            if assignee is None or assignee == "":
+                # Unassign: the atlassian-python-api accepts None for unassignment
+                self.jira.assign_issue(issue_key, None)
+            elif isinstance(assignee, dict):
+                if self.config.is_cloud:
+                    assignee_identifier = assignee.get("accountId") or assignee.get(
+                        "account_id"
+                    )
+                    if not assignee_identifier:
+                        raise ValueError(
+                            "Cloud assignee dict must include accountId or account_id"
+                        )
+                else:
+                    assignee_identifier = (
+                        assignee.get("name")
+                        or assignee.get("username")
+                        or assignee.get("key")
+                        or assignee.get("accountId")
+                        or assignee.get("account_id")
+                    )
+                    if not assignee_identifier:
+                        raise ValueError(
+                            "Server/DC assignee dict must include name, username, "
+                            "key, accountId, or account_id"
+                        )
+                self.jira.assign_issue(issue_key, str(assignee_identifier))
+            else:
+                account_id = self._get_account_id(assignee, issue_key=issue_key)
+                self.jira.assign_issue(issue_key, account_id)
+
+            # Return the updated issue
+            return self.get_issue(issue_key)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error assigning issue {issue_key}: {error_msg}")
+            raise ValueError(f"Failed to assign issue {issue_key}: {error_msg}") from e
+
+    def _update_issue_with_status(
+        self,
+        issue_key: str,
+        fields: dict[str, Any],
+        return_fields: str | list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> JiraIssue:
+        """
+        Update an issue with a status change.
+
+        Args:
+            issue_key: The key of the issue to update
+            fields: Dictionary of fields to update
+            return_fields: Fields to include on the issue returned after the
+                update (comma-separated string, collection, or ``"*all"``).
+                None lets the API return its default field set.
+
+        Returns:
+            JiraIssue model representing the updated issue
+
+        Raises:
+            Exception: If there is an error updating the issue
+        """
+        return_fields_param = self._normalize_return_fields(return_fields)
+
+        # Extract status from fields and remove it for the standard update
+        status = fields.pop("status", None)
+
+        # First update any fields if needed
+        if fields:
+            self.jira.update_issue(issue_key=issue_key, update={"fields": fields})
+
+        # If no status change is requested, return the issue
+        if not status:
+            issue_data = self.jira.get_issue(
+                issue_key,
+                fields=return_fields_param,
+                **_privacy_issue_metadata_kwargs(),
+            )
+            if not isinstance(issue_data, dict):
+                msg = f"Unexpected return value type from `jira.get_issue`: {type(issue_data)}"
+                logger.error(msg)
+                raise TypeError(msg)
+            return JiraIssue.from_api_response(
+                issue_data, requested_fields=return_fields_param
+            )
+
+        # Get available transitions (uses TransitionsMixin's normalized implementation)
+        transitions = self.get_available_transitions(issue_key)  # type: ignore[attr-defined]
+
+        # Extract status name or ID depending on what we received
+        status_name = None
+        status_id = None
+
+        # Handle different input formats for status
+        if isinstance(status, dict):
+            # Dictionary format: {"name": "In Progress"} or {"id": "123"}
+            status_name = status.get("name")
+            status_id = status.get("id")
+        elif isinstance(status, str):
+            # String format: could be a name or an ID
+            if status.isdigit():
+                status_id = status
+            else:
+                status_name = status
+        elif isinstance(status, int):
+            # Integer format: must be an ID
+            status_id = str(status)
+        else:
+            # Unknown format
+            logger.warning(
+                f"Unrecognized status format: {status} (type: {type(status)})"
+            )
+            status_name = str(status)
+
+        # Log what we're searching for
+        if status_name:
+            logger.info(f"Looking for transition to status name: '{status_name}'")
+        if status_id:
+            logger.info(f"Looking for transition with ID: '{status_id}'")
+
+        # Find the appropriate transition
+        transition_id = None
+        for transition in transitions:
+            # TransitionsMixin returns normalized transitions with 'to_status' field
+            transition_status_name = transition.get("to_status", "")
+
+            # Match by name (case-insensitive)
+            if (
+                status_name
+                and transition_status_name
+                and transition_status_name.lower() == status_name.lower()
+            ):
+                transition_id = transition.get("id")
+                logger.info(
+                    f"Found transition ID {transition_id} matching status name '{status_name}'"
+                )
+                break
+
+            # Direct transition ID match (if status is actually a transition ID)
+            if status_id and str(transition.get("id", "")) == str(status_id):
+                transition_id = transition.get("id")
+                logger.info(f"Using direct transition ID {transition_id}")
+                break
+
+        if not transition_id:
+            # Build list of available statuses from normalized transitions
+            available_statuses = []
+            for t in transitions:
+                # Include transition name and target status if available
+                transition_name = t.get("name", "")
+                to_status = t.get("to_status", "")
+                if to_status:
+                    available_statuses.append(f"{transition_name} -> {to_status}")
+                elif transition_name:
+                    available_statuses.append(transition_name)
+
+            available_statuses_str = (
+                ", ".join(available_statuses) if available_statuses else "None found"
+            )
+            error_msg = (
+                f"Could not find transition to status '{status}'. "
+                f"Available transitions: {available_statuses_str}"
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        # Perform the transition
+        logger.info(f"Performing transition with ID {transition_id}")
+        self.jira.set_issue_status_by_transition_id(
+            issue_key=issue_key,
+            transition_id=(
+                int(transition_id)
+                if isinstance(transition_id, str) and transition_id.isdigit()
+                else transition_id
+            ),
+        )
+
+        # Get the updated issue data
+        issue_data = self.jira.get_issue(
+            issue_key,
+            fields=return_fields_param,
+            **_privacy_issue_metadata_kwargs(),
+        )
+        if not isinstance(issue_data, dict):
+            msg = f"Unexpected return value type from `jira.get_issue`: {type(issue_data)}"
+            logger.error(msg)
+            raise TypeError(msg)
+        return JiraIssue.from_api_response(
+            issue_data, requested_fields=return_fields_param
+        )
+
+    def delete_issue(self, issue_key: str) -> bool:
+        """
+        Delete a Jira issue.
+
+        Args:
+            issue_key: The key of the issue to delete
+
+        Returns:
+            True if the issue was deleted successfully
+
+        Raises:
+            Exception: If there is an error deleting the issue
+        """
+        try:
+            self.jira.delete_issue(issue_key)
+            return True
+        except Exception as e:
+            msg = f"Error deleting issue {issue_key}: {str(e)}"
+            logger.error(msg)
+            raise Exception(msg) from e
+
+    def move_issue(self, issue_key: str, target_project_key: str) -> JiraIssue:
+        """
+        Move a Jira issue to a different project.
+
+        Uses Jira Cloud's bulk move API. The issue can be assigned a new key in
+        the target project (e.g., OLDPROJ-123 becomes NEWPROJ-456). The move is
+        processed asynchronously on Jira's side; this method polls until the
+        task completes or times out after 30 seconds.
+
+        Warning:
+            This function is only available on Jira Cloud.
+
+        Args:
+            issue_key: The key of the issue to move (e.g., 'PROJ-123')
+            target_project_key: The key of the target project (e.g., 'OTHERPROJ').
+                The target project must support the source issue's type.
+
+        Returns:
+            JiraIssue model representing the moved issue with its new key
+
+        Raises:
+            NotImplementedError: If not running on Jira Cloud
+            ValueError: If the move fails or times out
+        """
+        issue_key = issue_key.strip()
+        target_project_key = target_project_key.strip()
+        if not issue_key:
+            raise ValueError("Issue key is required")
+        if not target_project_key:
+            raise ValueError("Target project key is required")
+
+        if not self.config.is_cloud:
+            raise NotImplementedError(
+                "Cross-project issue move is only available on Jira Cloud."
+            )
+
+        try:
+            target_issue_type_id = self._get_target_issue_type_id(
+                issue_key, target_project_key
+            )
+
+            data: dict[str, Any] = {
+                "sendBulkNotification": False,
+                "targetToSourcesMapping": {
+                    f"{target_project_key},{target_issue_type_id}": {
+                        "inferClassificationDefaults": True,
+                        "inferFieldDefaults": True,
+                        "inferStatusDefaults": True,
+                        "inferSubtaskTypeDefault": True,
+                        "issueIdsOrKeys": [issue_key],
+                    }
+                },
+            }
+
+            response = self._post_api3("bulk/issues/move", data)
+
+            if not isinstance(response, dict):
+                raise ValueError(f"Unexpected response from bulk move API: {response}")
+
+            task_id = response.get("taskId")
+            if not task_id:
+                raise ValueError(f"No task ID in bulk move response: {response}")
+
+            logger.info(
+                f"Bulk move submitted for {issue_key} -> {target_project_key}, "
+                f"task ID: {task_id}"
+            )
+
+            task_url = self.jira.resource_url(f"bulk/queue/{task_id}", api_version="3")
+            completed_task: dict[str, Any] | None = None
+
+            for attempt in range(15):
+                task_response = self.jira.get(task_url)
+
+                if not isinstance(task_response, dict):
+                    logger.warning(
+                        f"Unexpected task response on attempt {attempt + 1}: "
+                        f"{type(task_response)}"
+                    )
+                    continue
+
+                status = task_response.get("status")
+                logger.info(
+                    f"Move task {task_id} status (attempt {attempt + 1}): {status}"
+                )
+
+                if status == "COMPLETE":
+                    completed_task = task_response
+                    break
+
+                elif status == "FAILED":
+                    errors = task_response.get("errorMessages", ["Unknown error"])
+                    raise ValueError(f"Bulk move task failed: {errors}")
+
+                elif status in ("CANCELLED", "CANCEL_REQUESTED"):
+                    raise ValueError(f"Bulk move task was cancelled (status: {status})")
+
+                if attempt < 14:
+                    time.sleep(2)
+
+            else:
+                raise ValueError(
+                    f"Move task timed out after 30 seconds (task ID: {task_id})"
+                )
+
+            if completed_task is None:
+                raise ValueError(
+                    f"Move task timed out after 30 seconds (task ID: {task_id})"
+                )
+
+            invalid_count = completed_task.get("invalidOrInaccessibleIssueCount") or 0
+            if int(invalid_count) > 0:
+                raise ValueError(
+                    "Bulk move task completed with "
+                    f"{invalid_count} invalid or inaccessible issue(s)"
+                )
+
+            processed_issues = completed_task.get("processedAccessibleIssues")
+            lookup_key = issue_key
+            if isinstance(processed_issues, list) and processed_issues:
+                lookup_key = str(processed_issues[0])
+
+            issue_data = self.jira.get_issue(
+                lookup_key,
+                **_privacy_issue_metadata_kwargs(),
+            )
+            if not isinstance(issue_data, dict):
+                msg = f"Unexpected return value type from `jira.get_issue`: {type(issue_data)}"
+                logger.error(msg)
+                raise TypeError(msg)
+            return JiraIssue.from_api_response(issue_data)
+
+        except (ValueError, NotImplementedError, TypeError):
+            raise
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(
+                f"Error moving issue {issue_key} to project {target_project_key}: {error_msg}"
+            )
+            raise ValueError(
+                f"Failed to move issue {issue_key} to project {target_project_key}: {error_msg}"
+            ) from e
+
+    def _get_target_issue_type_id(self, issue_key: str, target_project_key: str) -> str:
+        """Resolve the target issue type ID for a bulk issue move.
+
+        Jira's bulk move mapping key is ``projectKey,issueTypeId``. Because the
+        public tool accepts only a target project, preserve the source issue type
+        by resolving the same type in the target project before submitting.
+        """
+        source_issue = self.jira.get_issue(issue_key, fields="issuetype")
+        if not isinstance(source_issue, dict):
+            msg = (
+                f"Unexpected return value type from `jira.get_issue`: "
+                f"{type(source_issue)}"
+            )
+            logger.error(msg)
+            raise TypeError(msg)
+
+        source_issue_type = source_issue.get("fields", {}).get("issuetype")
+        if not isinstance(source_issue_type, dict):
+            raise ValueError(f"Could not determine issue type for {issue_key}")
+
+        source_type_id = source_issue_type.get("id")
+        source_type_name = source_issue_type.get("name")
+        source_is_subtask = source_issue_type.get("subtask")
+        target_issue_types = self.get_project_issue_types(target_project_key)
+        for issue_type in target_issue_types:
+            if source_type_id and str(issue_type.get("id")) == str(source_type_id):
+                return str(issue_type["id"])
+
+        normalized_source_name = (
+            self._normalize_issue_type_name(str(source_type_name))
+            if source_type_name
+            else ""
+        )
+        for issue_type in target_issue_types:
+            type_name = str(issue_type.get("name", ""))
+            if (
+                normalized_source_name
+                and self._normalize_issue_type_name(type_name) == normalized_source_name
+                and (
+                    source_is_subtask is None
+                    or bool(issue_type.get("subtask", False)) == bool(source_is_subtask)
+                )
+            ):
+                issue_type_id = issue_type.get("id")
+                if issue_type_id:
+                    return str(issue_type_id)
+
+        raise ValueError(
+            f"Target project {target_project_key} does not support issue type "
+            f"{source_type_name or source_type_id or 'unknown'}"
+        )
+
+    def _log_available_fields(self, fields: list[dict]) -> None:
+        """
+        Log available fields for debugging.
+
+        Args:
+            fields: List of field definitions
+        """
+        logger.debug("Available Jira fields:")
+        for field in fields:
+            logger.debug(
+                f"{field.get('id')}: {field.get('name')} ({field.get('schema', {}).get('type')})"
+            )
+
+    def _process_field_for_epic_data(
+        self, field: dict, field_ids: dict[str, str]
+    ) -> None:
+        """
+        Process a field for epic-related data.
+
+        Args:
+            field: The field data to process
+            field_ids: Dictionary of field IDs to update
+        """
+        try:
+            field_id = field.get("id")
+            if not field_id:
+                return
+
+            # Skip non-custom fields
+            if not field_id.startswith("customfield_"):
+                return
+
+            name = field.get("name", "").lower()
+
+            # Look for field names related to epics
+            if "epic" in name:
+                if "link" in name:
+                    field_ids["epic_link"] = field_id
+                    field_ids["Epic Link"] = field_id
+                elif "name" in name:
+                    field_ids["epic_name"] = field_id
+                    field_ids["Epic Name"] = field_id
+        except Exception as e:
+            logger.warning(f"Error processing field for epic data: {str(e)}")
+
+    def _get_raw_transitions(self, issue_key: str) -> list[dict]:
+        """
+        Get raw transition data from the Jira API.
+
+        This is an internal method that returns unprocessed transition data.
+        For normalized transitions with proper structure, use get_available_transitions()
+        from TransitionsMixin instead.
+
+        Args:
+            issue_key: The key of the issue
+
+        Returns:
+            List of raw transition data from the API
+
+        Raises:
+            Exception: If there is an error getting transitions
+        """
+        try:
+            transitions = self.jira.get_issue_transitions(issue_key)
+            return transitions
+        except Exception as e:
+            logger.error(f"Error getting transitions for issue {issue_key}: {str(e)}")
+            raise Exception(
+                f"Error getting transitions for issue {issue_key}: {str(e)}"
+            ) from e
+
+    def transition_issue(self, issue_key: str, transition_id: str) -> JiraIssue:
+        """
+        Transition an issue to a new status.
+
+        Args:
+            issue_key: The key of the issue
+            transition_id: The ID of the transition to perform
+
+        Returns:
+            JiraIssue model with the updated issue data
+
+        Raises:
+            Exception: If there is an error transitioning the issue
+        """
+        try:
+            self.jira.set_issue_status(
+                issue_key=issue_key, status_name=transition_id, fields=None, update=None
+            )
+            return self.get_issue(issue_key)
+        except Exception as e:
+            logger.error(f"Error transitioning issue {issue_key}: {str(e)}")
+            raise
+
+    def batch_create_issues(
+        self,
+        issues: list[dict[str, Any]],
+        validate_only: bool = False,
+    ) -> list[JiraIssue]:
+        """Create multiple Jira issues in a batch.
+
+        Args:
+            issues: List of issue dictionaries, each containing:
+                - project_key (str): Key of the project
+                - summary (str): Issue summary
+                - issue_type (str): Type of issue
+                - description (str, optional): Issue description
+                - assignee (str, optional): Username of assignee
+                - components (list[str], optional): List of component names
+                - **kwargs: Additional fields specific to your Jira instance
+            validate_only: If True, only validates the issues without creating them
+
+        Returns:
+            List of created JiraIssue objects
+
+        Raises:
+            ValueError: If any required fields are missing or invalid
+            MCPAtlassianAuthenticationError: If authentication fails
+        """
+        if not issues:
+            return []
+
+        # Prepare issues for bulk creation
+        issue_updates = []
+        for issue_data in issues:
+            try:
+                # Extract and validate required fields
+                project_key = issue_data.pop("project_key", None)
+                summary = issue_data.pop("summary", None)
+                issue_type = issue_data.pop("issue_type", None)
+                description = issue_data.pop("description", "")
+                assignee = issue_data.pop("assignee", None)
+                components = issue_data.pop("components", None)
+
+                # Validate required fields
+                if not all([project_key, summary, issue_type]):
+                    raise ValueError(
+                        f"Missing required fields for issue: {project_key=}, {summary=}, {issue_type=}"
+                    )
+
+                # Prepare fields dictionary
+                fields = {
+                    "project": {"key": project_key},
+                    "summary": summary,
+                    "issuetype": {"name": issue_type},
+                }
+
+                # Add optional fields
+                if description:
+                    fields["description"] = self._markdown_to_jira(description)
+
+                # Add assignee if provided
+                if assignee:
+                    try:
+                        # _get_account_id now returns the correct identifier (accountId for cloud, name for server)
+                        assignee_identifier = self._get_account_id(assignee)
+                        self._add_assignee_to_fields(fields, assignee_identifier)
+                    except ValueError as e:
+                        logger.warning(f"Could not assign issue: {str(e)}")
+
+                # Add components if provided
+                if components:
+                    if isinstance(components, list):
+                        valid_components = [
+                            comp_name.strip()
+                            for comp_name in components
+                            if isinstance(comp_name, str) and comp_name.strip()
+                        ]
+                        if valid_components:
+                            fields["components"] = [
+                                {"name": comp_name} for comp_name in valid_components
+                            ]
+
+                # Add any remaining custom fields
+                self._process_additional_fields(fields, issue_data)
+
+                if validate_only:
+                    # For validation, just log the issue that would be created
+                    logger.info(
+                        f"Validated issue creation: {project_key} - {summary} ({issue_type})"
+                    )
+                    continue
+
+                # Add to bulk creation list
+                issue_updates.append({"fields": fields})
+
+            except Exception as e:
+                logger.error(f"Failed to prepare issue for creation: {str(e)}")
+                if not issue_updates:
+                    raise
+
+        if validate_only:
+            return []
+
+        try:
+            # Call Jira's bulk create endpoint, using v3 when any field is ADF.
+            has_adf = any(
+                self._contains_adf_document(issue_update["fields"])
+                for issue_update in issue_updates
+            )
+            if has_adf and self.config.is_cloud:
+                response = self._post_api3(
+                    "issue/bulk", {"issueUpdates": issue_updates}
+                )
+            else:
+                response = self.jira.create_issues(issue_updates)
+            if not isinstance(response, dict):
+                msg = f"Unexpected return value type from `jira.create_issues`: {type(response)}"
+                logger.error(msg)
+                raise TypeError(msg)
+
+            # Process results
+            created_issues = []
+            for issue_info in response.get("issues", []):
+                issue_key = issue_info.get("key")
+                if issue_key:
+                    try:
+                        # Fetch the full issue data
+                        issue_data = self.jira.get_issue(
+                            issue_key,
+                            **_privacy_issue_metadata_kwargs(),
+                        )
+                        if not isinstance(issue_data, dict):
+                            msg = f"Unexpected return value type from `jira.get_issue`: {type(issue_data)}"
+                            logger.error(msg)
+                            raise TypeError(msg)
+
+                        created_issues.append(
+                            JiraIssue.from_api_response(
+                                issue_data,
+                                base_url=self.config.url
+                                if hasattr(self, "config")
+                                else None,
+                            )
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Error fetching created issue {issue_key}: {str(e)}"
+                        )
+
+            # Log any errors from the bulk creation
+            errors = response.get("errors", [])
+            if errors:
+                for error in errors:
+                    logger.error(f"Bulk creation error: {error}")
+
+            return created_issues
+
+        except Exception as e:
+            logger.error(f"Error in bulk issue creation: {str(e)}")
+            raise
+
+    def batch_get_changelogs(
+        self, issue_ids_or_keys: list[str], fields: list[str] | None = None
+    ) -> list[JiraIssue]:
+        """
+        Get changelogs for multiple issues in a batch. Repeatly fetch data if necessary.
+
+        Warning:
+            This function is only avaiable on Jira Cloud.
+
+        Args:
+            issue_ids_or_keys: List of issue IDs or keys
+            fields: Filter the changelogs by fields, e.g. ['status', 'assignee']. Default to None for all fields.
+
+        Returns:
+            List of JiraIssue objects that only contain changelogs and id
+        """
+
+        if not self.config.is_cloud:
+            error_msg = "Batch get issue changelogs is only available on Jira Cloud."
+            logger.error(error_msg)
+            raise NotImplementedError(error_msg)
+
+        # Get paged api results
+        paged_api_results = self.get_paged(
+            method="post",
+            url=self.jira.resource_url("changelog/bulkfetch"),
+            params_or_json={
+                "fieldIds": fields,
+                "issueIdsOrKeys": issue_ids_or_keys,
+            },
+        )
+
+        # Save (issue_id, changelogs)
+        issue_changelog_results: defaultdict[str, list[JiraChangelog]] = defaultdict(
+            list
+        )
+
+        for api_result in paged_api_results:
+            for data in api_result.get("issueChangeLogs", []):
+                issue_id = data.get("issueId", "")
+                changelogs = [
+                    JiraChangelog.from_api_response(changelog_data)
+                    for changelog_data in data.get("changeHistories", [])
+                ]
+
+                issue_changelog_results[issue_id].extend(changelogs)
+
+        issues = [
+            JiraIssue(id=issue_id, changelogs=changelogs)
+            for issue_id, changelogs in issue_changelog_results.items()
+        ]
+
+        return issues

@@ -1,6 +1,6 @@
 ---
 title: "Troubleshooting"
-description: "Fix auth errors (401/403), field issues, rate limiting, SSL problems, and debug MCP Atlassian connections"
+description: "Fix auth errors (401/403), field issues, rate limiting, SSL problems, and debug MCP Atlassian with Bitbucket and Privacy connections"
 ---
 
 ## Common Issues
@@ -18,7 +18,7 @@ description: "Fix auth errors (401/403), field issues, rate limiting, SSL proble
   </Accordion>
 
   <Accordion title="SSL Certificate Issues">
-    mcp-atlassian uses the OS native trust store by default (via
+    mcp-atlassian-with-bitbucket-and-privacy uses the OS native trust store by default (via
     [truststore](https://truststore.readthedocs.io/)), so certificates
     signed by enterprise CAs installed in Windows Certificate Store,
     macOS Keychain, or the Linux system CA bundle are trusted
@@ -82,10 +82,10 @@ Test your configuration interactively:
 
 ```bash
 # With uvx
-npx @modelcontextprotocol/inspector uvx mcp-atlassian
+npx @modelcontextprotocol/inspector uvx mcp-atlassian-with-bitbucket-and-privacy
 
 # With local development version
-npx @modelcontextprotocol/inspector uv --directory /path/to/mcp-atlassian run mcp-atlassian
+npx @modelcontextprotocol/inspector uv --directory /path/to/mcp-atlassian-with-bitbucket-and-privacy run mcp-atlassian-with-bitbucket-and-privacy
 ```
 
 ## Debugging Custom Headers
@@ -141,6 +141,22 @@ Header values containing sensitive information are automatically masked in logs.
     ```
   </Accordion>
 
+  <Accordion title="401 Unauthorized — Confluence attachment / image download (Cloud)">
+    **Symptom:** Reading pages works, but `confluence_get_page_images` returns
+    `downloaded: 0` (every image `"Fetch failed"`) and `confluence_download_attachment` /
+    `confluence_download_content_attachments` fail. Logs show
+    `401 ... /wiki/download/attachments/...`.
+
+    **Cause:** Confluence Cloud removed the legacy `/download/attachments/...` endpoint
+    (changelog [CHANGE-2735](https://developer.atlassian.com/cloud/confluence/changelog/) /
+    ["Deprecation of /download/attachments/ APIs"](https://community.developer.atlassian.com/t/deprecation-of-download-attachments-apis/94448)).
+    It now returns 401 for API-token / scoped-token auth, while metadata endpoints keep working.
+
+    **Fix:** On Cloud this is handled automatically — downloads use the v1 REST endpoint
+    `/rest/api/content/{id}/child/attachment/{aid}/download`. To force the behaviour, set
+    `CONFLUENCE_ATTACHMENT_DOWNLOAD_USE_V1=true` (or `false` to keep the legacy link).
+  </Accordion>
+
   <Accordion title="401 Unauthorized — Personal Access Token (PAT)">
     **Cause:** Invalid PAT or PAT doesn't have required permissions.
 
@@ -170,7 +186,7 @@ Header values containing sensitive information are automatically masked in logs.
     **Cause:** OAuth access token has expired and refresh failed.
 
     **Fix:**
-    1. Re-run the OAuth setup: `mcp-atlassian --oauth-setup`
+    1. Re-run the OAuth setup: `mcp-atlassian-with-bitbucket-and-privacy --oauth-setup`
     2. Ensure your app has `offline_access` scope for refresh tokens
     3. Check if the OAuth app is still active in your Atlassian developer console
   </Accordion>
@@ -192,6 +208,28 @@ Header values containing sensitive information are automatically masked in logs.
     ```
   </Accordion>
 
+  <Accordion title="String should match pattern — issue_key / project_key rejected">
+    **Symptom:** A tool call fails before reaching Jira with a validation error such as
+    `project_key: String should match pattern '^[A-Z][A-Z0-9_]+$'`, even though the
+    project exists and the key is correct.
+
+    **Cause:** `issue_key` and `project_key` arguments are validated against a regex
+    first. The defaults require an uppercase letter followed by at least one more
+    character, which is the fixed Cloud format. Server/Data Center instances configure
+    their own `jira.projectkey.pattern` and may allow keys the defaults reject — a
+    leading digit (`4ME`), a single character, or lowercase.
+
+    **Fix:** Widen the patterns to match your instance, then restart the server (they
+    are read once at startup):
+
+    ```bash
+    JIRA_ISSUE_KEY_PATTERN=^[A-Z0-9][A-Z0-9_]*-\d+(?:-\d+)*$
+    JIRA_PROJECT_KEY_PATTERN=^[A-Z0-9][A-Z0-9_]*$
+    ```
+
+    See [Jira Key Validation](/docs/configuration#jira-key-validation).
+  </Accordion>
+
   <Accordion title="Issue type not found or not available">
     **Cause:** The specified issue type doesn't exist in the project.
 
@@ -205,7 +243,7 @@ Header values containing sensitive information are automatically masked in logs.
     **Cause:** File exceeds the 50MB attachment limit.
 
     **Fix:**
-    - MCP Atlassian limits inline attachment downloads to 50MB
+    - MCP Atlassian with Bitbucket and Privacy limits inline attachment downloads to 50MB
     - For larger files, access attachments directly via the Jira/Confluence web UI
     - Consider compressing files before uploading
   </Accordion>
@@ -239,7 +277,12 @@ Header values containing sensitive information are automatically masked in logs.
     CONFLUENCE_SSL_VERIFY=false
     ```
 
-    For mTLS (mutual TLS) authentication:
+    For mTLS (mutual TLS) authentication, set either a combined cert/key PEM:
+    ```bash
+    JIRA_CLIENT_CERT=/path/to/client-combined.pem
+    ```
+
+    Or set separate certificate and key files:
     ```bash
     JIRA_CLIENT_CERT=/path/to/client-cert.pem
     JIRA_CLIENT_KEY=/path/to/client-key.pem
@@ -260,11 +303,16 @@ Header values containing sensitive information are automatically masked in logs.
     ```bash
     HTTPS_PROXY=https://proxy.example.com:8443
     ```
+    - If your network uses PAC/WPAD, enable it explicitly:
+    ```bash
+    ATLASSIAN_PROXY_WPAD_ENABLE=true
+    ATLASSIAN_PROXY_WPAD_URL=http://wpad/wpad.dat
+    ```
   </Accordion>
 </AccordionGroup>
 
 ## Getting Help
 
-- Check [GitHub Issues](https://github.com/sooperset/mcp-atlassian/issues) for known problems
-- Review [SECURITY.md](https://github.com/sooperset/mcp-atlassian/blob/main/SECURITY.md) for security-related concerns
+- Check [GitHub Issues](https://github.com/ulikoenig/mcp-atlassian-with-bitbucket/issues) for known problems
+- Review [SECURITY.md](https://github.com/ulikoenig/mcp-atlassian-with-bitbucket/blob/main/SECURITY.md) for security-related concerns
 - Open a new issue with debug logs if the problem persists

@@ -4,8 +4,8 @@ from unittest.mock import patch
 
 import pytest
 
-from mcp_atlassian.bitbucket.client import BitbucketClient
-from mcp_atlassian.bitbucket.config import BitbucketConfig
+from mcp_atlassian_with_bitbucket_and_privacy.bitbucket.client import BitbucketClient
+from mcp_atlassian_with_bitbucket_and_privacy.bitbucket.config import BitbucketConfig
 
 
 @pytest.fixture
@@ -391,6 +391,13 @@ class TestCloudOperations:
         client = BitbucketClient(config=cloud_config)
         result = client.search_code(query="def main", repo_slug="my-repo")
         assert len(result) == 1
+        # Cloud only has a workspace-level endpoint; a repository is selected
+        # through the repo: modifier inside the query.
+        mock_paginate.assert_called_once_with(
+            "/workspaces/my-workspace/search/code",
+            params={"search_query": "def main repo:my-repo"},
+            max_results=25,
+        )
 
     @patch.object(BitbucketClient, "_validate_connection")
     @patch.object(BitbucketClient, "_paginate")
@@ -505,7 +512,9 @@ class TestServerOperations:
         client = BitbucketClient(config=server_config)
         client.delete_tag(repo_slug="my-repo", tag_name="v1.0.0")
         mock_request.assert_called_once_with(
-            "DELETE", "/projects/PROJ/repos/my-repo/tags/v1.0.0"
+            "DELETE",
+            "/projects/PROJ/repos/my-repo/tags/v1.0.0",
+            base_url="https://bitbucket.company.com/rest/git/latest",
         )
 
 
@@ -629,3 +638,363 @@ class TestRequiredParams:
         client = BitbucketClient(config=config)
         with pytest.raises(ValueError, match="Project key is required"):
             client.get_repository(repo_slug="my-repo")
+
+
+class TestCodeSearch:
+    """Tests for code search on Cloud and Server/DC."""
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_cloud_without_repo(self, mock_paginate, mock_validate, cloud_config):
+        mock_paginate.return_value = []
+        client = BitbucketClient(config=cloud_config)
+        client.search_code(query="def main", max_results=10)
+        mock_paginate.assert_called_once_with(
+            "/workspaces/my-workspace/search/code",
+            params={"search_query": "def main"},
+            max_results=10,
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_cloud_explicit_workspace(self, mock_paginate, mock_validate, cloud_config):
+        mock_paginate.return_value = []
+        client = BitbucketClient(config=cloud_config)
+        client.search_code(query="def main", workspace="other-ws")
+        assert mock_paginate.call_args[0][0] == "/workspaces/other-ws/search/code"
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    def test_cloud_requires_workspace(self, mock_validate):
+        config = BitbucketConfig(
+            url="https://bitbucket.org",
+            auth_type="basic",
+            username="user",
+            app_password="pass",
+            workspace=None,
+        )
+        client = BitbucketClient(config=config)
+        with pytest.raises(ValueError, match="Workspace is required"):
+            client.search_code(query="def main")
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_posts_to_search_api(
+        self, mock_request, mock_validate, server_config
+    ):
+        mock_request.return_value = {
+            "code": {"values": [{"file": "app/main.py"}], "isLastPage": True}
+        }
+        client = BitbucketClient(config=server_config)
+        result = client.search_code(query="def main", max_results=5)
+
+        assert result == [{"file": "app/main.py"}]
+        mock_request.assert_called_once_with(
+            "POST",
+            "/search",
+            json_data={
+                "query": "def main project:PROJ",
+                "entities": {"code": {"start": 0, "limit": 5}},
+            },
+            base_url="https://bitbucket.company.com/rest/search/latest",
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_without_project_searches_globally(
+        self, mock_request, mock_validate
+    ):
+        config = BitbucketConfig(
+            url="https://bitbucket.company.com",
+            auth_type="pat",
+            personal_token="test-pat",
+            project_key=None,
+        )
+        mock_request.return_value = {"code": {"values": [], "isLastPage": True}}
+        client = BitbucketClient(config=config)
+        client.search_code(query="def main")
+        assert mock_request.call_args.kwargs["json_data"]["query"] == "def main"
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_repo_modifier(self, mock_request, mock_validate, server_config):
+        mock_request.return_value = {"code": {"values": [], "isLastPage": True}}
+        client = BitbucketClient(config=server_config)
+        client.search_code(query="def main", repo_slug="my-repo")
+        assert (
+            mock_request.call_args.kwargs["json_data"]["query"]
+            == "def main project:PROJ repo:my-repo"
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_qualified_repo_without_project(self, mock_request, mock_validate):
+        config = BitbucketConfig(
+            url="https://bitbucket.company.com",
+            auth_type="pat",
+            personal_token="test-pat",
+            project_key=None,
+        )
+        mock_request.return_value = {"code": {"values": [], "isLastPage": True}}
+        client = BitbucketClient(config=config)
+        client.search_code(query="def main", repo_slug="PROJ/my-repo")
+        assert (
+            mock_request.call_args.kwargs["json_data"]["query"]
+            == "def main repo:PROJ/my-repo"
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    def test_server_bare_repo_without_project_raises(self, mock_validate):
+        config = BitbucketConfig(
+            url="https://bitbucket.company.com",
+            auth_type="pat",
+            personal_token="test-pat",
+            project_key=None,
+        )
+        client = BitbucketClient(config=config)
+        with pytest.raises(ValueError, match="together with a project"):
+            client.search_code(query="def main", repo_slug="my-repo")
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_pagination(self, mock_request, mock_validate, server_config):
+        mock_request.side_effect = [
+            {
+                "code": {
+                    "values": [{"file": f"f{i}.py"} for i in range(25)],
+                    "isLastPage": False,
+                    "nextStart": 25,
+                }
+            },
+            {
+                "code": {
+                    "values": [{"file": f"f{i}.py"} for i in range(25, 30)],
+                    "isLastPage": True,
+                }
+            },
+        ]
+        client = BitbucketClient(config=server_config)
+        result = client.search_code(query="def main", max_results=30)
+
+        assert len(result) == 30
+        assert mock_request.call_count == 2
+        first, second = mock_request.call_args_list
+        assert first.kwargs["json_data"]["entities"]["code"] == {
+            "start": 0,
+            "limit": 25,
+        }
+        assert second.kwargs["json_data"]["entities"]["code"] == {
+            "start": 25,
+            "limit": 5,
+        }
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_stops_on_empty_page(
+        self, mock_request, mock_validate, server_config
+    ):
+        mock_request.return_value = {"code": {"values": [], "isLastPage": False}}
+        client = BitbucketClient(config=server_config)
+        assert client.search_code(query="nothing", max_results=50) == []
+        assert mock_request.call_count == 1
+
+
+class TestPullRequestStatusesServer:
+    """Tests for list_pull_request_statuses on Server/DC."""
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "get_pull_request")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_server_lists_build_statuses(
+        self, mock_paginate, mock_get_pr, mock_validate, server_config
+    ):
+        """Server/DC uses build-status API with correct base URL."""
+        mock_get_pr.return_value = {"fromRef": {"latestCommit": "abc123def456"}}
+        mock_paginate.return_value = [{"state": "SUCCESSFUL", "key": "ci-build"}]
+        client = BitbucketClient(config=server_config)
+        result = client.list_pull_request_statuses(
+            repo_slug="my-repo", pr_id=42, project_key="PROJ"
+        )
+
+        assert len(result) == 1
+        assert result[0]["state"] == "SUCCESSFUL"
+        # Verify _paginate was called with the correct base_url
+        mock_paginate.assert_called_once_with(
+            "/commits/abc123def456",
+            max_results=25,
+            base_url="https://bitbucket.company.com/rest/build-status/latest",
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "get_pull_request")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_server_empty_commit_hash_returns_empty(
+        self, mock_paginate, mock_get_pr, mock_validate, server_config
+    ):
+        """Server/DC returns empty list if commit hash not found."""
+        mock_get_pr.return_value = {"fromRef": {}}
+        client = BitbucketClient(config=server_config)
+        result = client.list_pull_request_statuses(
+            repo_slug="my-repo", pr_id=42, project_key="PROJ"
+        )
+
+        assert result == []
+        mock_paginate.assert_not_called()
+
+
+class TestBranchRestrictionsServer:
+    """Tests for list_branch_restrictions on Server/DC."""
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_server_lists_restrictions(
+        self, mock_paginate, mock_validate, server_config
+    ):
+        """Server/DC uses branch-permissions API with correct base URL."""
+        mock_paginate.return_value = [
+            {"id": 1, "type": "PUSH_DENY", "scope": {"repositoryId": 123}}
+        ]
+        client = BitbucketClient(config=server_config)
+        result = client.list_branch_restrictions(
+            repo_slug="my-repo", project_key="PROJ"
+        )
+
+        assert len(result) == 1
+        # Verify _paginate was called with the correct base_url
+        mock_paginate.assert_called_once_with(
+            "/projects/PROJ/repos/my-repo/restrictions",
+            max_results=25,
+            base_url="https://bitbucket.company.com/rest/branch-permissions/2.0",
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_server_pagination_multiple_pages(
+        self, mock_paginate, mock_validate, server_config
+    ):
+        """Server/DC paginates through multiple pages of restrictions."""
+        # Simulate paginating through 50 restrictions
+        mock_paginate.return_value = [{"id": i} for i in range(50)]
+        client = BitbucketClient(config=server_config)
+        result = client.list_branch_restrictions(
+            repo_slug="my-repo", project_key="PROJ", max_results=50
+        )
+
+        assert len(result) == 50
+        mock_paginate.assert_called_once_with(
+            "/projects/PROJ/repos/my-repo/restrictions",
+            max_results=50,
+            base_url="https://bitbucket.company.com/rest/branch-permissions/2.0",
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_server_empty_restrictions(
+        self, mock_paginate, mock_validate, server_config
+    ):
+        """Server/DC returns empty list if no restrictions."""
+        mock_paginate.return_value = []
+        client = BitbucketClient(config=server_config)
+        result = client.list_branch_restrictions(
+            repo_slug="my-repo", project_key="PROJ"
+        )
+
+        assert result == []
+
+
+class TestCommitStatusesServer:
+    """Tests for list_commit_statuses on Server/DC."""
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_server_lists_build_statuses(
+        self, mock_paginate, mock_validate, server_config
+    ):
+        """Server/DC uses build-status API with correct base URL."""
+        mock_paginate.return_value = [{"state": "SUCCESSFUL", "key": "ci-build"}]
+        client = BitbucketClient(config=server_config)
+        result = client.list_commit_statuses(
+            repo_slug="my-repo", commit_hash="abc123", project_key="PROJ"
+        )
+
+        assert len(result) == 1
+        assert result[0]["state"] == "SUCCESSFUL"
+        mock_paginate.assert_called_once_with(
+            "/commits/abc123",
+            max_results=25,
+            base_url="https://bitbucket.company.com/rest/build-status/latest",
+        )
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_paginate")
+    def test_server_empty_statuses(self, mock_paginate, mock_validate, server_config):
+        """Server/DC returns empty list if no build statuses."""
+        mock_paginate.return_value = []
+        client = BitbucketClient(config=server_config)
+        result = client.list_commit_statuses(
+            repo_slug="my-repo", commit_hash="abc123", project_key="PROJ"
+        )
+
+        assert result == []
+
+
+class TestDeleteBranchServer:
+    """Tests for delete_branch on Server/DC."""
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_deletes_branch(self, mock_request, mock_validate, server_config):
+        """Server/DC uses branch-utils API with correct base URL and body."""
+        mock_request.return_value = None
+        client = BitbucketClient(config=server_config)
+        client.delete_branch(
+            repo_slug="my-repo", branch_name="feature/x", project_key="PROJ"
+        )
+
+        mock_request.assert_called_once_with(
+            "DELETE",
+            "/projects/PROJ/repos/my-repo/branches",
+            json_data={"name": "feature/x"},
+            base_url="https://bitbucket.company.com/rest/branch-utils/latest",
+        )
+
+
+class TestGetBranchingModelServer:
+    """Tests for get_branching_model on Server/DC."""
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_gets_branching_model(
+        self, mock_request, mock_validate, server_config
+    ):
+        """Server/DC uses branch-utils API with correct base URL."""
+        mock_request.return_value = {
+            "development": {"useDefault": True},
+            "types": [{"id": "FEATURE", "prefix": "feature/"}],
+        }
+        client = BitbucketClient(config=server_config)
+        result = client.get_branching_model(repo_slug="my-repo", project_key="PROJ")
+
+        assert result["types"][0]["id"] == "FEATURE"
+        mock_request.assert_called_once_with(
+            "GET",
+            "/projects/PROJ/repos/my-repo/branchmodel/configuration",
+            base_url="https://bitbucket.company.com/rest/branch-utils/latest",
+        )
+
+
+class TestDeleteTagServer:
+    """Tests for delete_tag on Server/DC."""
+
+    @patch.object(BitbucketClient, "_validate_connection")
+    @patch.object(BitbucketClient, "_request")
+    def test_server_deletes_tag(self, mock_request, mock_validate, server_config):
+        """Server/DC uses the git API namespace, not /rest/api/1.0."""
+        mock_request.return_value = None
+        client = BitbucketClient(config=server_config)
+        client.delete_tag(repo_slug="my-repo", tag_name="v1.0.0", project_key="PROJ")
+
+        mock_request.assert_called_once_with(
+            "DELETE",
+            "/projects/PROJ/repos/my-repo/tags/v1.0.0",
+            base_url="https://bitbucket.company.com/rest/git/latest",
+        )

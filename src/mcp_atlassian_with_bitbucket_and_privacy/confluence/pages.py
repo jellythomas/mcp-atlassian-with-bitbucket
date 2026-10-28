@@ -1,0 +1,1681 @@
+"""Module for Confluence page operations."""
+
+import difflib
+import logging
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+import requests
+from atlassian.errors import ApiError
+from bs4 import BeautifulSoup, Tag
+from requests.exceptions import HTTPError
+
+from ..models.confluence import ConfluencePage
+from ..utils.decorators import handle_auth_errors
+from ..utils.pagination import clamp_limit
+from .client import ConfluenceClient
+from .utils import emoji_to_hex_id, extract_emoji_from_property
+from .v2_adapter import ConfluenceV2Adapter
+
+logger = logging.getLogger("mcp-atlassian-with-bitbucket-and-privacy")
+
+
+class PagesMixin(ConfluenceClient):
+    """Mixin for Confluence page operations."""
+
+    @property
+    def _v2_adapter(self) -> ConfluenceV2Adapter | None:
+        """Get v2 API adapter for OAuth authentication.
+
+        Returns:
+            ConfluenceV2Adapter instance if OAuth is configured, None otherwise
+        """
+        if self.config.auth_type == "oauth" and self.config.is_cloud:
+            return ConfluenceV2Adapter(
+                session=self.confluence._session, base_url=self.confluence.url
+            )
+        return None
+
+    def _cloud_v2_adapter(self) -> ConfluenceV2Adapter | None:
+        """Get a v2 API adapter for any Confluence Cloud auth mode."""
+        if not self.config.is_cloud:
+            return None
+
+        if self.config.auth_type == "oauth":
+            base_url = self.confluence.url
+        else:
+            base_url = self.config.url
+        return ConfluenceV2Adapter(
+            session=self.confluence._session,
+            base_url=base_url,
+        )
+
+    @property
+    def _page_children_v2_adapter(self) -> ConfluenceV2Adapter | None:
+        """Get v2 API adapter for Cloud page-children lookups.
+
+        Returns:
+            ConfluenceV2Adapter instance for Cloud, None for Server/Data Center.
+        """
+        if self.config.is_cloud:
+            return ConfluenceV2Adapter(
+                session=self.confluence._session, base_url=self.confluence.url
+            )
+        return None
+
+    @staticmethod
+    def _v2_next_cursor(response: dict[str, Any]) -> str | None:
+        """Extract the next cursor from a Confluence v2 paginated response."""
+        links = response.get("_links", {})
+        if not isinstance(links, dict):
+            return None
+
+        next_link = links.get("next")
+        if not isinstance(next_link, str) or not next_link:
+            return None
+
+        cursor = parse_qs(urlparse(next_link).query).get("cursor", [None])[0]
+        return cursor or None
+
+    @staticmethod
+    def _is_requested_child_type(
+        item: dict[str, Any], *, include_folders: bool
+    ) -> bool:
+        """Return whether a v2 direct-child item matches the tool contract."""
+        item_type = item.get("type", "page")
+        return item_type == "page" or (include_folders and item_type == "folder")
+
+    def _get_v2_page_children_items(
+        self,
+        v2_adapter: ConfluenceV2Adapter,
+        page_id: str,
+        start: int,
+        limit: int,
+        expand: str,
+        *,
+        include_folders: bool,
+    ) -> list[dict[str, Any]]:
+        """Fetch v2 direct children while preserving the v1 start/limit contract."""
+        if limit <= 0:
+            return []
+
+        child_items: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str | None] = set()
+        items_to_skip = max(start, 0)
+
+        while len(child_items) < limit:
+            if cursor in seen_cursors:
+                logger.warning(
+                    "Stopping v2 child pagination for page '%s' after repeated "
+                    "cursor '%s'",
+                    page_id,
+                    cursor,
+                )
+                break
+            seen_cursors.add(cursor)
+
+            page_results = v2_adapter.get_page_direct_children(
+                page_id=page_id,
+                limit=limit,
+                cursor=cursor,
+            )
+            raw_items = page_results.get("results", [])
+            if not isinstance(raw_items, list):
+                break
+
+            requested_items = [
+                item
+                for item in raw_items
+                if isinstance(item, dict)
+                and self._is_requested_child_type(item, include_folders=include_folders)
+            ]
+
+            if items_to_skip:
+                if len(requested_items) <= items_to_skip:
+                    items_to_skip -= len(requested_items)
+                    cursor = self._v2_next_cursor(page_results)
+                    if not cursor:
+                        break
+                    continue
+
+                requested_items = requested_items[items_to_skip:]
+                items_to_skip = 0
+
+            remaining = limit - len(child_items)
+            child_items.extend(requested_items[:remaining])
+
+            if len(child_items) >= limit:
+                break
+
+            cursor = self._v2_next_cursor(page_results)
+            if not cursor:
+                break
+
+        if "body" in expand:
+            return self._enrich_v2_child_pages_with_content(v2_adapter, child_items)
+
+        return child_items
+
+    def _enrich_v2_child_pages_with_content(
+        self,
+        v2_adapter: ConfluenceV2Adapter,
+        child_items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Fetch page details for v2 direct-child page items when body is requested."""
+        enriched_items: list[dict[str, Any]] = []
+
+        for item in child_items:
+            if item.get("type", "page") != "page" or not item.get("id"):
+                enriched_items.append(item)
+                continue
+
+            page = v2_adapter.get_page(
+                page_id=str(item["id"]),
+                expand="body.storage,version,space",
+            )
+            enriched_items.append({**item, **page})
+
+        return enriched_items
+
+    @handle_auth_errors("Confluence API")
+    def get_page_content(
+        self, page_id: str, *, convert_to_markdown: bool = True
+    ) -> ConfluencePage:
+        """
+        Get content of a specific page.
+
+        Args:
+            page_id: The ID of the page to retrieve
+            convert_to_markdown: When True, returns content in
+                markdown format, otherwise returns raw Confluence storage XHTML
+                (keyword-only)
+
+        Returns:
+            ConfluencePage model containing the page content and
+            metadata
+
+        Raises:
+            MCPAtlassianAuthenticationError: If authentication fails
+                with the Confluence API (401/403)
+            Exception: If there is an error retrieving the page
+        """
+        try:
+            # Use v2 API for OAuth, v1 API for token/basic auth
+            v2_adapter = self._v2_adapter
+            if v2_adapter:
+                logger.debug(
+                    f"Using v2 API for OAuth authentication to get page '{page_id}'"
+                )
+                page = v2_adapter.get_page(
+                    page_id=page_id,
+                    expand="body.storage,version,space,children.attachment,history",
+                )
+            else:
+                logger.debug(
+                    "Using v1 API for token/basic"
+                    f" authentication to get page '{page_id}'"
+                )
+                page = self.confluence.get_page_by_id(
+                    page_id=page_id,
+                    expand="body.storage,version,space,children.attachment,history",
+                )
+
+            # Check if API returned an error string
+            if isinstance(page, str):
+                error_msg = f"API returned error response: {page[:500]}"
+                raise Exception(error_msg)
+
+            space_key = page.get("space", {}).get("key", "")
+            try:
+                content = page["body"]["storage"]["value"]
+            except (KeyError, TypeError) as e:
+                logger.warning(
+                    f"Page {page.get('id', 'unknown')} missing body.storage.value: {e}"
+                )
+                content = ""
+            page_id_str = str(page.get("id", ""))
+            page_attachments = (
+                page.get("children", {}).get("attachment", {}).get("results", [])
+            )
+            if convert_to_markdown:
+                _, page_content = self.preprocessor.process_html_content(
+                    content,
+                    space_key=space_key,
+                    confluence_client=self.confluence,
+                    content_id=page_id_str,
+                    attachments=page_attachments,
+                )
+            else:
+                page_content = content
+
+            # Fetch page emoji and width from content properties
+            emoji = self._get_page_emoji(page_id)
+            page_width = self._get_page_width(page_id)
+
+            return ConfluencePage.from_api_response(
+                page,
+                base_url=self.config.url,
+                include_body=True,
+                content_override=page_content,
+                content_format=("storage" if not convert_to_markdown else "markdown"),
+                is_cloud=self.config.is_cloud,
+                emoji=emoji,
+                page_width=page_width,
+            )
+        except HTTPError:
+            raise  # let decorator handle auth errors
+        except Exception as e:
+            logger.error(
+                f"Error retrieving page content for page ID {page_id}: {str(e)}"
+            )
+            raise Exception(f"Error retrieving page content: {str(e)}") from e
+
+    @handle_auth_errors("Confluence API")
+    def get_page_ancestors(self, page_id: str) -> list[ConfluencePage]:
+        """
+        Get ancestors (parent pages) of a specific page.
+
+        Args:
+            page_id: The ID of the page to get ancestors for
+
+        Returns:
+            List of ConfluencePage models representing the
+            ancestors in hierarchical order (immediate parent
+            first, root ancestor last)
+
+        Raises:
+            MCPAtlassianAuthenticationError: If authentication
+                fails with the Confluence API (401/403)
+        """
+        try:
+            ancestors = self.confluence.get_page_ancestors(page_id)
+
+            ancestor_models = []
+            for ancestor in ancestors:
+                page_model = ConfluencePage.from_api_response(
+                    ancestor,
+                    base_url=self.config.url,
+                    include_body=False,
+                )
+                ancestor_models.append(page_model)
+
+            return ancestor_models
+        except HTTPError:
+            raise  # let decorator handle auth errors
+        except Exception as e:
+            logger.error(f"Error fetching ancestors for page {page_id}: {str(e)}")
+            logger.debug("Full exception details:", exc_info=True)
+            return []
+
+    def _get_page_emoji(self, page_id: str) -> str | None:
+        """Get the page title emoji from content properties.
+
+        The page emoji (icon shown in navigation) is stored as a content property
+        with key 'emoji-title-published' or 'emoji-title-draft'.
+
+        Args:
+            page_id: The ID of the page
+
+        Returns:
+            The emoji character if set, None otherwise
+        """
+        try:
+            # Use v2 API for OAuth authentication
+            v2_adapter = self._v2_adapter
+            if v2_adapter:
+                return v2_adapter.get_page_emoji(page_id)
+
+            # For token/basic auth, use v1 API via atlassian library
+            properties = self.confluence.get_page_properties(page_id)
+            if not properties:
+                return None
+
+            results = (
+                properties
+                if isinstance(properties, list)
+                else properties.get("results", [])
+            )
+            for prop in results:
+                key = prop.get("key", "")
+                if key in ("emoji-title-published", "emoji-title-draft"):
+                    value = prop.get("value", {})
+                    return extract_emoji_from_property(value)
+
+            return None
+
+        except Exception as e:
+            logger.debug(f"Error fetching emoji for page {page_id}: {str(e)}")
+            return None
+
+    def _set_single_property(
+        self, page_id: str, property_key: str, value: str | None
+    ) -> bool:
+        """Set or remove a single page property via v1 API.
+
+        Uses create (POST) for new properties and update (PUT) for existing ones.
+        The v1 API requires a version number when updating existing properties.
+
+        Args:
+            page_id: The ID of the page
+            property_key: The property key to set
+            value: The value to set, or None to delete the property
+
+        Returns:
+            True if the operation succeeded, False otherwise
+        """
+        try:
+            if value is None:
+                # Delete the property. A property that is already absent leaves the
+                # page in the requested state, so only a 404 counts as success --
+                # anything else (denied, locked, throttled, transport failure) means
+                # the removal did not happen and must not be reported as done.
+                try:
+                    self.confluence.delete_page_property(page_id, property_key)
+                except (HTTPError, ApiError) as api_err:
+                    http_err = (
+                        api_err if isinstance(api_err, HTTPError) else api_err.reason
+                    )
+                    if (
+                        isinstance(http_err, HTTPError)
+                        and http_err.response is not None
+                        and http_err.response.status_code == 404
+                    ):
+                        logger.debug(
+                            f"Property '{property_key}' already absent on page "
+                            f"{page_id}"
+                        )
+                        return True
+                    logger.warning(
+                        f"Could not delete property '{property_key}' for page "
+                        f"{page_id}: {http_err}"
+                    )
+                    return False
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"Could not delete property '{property_key}' for page "
+                        f"{page_id}: {e}"
+                    )
+                    return False
+                return True
+
+            # Check if the property already exists (need version for update)
+            existing_version = None
+            try:
+                existing = self.confluence.get_page_property(page_id, property_key)
+                if existing and isinstance(existing, dict):
+                    existing_version = existing.get("version", {}).get("number")
+            except Exception:  # noqa: S110
+                # Property doesn't exist yet, that's fine - we'll create it
+                pass
+
+            property_data = {
+                "key": property_key,
+                "value": value,
+            }
+
+            if existing_version is not None:
+                # Property exists - use PUT (update) with incremented version
+                property_data["version"] = {"number": existing_version + 1}
+                self.confluence.update_page_property(page_id, property_data)
+            else:
+                # Property doesn't exist - use POST (create)
+                self.confluence.set_page_property(page_id, property_data)
+
+            return True
+
+        except Exception as e:
+            logger.warning(
+                f"Error setting property '{property_key}' for page {page_id}: {str(e)}"
+            )
+            return False
+
+    def _set_page_emoji(self, page_id: str, emoji: str | None) -> bool:
+        """Set or remove the page title emoji.
+
+        The page emoji (icon shown in navigation) is stored as content properties.
+        Both 'emoji-title-published' and 'emoji-title-draft' are set to ensure
+        the emoji appears in both view and edit modes.
+
+        Args:
+            page_id: The ID of the page
+            emoji: The emoji character to set, or None to remove the emoji
+
+        Returns:
+            True if the operation succeeded, False otherwise
+        """
+        try:
+            # Use v2 API for OAuth authentication
+            v2_adapter = self._v2_adapter
+            if v2_adapter:
+                return v2_adapter.set_page_emoji(page_id, emoji)
+
+            # For token/basic auth, use v1 API via atlassian library
+            # Convert emoji to hex code, or None to delete
+            emoji_value = emoji_to_hex_id(emoji) if emoji else None
+
+            # Set both published and draft properties
+            published_ok = self._set_single_property(
+                page_id, "emoji-title-published", emoji_value
+            )
+            draft_ok = self._set_single_property(
+                page_id, "emoji-title-draft", emoji_value
+            )
+
+            if not published_ok:
+                logger.warning(
+                    f"Failed to set emoji-title-published for page {page_id}"
+                )
+            if not draft_ok:
+                logger.warning(f"Failed to set emoji-title-draft for page {page_id}")
+
+            return published_ok and draft_ok
+
+        except Exception as e:
+            logger.warning(f"Error setting emoji for page {page_id}: {str(e)}")
+            return False
+
+    def _get_page_width(self, page_id: str) -> str | None:
+        """Get the page layout width from content properties.
+
+        The page width (full-width, max, or default) is stored as a content property
+        with key 'content-appearance-published' or 'content-appearance-draft'.
+
+        Args:
+            page_id: The ID of the page
+
+        Returns:
+            The width setting if set ('full-width', 'max', or 'default'), None otherwise
+        """
+        try:
+            # For token/basic auth, use v1 API via atlassian library
+            properties = self.confluence.get_page_properties(page_id)
+            if not properties:
+                return None
+
+            results = (
+                properties
+                if isinstance(properties, list)
+                else properties.get("results", [])
+            )
+            for prop in results:
+                key = prop.get("key", "")
+                if key in ("content-appearance-published", "content-appearance-draft"):
+                    value = prop.get("value", {})
+                    # The value is stored as a dict with "value" key or directly as string
+                    if isinstance(value, dict):
+                        return value.get("value")
+                    elif isinstance(value, str):
+                        return value
+
+            return None
+
+        except Exception as e:
+            logger.debug(f"Error fetching page width for page {page_id}: {str(e)}")
+            return None
+
+    def _set_page_width(self, page_id: str, width: str | None) -> bool:
+        """Set the page layout width.
+
+        The page width is stored as content properties.
+        Both 'content-appearance-draft' and 'content-appearance-published' are set
+        to ensure the width appears in both view and edit modes.
+
+        Args:
+            page_id: The ID of the page
+            width: The width to set ('full-width', 'max', or 'default'), or None to remove
+
+        Returns:
+            True if the operation succeeded, False otherwise
+        """
+        try:
+            # Validate width value
+            if width is not None and width not in ["full-width", "max", "default"]:
+                logger.warning(
+                    f"Invalid page width '{width}'. Must be 'full-width', 'max', or 'default'"
+                )
+                return False
+
+            # Set both published and draft properties
+            published_ok = self._set_single_property(
+                page_id, "content-appearance-published", width
+            )
+            draft_ok = self._set_single_property(
+                page_id, "content-appearance-draft", width
+            )
+
+            if not published_ok:
+                logger.warning(
+                    f"Failed to set content-appearance-published for page {page_id}"
+                )
+            if not draft_ok:
+                logger.warning(
+                    f"Failed to set content-appearance-draft for page {page_id}"
+                )
+
+            return published_ok and draft_ok
+
+        except Exception as e:
+            logger.warning(f"Error setting page width for page {page_id}: {str(e)}")
+            return False
+
+    def get_page_by_title(
+        self, space_key: str, title: str, *, convert_to_markdown: bool = True
+    ) -> ConfluencePage | None:
+        """
+        Get a specific page by its title from a Confluence space.
+
+        Args:
+            space_key: The key of the space containing the page
+            title: The title of the page to retrieve
+            convert_to_markdown: When True, returns content in markdown format,
+                otherwise returns raw Confluence storage XHTML (keyword-only)
+
+        Returns:
+            ConfluencePage model containing the page content and metadata, or None if not found
+        """
+        try:
+            # Directly try to find the page by title
+            page = self.confluence.get_page_by_title(
+                space_key, title, expand="body.storage,version"
+            )
+            if isinstance(page, dict) and isinstance(page.get("results"), list):
+                page = page["results"][0] if page["results"] else None
+
+            if not page:
+                logger.warning(
+                    f"Page '{title}' not found in space '{space_key}'. "
+                    f"The space may be invalid, the page may not exist, or permissions may be insufficient."
+                )
+                return None
+
+            try:
+                content = page["body"]["storage"]["value"]
+            except (KeyError, TypeError) as e:
+                logger.warning(
+                    f"Page {page.get('id', 'unknown')} missing body.storage.value: {e}"
+                )
+                content = ""
+            if convert_to_markdown:
+                _, page_content = self.preprocessor.process_html_content(
+                    content,
+                    space_key=space_key,
+                    confluence_client=self.confluence,
+                    content_id=str(page.get("id", "")),
+                )
+            else:
+                page_content = content
+
+            # Fetch page emoji and width from content properties
+            emoji = self._get_page_emoji(str(page.get("id", "")))
+            page_width = self._get_page_width(str(page.get("id", "")))
+
+            # Create and return the ConfluencePage model
+            return ConfluencePage.from_api_response(
+                page,
+                base_url=self.config.url,
+                include_body=True,
+                # Override content with our processed version
+                content_override=page_content,
+                content_format="storage" if not convert_to_markdown else "markdown",
+                is_cloud=self.config.is_cloud,
+                emoji=emoji,
+                page_width=page_width,
+            )
+
+        except KeyError as e:
+            logger.error(f"Missing key in page data: {str(e)}")
+            return None
+        except requests.RequestException as e:
+            logger.error(f"Network error when fetching page: {str(e)}")
+            return None
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error processing page data: {str(e)}")
+            return None
+        except Exception as e:  # noqa: BLE001 - Intentional fallback with full logging
+            logger.error(f"Unexpected error fetching page: {str(e)}")
+            # Log the full traceback at debug level for troubleshooting
+            logger.debug("Full exception details:", exc_info=True)
+            return None
+
+    def get_space_pages(
+        self,
+        space_key: str,
+        start: int = 0,
+        limit: int = 10,
+        *,
+        convert_to_markdown: bool = True,
+    ) -> list[ConfluencePage]:
+        """
+        Get all pages from a specific space.
+
+        Args:
+            space_key: The key of the space to get pages from
+            start: The starting index for pagination
+            limit: Maximum number of pages to return
+            convert_to_markdown: When True, returns content in markdown format,
+                               otherwise returns raw HTML (keyword-only)
+
+        Returns:
+            List of ConfluencePage models containing page content and metadata
+        """
+        pages = self.confluence.get_all_pages_from_space(
+            space_key, start=start, limit=limit, expand="body.storage"
+        )
+
+        page_models = []
+        for page in pages:
+            try:
+                content = page["body"]["storage"]["value"]
+            except (KeyError, TypeError) as e:
+                logger.warning(
+                    f"Page {page.get('id', 'unknown')} missing body.storage.value: {e}"
+                )
+                content = ""
+            processed_html, processed_markdown = self.preprocessor.process_html_content(
+                content,
+                space_key=space_key,
+                confluence_client=self.confluence,
+                content_id=str(page.get("id", "")),
+            )
+
+            # Use the appropriate content format based on the convert_to_markdown flag
+            page_content = processed_markdown if convert_to_markdown else processed_html
+
+            # Ensure space information is included
+            if "space" not in page:
+                page["space"] = {
+                    "key": space_key,
+                    "name": space_key,  # Use space_key as name if not available
+                }
+
+            # Create the ConfluencePage model
+            page_model = ConfluencePage.from_api_response(
+                page,
+                base_url=self.config.url,
+                include_body=True,
+                # Override content with our processed version
+                content_override=page_content,
+                content_format="storage" if not convert_to_markdown else "markdown",
+                is_cloud=self.config.is_cloud,
+            )
+
+            page_models.append(page_model)
+
+        return page_models
+
+    def create_page(
+        self,
+        space_key: str,
+        title: str,
+        body: str,
+        parent_id: str | None = None,
+        *,
+        is_markdown: bool = True,
+        enable_heading_anchors: bool = False,
+        content_representation: str | None = None,
+        emoji: str | None = None,
+        page_width: str | None = None,
+        subtype: str | None = None,
+        table_layout: str | None = None,
+    ) -> ConfluencePage:
+        """
+        Create a new page in a Confluence space.
+
+        Args:
+            space_key: The key of the space to create the page in
+            title: The title of the new page
+            body: The content of the page (markdown, wiki markup, or storage format)
+            parent_id: Optional ID of a parent page
+            is_markdown: Whether the body content is in markdown format (default: True, keyword-only)
+            enable_heading_anchors: Whether to enable automatic heading anchor generation (default: False, keyword-only)
+            content_representation: Content format when is_markdown=False ('wiki' or 'storage', keyword-only)
+            emoji: Optional emoji character for the page title icon (keyword-only)
+            page_width: Optional page layout width ('full-width', 'max', or 'default', keyword-only)
+            subtype: Optional Confluence page subtype. Use "live" to create a Live Doc.
+            table_layout: Optional table width preset for markdown tables ('full-width', 'wide', 'default', keyword-only)
+
+        Returns:
+            ConfluencePage model containing the new page's data
+
+        Raises:
+            Exception: If there is an error creating the page
+        """
+        try:
+            # Determine body and representation based on content type
+            if is_markdown:
+                # Convert markdown to Confluence storage format
+                final_body = self.preprocessor.markdown_to_confluence_storage(
+                    body,
+                    enable_heading_anchors=enable_heading_anchors,
+                    table_layout=table_layout,
+                )
+                representation = "storage"
+            else:
+                # Use body as-is with specified representation
+                final_body = body
+                representation = content_representation or "storage"
+
+            # Use v2 API for OAuth authentication and for Cloud page subtypes
+            # such as Live Docs. The v1 API/client does not expose subtype.
+            v2_adapter = self._v2_adapter
+            if subtype:
+                v2_adapter = self._cloud_v2_adapter()
+                if not v2_adapter:
+                    raise ValueError(
+                        "Confluence page subtype is only supported for Confluence Cloud"
+                    )
+            if v2_adapter:
+                logger.debug(
+                    f"Using v2 API for OAuth authentication to create page '{title}'"
+                )
+                create_kwargs = {
+                    "space_key": space_key,
+                    "title": title,
+                    "body": final_body,
+                    "parent_id": parent_id,
+                    "representation": representation,
+                }
+                if subtype:
+                    create_kwargs["subtype"] = subtype
+                result = v2_adapter.create_page(**create_kwargs)
+            else:
+                logger.debug(
+                    f"Using v1 API for token/basic authentication to create page '{title}'"
+                )
+                result = self.confluence.create_page(
+                    space=space_key,
+                    title=title,
+                    body=final_body,
+                    parent_id=parent_id,
+                    representation=representation,
+                )
+
+            # Get the new page content
+            page_id = result.get("id")
+            if not page_id:
+                raise ValueError("Create page response did not contain an ID")
+
+            # Set the page emoji if provided
+            if emoji:
+                emoji_updated = self._set_page_emoji(page_id, emoji)
+                if not emoji_updated:
+                    error_message = (
+                        f"Page was created, but page emoji update failed "
+                        f"for page {page_id}"
+                    )
+                    raise RuntimeError(error_message)
+
+            # Set the page width if provided
+            if page_width:
+                width_updated = self._set_page_width(page_id, page_width)
+                if not width_updated:
+                    error_message = (
+                        f"Page was created, but page width update failed "
+                        f"for page {page_id}"
+                    )
+                    raise RuntimeError(error_message)
+
+            return self.get_page_content(page_id)
+        except Exception as e:
+            logger.error(
+                f"Error creating page '{title}' in space {space_key}: {str(e)}"
+            )
+            raise Exception(
+                f"Failed to create page '{title}' in space {space_key}: {str(e)}"
+            ) from e
+
+    def update_page(
+        self,
+        page_id: str,
+        title: str,
+        body: str,
+        *,
+        is_minor_edit: bool = False,
+        version_comment: str = "",
+        is_markdown: bool = True,
+        parent_id: str | None = None,
+        enable_heading_anchors: bool = False,
+        content_representation: str | None = None,
+        emoji: str | None = None,
+        page_width: str | None = None,
+        table_layout: str | None = None,
+    ) -> ConfluencePage:
+        """
+        Update an existing page in Confluence.
+
+        Args:
+            page_id: The ID of the page to update
+            title: The new title of the page
+            body: The new content of the page (markdown, wiki markup, or storage format)
+            is_minor_edit: Whether this is a minor edit (keyword-only)
+            version_comment: Optional comment for this version (keyword-only)
+            is_markdown: Whether the body content is in markdown format (default: True, keyword-only)
+            parent_id: Optional new parent page ID (keyword-only)
+            enable_heading_anchors: Whether to enable automatic heading anchor generation (default: False, keyword-only)
+            content_representation: Content format when is_markdown=False ('wiki' or 'storage', keyword-only)
+            emoji: Optional emoji character for the page title icon (keyword-only). Pass empty string to remove emoji.
+            page_width: Optional page layout width ('full-width', 'max', or 'default', keyword-only). Pass empty string to reset to default.
+            table_layout: Optional table width preset for markdown tables ('full-width', 'wide', 'default', keyword-only)
+
+        Returns:
+            ConfluencePage model containing the updated page's data
+
+        Raises:
+            Exception: If there is an error updating the page
+        """
+        try:
+            # Determine body and representation based on content type
+            if is_markdown:
+                # Convert markdown to Confluence storage format
+                final_body = self.preprocessor.markdown_to_confluence_storage(
+                    body,
+                    enable_heading_anchors=enable_heading_anchors,
+                    table_layout=table_layout,
+                )
+                representation = "storage"
+            else:
+                # Use body as-is with specified representation
+                final_body = body
+                representation = content_representation or "storage"
+
+            logger.debug(f"Updating page {page_id} with title '{title}'")
+
+            # Use v2 API for OAuth authentication, v1 API for token/basic auth
+            v2_adapter = self._v2_adapter
+            if v2_adapter:
+                logger.debug(
+                    f"Using v2 API for OAuth authentication to update page '{page_id}'"
+                )
+                response = v2_adapter.update_page(
+                    page_id=page_id,
+                    title=title,
+                    body=final_body,
+                    representation=representation,
+                    version_comment=version_comment,
+                )
+            else:
+                logger.debug(
+                    f"Using v1 API for token/basic authentication to update page '{page_id}'"
+                )
+                update_kwargs = {
+                    "page_id": page_id,
+                    "title": title,
+                    "body": final_body,
+                    "type": "page",
+                    "representation": representation,
+                    "minor_edit": is_minor_edit,
+                    "version_comment": version_comment,
+                    "always_update": True,
+                }
+                if parent_id:
+                    update_kwargs["parent_id"] = parent_id
+
+                self.confluence.update_page(**update_kwargs)
+
+            # Set or remove the page emoji if provided
+            if emoji is not None:
+                # Empty string means remove emoji, otherwise set it
+                emoji_to_set = emoji if emoji else None
+                emoji_updated = self._set_page_emoji(page_id, emoji_to_set)
+                if not emoji_updated:
+                    error_message = (
+                        f"Page content was updated, but page emoji update failed "
+                        f"for page {page_id}"
+                    )
+                    raise RuntimeError(error_message)
+
+            # Set or remove the page width if provided
+            if page_width is not None:
+                # Empty string means reset to default, otherwise set it
+                width_to_set = page_width if page_width else None
+                width_updated = self._set_page_width(page_id, width_to_set)
+                if not width_updated:
+                    error_message = (
+                        f"Page content was updated, but page width update failed "
+                        f"for page {page_id}"
+                    )
+                    raise RuntimeError(error_message)
+
+            # After update, refresh the page data
+            return self.get_page_content(page_id)
+        except Exception as e:
+            logger.error(f"Error updating page {page_id}: {str(e)}")
+            raise Exception(f"Failed to update page {page_id}: {str(e)}") from e
+
+    def update_page_section(
+        self,
+        page_id: str,
+        heading_text: str,
+        new_content: str,
+        *,
+        content_format: str = "markdown",
+        is_minor_edit: bool = False,
+        version_comment: str = "",
+    ) -> ConfluencePage:
+        """Update a single section of a Confluence page without affecting the rest.
+
+        Fetches the page in raw storage format, locates the section identified by
+        its heading text, replaces only the content between that heading and the
+        next heading of the same or higher level, and writes the modified storage
+        XML back. This is lossless: macros, layouts, mentions, and all other
+        Confluence-specific elements outside the target section are preserved.
+
+        Args:
+            page_id: The ID of the page to update.
+            heading_text: Exact text of the heading that starts the section to
+                replace. Matching is case-sensitive and whitespace-normalised.
+            new_content: Replacement content for the section body (excluding the
+                heading itself).
+            content_format: Format of new_content — ``'markdown'`` (default) or
+                ``'storage'``. When ``'markdown'``, the content is
+                converted to Confluence storage format before insertion.
+                (keyword-only)
+            is_minor_edit: Whether to flag the page version as a minor edit.
+                (keyword-only)
+            version_comment: Optional version comment. (keyword-only)
+
+        Returns:
+            Updated ``ConfluencePage`` with the section replaced.
+
+        Raises:
+            ValueError: If ``heading_text`` is not found on the page, or if
+                ``content_format`` is not one of the accepted values.
+            Exception: If retrieving or updating the page fails.
+        """
+        if content_format not in ("markdown", "storage"):
+            error_msg = (
+                f"Invalid content_format '{content_format}'. Must be "
+                "'markdown' or 'storage'."
+            )
+            raise ValueError(error_msg)
+
+        # 1. Fetch raw storage XML — no markdown conversion so nothing is lost.
+        page = self.get_page_content(page_id, convert_to_markdown=False)
+        raw_storage = page.content or ""
+
+        # 2. Convert new_content to storage format when necessary.
+        if content_format == "markdown":
+            new_storage_fragment = self.preprocessor.markdown_to_confluence_storage(
+                new_content
+            )
+        else:
+            new_storage_fragment = new_content
+
+        # 3. Parse the full storage XML with BeautifulSoup.
+        soup = BeautifulSoup(raw_storage, "html.parser")
+
+        heading_tags = ["h1", "h2", "h3", "h4", "h5", "h6"]
+        target_heading: Tag | None = None
+        for tag in soup.find_all(heading_tags):
+            if (
+                isinstance(tag, Tag)
+                and tag.get_text(strip=True) == heading_text.strip()
+            ):
+                target_heading = tag
+                break
+
+        if target_heading is None:
+            error_msg = (
+                f"Heading '{heading_text.strip()}' not found in page {page_id}. "
+                "Heading text must match exactly (case-sensitive)."
+            )
+            raise ValueError(error_msg)
+
+        heading_level = int(target_heading.name[1])  # e.g. "h2" → 2
+
+        # 4. Collect all sibling nodes that belong to this section (between
+        #    this heading and the next heading of the same or higher level).
+        #    NavigableString nodes (whitespace, text) are included alongside
+        #    Tag nodes, so we type the list broadly.
+        siblings_to_remove: list[Any] = []
+        current = target_heading.next_sibling
+        while current is not None:
+            if isinstance(current, Tag) and current.name in heading_tags:
+                if int(current.name[1]) <= heading_level:
+                    break
+            siblings_to_remove.append(current)
+            current = current.next_sibling
+
+        # 5. Capture heading HTML, remove old section nodes, then splice in the
+        #    new fragment via string operations — avoids moving nodes between
+        #    BS4 trees which causes type and mutation issues.
+        heading_html = str(target_heading)
+        for node in siblings_to_remove:
+            node.extract()
+
+        pruned_html = str(soup)
+        heading_pos = pruned_html.find(heading_html)
+        if heading_pos == -1:
+            # Should not happen: heading was found by BS4 and serialised above.
+            # Guard against unexpected BS4 serialisation edge cases.
+            error_msg = (
+                f"Internal error: could not locate heading '{heading_text.strip()}' "
+                "in serialised page HTML. Please report this as a bug."
+            )
+            raise ValueError(error_msg)
+        insert_at = heading_pos + len(heading_html)
+        final_html = (
+            pruned_html[:insert_at] + new_storage_fragment + pruned_html[insert_at:]
+        )
+
+        # 7. Write the full modified storage XML back — no format conversion,
+        #    so every macro and element outside the section is untouched.
+        logger.debug(
+            f"Updating section '{heading_text}' on page {page_id} "
+            "using lossless storage-format write-back."
+        )
+        return self.update_page(
+            page_id=page_id,
+            title=page.title or "",
+            body=final_html,
+            is_markdown=False,
+            content_representation="storage",
+            is_minor_edit=is_minor_edit,
+            version_comment=version_comment,
+        )
+
+    def get_page_children(
+        self,
+        page_id: str,
+        start: int = 0,
+        limit: int = 25,
+        expand: str = "version,history",
+        *,
+        convert_to_markdown: bool = True,
+        include_folders: bool = True,
+    ) -> list[ConfluencePage]:
+        """
+        Get child pages and folders of a specific Confluence page.
+
+        Args:
+            page_id: The ID of the parent page
+            start: The starting index for pagination
+            limit: Maximum number of child items to return
+            expand: Fields to expand in the response
+            convert_to_markdown: When True, returns content in markdown format,
+                               otherwise returns raw HTML (keyword-only)
+            include_folders: When True, also returns child folders (keyword-only)
+
+        Returns:
+            List of ConfluencePage models containing the child pages and folders
+        """
+        try:
+            limit = clamp_limit(limit, context="confluence.get_page_children")
+
+            v2_adapter = self._page_children_v2_adapter
+            if v2_adapter:
+                logger.debug(f"Using v2 API to get children for Cloud page '{page_id}'")
+                child_items = self._get_v2_page_children_items(
+                    v2_adapter=v2_adapter,
+                    page_id=page_id,
+                    start=start,
+                    limit=limit,
+                    expand=expand,
+                    include_folders=include_folders,
+                )
+            else:
+                # Use the Atlassian Python API's get_page_child_by_type method
+                # First, get child pages
+                page_results = self.confluence.get_page_child_by_type(
+                    page_id=page_id,
+                    type="page",
+                    start=start,
+                    limit=limit,
+                    expand=expand,
+                )
+
+                # Handle both pagination modes for pages
+                if isinstance(page_results, dict) and "results" in page_results:
+                    child_items = page_results.get("results", [])
+                else:
+                    child_items = page_results or []
+
+                # Also get child folders if requested
+                if include_folders:
+                    try:
+                        folder_results = self.confluence.get_page_child_by_type(
+                            page_id=page_id,
+                            type="folder",
+                            start=start,
+                            limit=limit,
+                            expand=expand,
+                        )
+
+                        # Handle both pagination modes for folders
+                        if (
+                            isinstance(folder_results, dict)
+                            and "results" in folder_results
+                        ):
+                            child_folders = folder_results.get("results", [])
+                        else:
+                            child_folders = folder_results or []
+
+                        # Combine pages and folders
+                        child_items = child_items + child_folders
+                    except Exception as folder_err:
+                        # Log but don't fail if folder fetching fails
+                        # (e.g., older Confluence versions might not support folders)
+                        logger.debug(
+                            "Could not fetch child folders for page "
+                            f"{page_id}: {folder_err}"
+                        )
+
+            # Get space key from the first result if available
+            space_key = ""
+            if child_items:
+                first_item = child_items[0]
+                if "space" in first_item:
+                    space_key = first_item.get("space", {}).get("key", "")
+                elif expandable := first_item.get("_expandable", {}):
+                    if space_path := expandable.get("space"):
+                        if space_path.startswith("/rest/api/space/"):
+                            space_key = space_path.split("/rest/api/space/")[1]
+
+            # Process results
+            page_models = []
+
+            # Process each child item (page or folder)
+            for item in child_items:
+                # Only process content if we have "body" expanded
+                content_override = None
+                if "body" in item and convert_to_markdown:
+                    content = item.get("body", {}).get("storage", {}).get("value", "")
+                    if content:
+                        _, processed_markdown = self.preprocessor.process_html_content(
+                            content,
+                            space_key=space_key,
+                            confluence_client=self.confluence,
+                            content_id=str(item.get("id", "")),
+                        )
+                        content_override = processed_markdown
+
+                # Create the page model (works for both pages and folders)
+                page_model = ConfluencePage.from_api_response(
+                    item,
+                    base_url=self.config.url,
+                    include_body=True,
+                    content_override=content_override,
+                    content_format="markdown" if convert_to_markdown else "storage",
+                    is_cloud=self.config.is_cloud,
+                )
+
+                page_models.append(page_model)
+
+            return page_models
+
+        except Exception as e:
+            logger.error(f"Error fetching child pages for page {page_id}: {str(e)}")
+            logger.debug("Full exception details:", exc_info=True)
+            raise
+
+    @handle_auth_errors("Confluence API")
+    def get_space_page_tree(
+        self,
+        space_key: str,
+        limit: int = 500,
+    ) -> dict:
+        """Get hierarchical page tree for a space.
+
+        Returns a flat list of pages with parent_id and position attributes,
+        allowing the AI to build custom views or filter as needed. This is
+        more token-efficient than ASCII art and easier to process.
+
+        Uses manual pagination via get_all_pages_from_space_raw() to reliably
+        fetch all pages and detect truncation via _links.next, matching the
+        pagination pattern in search.py.
+
+        Args:
+            space_key: The key of the space
+            limit: Maximum number of pages to fetch (default: 500)
+
+        Returns:
+            Dictionary with:
+            - space_key: The space key
+            - total_pages: Total number of pages in the response
+            - has_more: Whether more pages exist beyond the limit
+            - pages: List of dicts with id, title, parent_id, position, depth
+            - Note: parent_id is None for root pages
+
+        Raises:
+            Exception: If there is an error fetching pages
+        """
+        try:
+            limit = clamp_limit(limit, context="confluence.get_space_page_tree")
+
+            # Paginate using the raw API to access _links.next for reliable
+            # truncation detection. The higher-level get_all_pages_from_space()
+            # has a broken termination condition when limit > server-side cap.
+            page_size = 200
+            start = 0
+            all_pages: list[dict[str, Any]] = []
+            next_link: str | None = None
+
+            while len(all_pages) < limit:
+                fetch_limit = min(page_size, limit - len(all_pages))
+                response = self.confluence.get_all_pages_from_space_raw(
+                    space=space_key,
+                    start=start,
+                    limit=fetch_limit,
+                    expand="ancestors",
+                )
+                batch = response.get("results", [])
+                all_pages.extend(batch)
+
+                next_link = response.get("_links", {}).get("next")
+                if not batch or not next_link:
+                    break
+                start += len(batch)
+
+            has_more = len(all_pages) >= limit and bool(next_link)
+
+            if not all_pages:
+                return {
+                    "space_key": space_key,
+                    "total_pages": 0,
+                    "has_more": False,
+                    "pages": [],
+                }
+
+            # Build flat list with parent_id and depth
+            result_pages = []
+
+            for page in all_pages:
+                page_id = page.get("id")
+                title = page.get("title", "Untitled")
+
+                # Position is auto-included via extensions in the v1 API.
+                # Confluence DC/Server can return position as the string
+                # "none" (or other non-numeric strings) instead of int/null.
+                # Normalize to int | None so sorting never mixes types.
+                raw_position = page.get("extensions", {}).get("position")
+                if raw_position is None:
+                    position = None
+                elif isinstance(raw_position, int):
+                    position = raw_position
+                else:
+                    try:
+                        position = int(str(raw_position))
+                    except (TypeError, ValueError):
+                        position = None
+
+                # Determine parent and depth from ancestors
+                ancestors = page.get("ancestors", [])
+                if ancestors:
+                    parent_id = ancestors[-1].get("id")
+                    depth = len(ancestors)
+                else:
+                    parent_id = None
+                    depth = 0
+
+                result_pages.append(
+                    {
+                        "id": page_id,
+                        "title": title,
+                        "parent_id": parent_id,
+                        "position": position,
+                        "depth": depth,
+                    }
+                )
+
+            # Sort by depth first (breadth-first), then by position.
+            # Position is now always int | None after normalization above.
+            result_pages.sort(
+                key=lambda p: (
+                    p["depth"],
+                    p["position"] if p["position"] is not None else 999999,
+                    p["title"] or "",
+                )
+            )
+
+            result: dict[str, Any] = {
+                "space_key": space_key,
+                "total_pages": len(result_pages),
+                "has_more": has_more,
+                "pages": result_pages,
+            }
+            if has_more:
+                result["next_start"] = start
+            return result
+
+        except HTTPError:
+            raise  # let @handle_auth_errors decorator handle auth errors
+        except Exception as e:
+            logger.error(f"Error fetching page tree for space '{space_key}': {e}")
+            raise Exception(f"Failed to fetch page tree: {e}") from e
+
+    def delete_page(self, page_id: str) -> bool:
+        """
+        Delete a Confluence page by its ID.
+
+        Args:
+            page_id: The ID of the page to delete
+
+        Returns:
+            Boolean indicating success (True) or failure (False)
+
+        Raises:
+            Exception: If there is an error deleting the page
+        """
+        try:
+            logger.debug(f"Deleting page {page_id}")
+
+            # Use v2 API for OAuth authentication, v1 API for token/basic auth
+            v2_adapter = self._v2_adapter
+            if v2_adapter:
+                logger.debug(
+                    f"Using v2 API for OAuth authentication to delete page '{page_id}'"
+                )
+                return v2_adapter.delete_page(page_id=page_id)
+            else:
+                logger.debug(
+                    f"Using v1 API for token/basic authentication to delete page '{page_id}'"
+                )
+                response = self.confluence.remove_page(page_id=page_id)
+
+                # The Atlassian library's remove_page returns the raw response from
+                # the REST API call. For a successful deletion, we should get a
+                # response object, but it might be empty (HTTP 204 No Content).
+                # For REST DELETE operations, a success typically returns 204 or 200
+
+                # Check if we got a response object
+                if isinstance(response, requests.Response):
+                    # Check if status code indicates success (2xx)
+                    success = 200 <= response.status_code < 300
+                    logger.debug(
+                        f"Delete page {page_id} returned status code {response.status_code}"
+                    )
+                    return success
+                # If it's not a response object but truthy (like True), consider it a success
+                elif response:
+                    return True
+                # Default to true since no exception was raised
+                # This is safer than returning false when we don't know what happened
+                return True
+
+        except Exception as e:
+            logger.error(f"Error deleting page {page_id}: {str(e)}")
+            raise Exception(f"Failed to delete page {page_id}: {str(e)}") from e
+
+    @handle_auth_errors("Confluence API")
+    def get_page_history(
+        self,
+        page_id: str,
+        version: int,
+        convert_to_markdown: bool = True,
+    ) -> ConfluencePage:
+        """
+        Get the history of a specific page.
+
+        Args:
+            page_id: The ID of the page to get history for
+            version: The version to get history for
+            convert_to_markdown: When True, returns content in
+                markdown format
+
+        Returns:
+            ConfluencePage model containing the page history
+
+        Raises:
+            MCPAtlassianAuthenticationError: If authentication
+                fails with the Confluence API (401/403)
+            Exception: If there is an error getting page history
+        """
+        try:
+            v2_adapter = self._v2_adapter
+            if v2_adapter:
+                logger.debug(
+                    "Using v2 API for OAuth authentication"
+                    " to get page history for"
+                    f" '{page_id}' version {version}"
+                )
+                page = v2_adapter.get_page_by_version(
+                    page_id=page_id,
+                    version=version,
+                    expand="body.storage,version,space,children.attachment,history",
+                )
+            else:
+                logger.debug(
+                    "Using v1 API for token/basic"
+                    " authentication to get page history"
+                    f" for '{page_id}'"
+                )
+                page = self.confluence.get_page_by_id(
+                    page_id=page_id,
+                    status="historical",
+                    version=version,
+                    expand="body.storage,version,space,children.attachment,history",
+                )
+
+            if isinstance(page, str):
+                error_msg = f"API returned error response: {page[:500]}"
+                raise Exception(error_msg)
+
+            try:
+                content = page["body"]["storage"]["value"]
+            except (KeyError, TypeError) as e:
+                logger.warning(
+                    f"Page {page.get('id', 'unknown')} missing body.storage.value: {e}"
+                )
+                content = ""
+
+            space_key = page.get("space", {}).get("key", "")
+            page_attachments = (
+                page.get("children", {}).get("attachment", {}).get("results", [])
+            )
+            processed_html, processed_markdown = self.preprocessor.process_html_content(
+                content,
+                space_key=space_key,
+                confluence_client=self.confluence,
+                content_id=str(page.get("id", "")),
+                attachments=page_attachments,
+            )
+
+            page_content = processed_markdown if convert_to_markdown else processed_html
+
+            emoji = self._get_page_emoji(page_id)
+            return ConfluencePage.from_api_response(
+                page,
+                base_url=self.config.url,
+                include_body=True,
+                content_override=page_content,
+                content_format=("markdown" if convert_to_markdown else "storage"),
+                is_cloud=self.config.is_cloud,
+                emoji=emoji,
+            )
+        except HTTPError:
+            raise  # let decorator handle auth errors
+        except Exception as e:
+            logger.error(f"Error getting page history for page {page_id}: {str(e)}")
+            raise Exception(f"Error getting page history: {str(e)}") from e
+
+    @handle_auth_errors("Confluence API")
+    def move_page(
+        self,
+        page_id: str,
+        target_parent_id: str | None = None,
+        target_space_key: str | None = None,
+        position: str = "append",
+    ) -> ConfluencePage:
+        """Move a page to a new parent or space.
+
+        Args:
+            page_id: ID of the page to move.
+            target_parent_id: Target parent page ID. If omitted with
+                target_space_key, moves page to root of target space.
+            target_space_key: Target space key for cross-space moves.
+            position: Position relative to target ("append", "above",
+                or "below").
+
+        Returns:
+            Updated ConfluencePage after move.
+
+        Raises:
+            ValueError: If neither target_parent_id nor target_space_key
+                is provided.
+            MCPAtlassianAuthenticationError: If authentication fails.
+        """
+        if not target_parent_id and not target_space_key:
+            raise ValueError(
+                "At least one of target_parent_id or target_space_key must be provided."
+            )
+
+        try:
+            # Use v2 adapter for OAuth authentication
+            v2_adapter = self._v2_adapter
+            if v2_adapter:
+                logger.debug(
+                    f"Using REST API for OAuth authentication to move page '{page_id}'"
+                )
+                v2_adapter.move_page(
+                    page_id=page_id,
+                    position=position,
+                    target_id=target_parent_id,
+                )
+            else:
+                # Determine space_key for the move_page call
+                if target_space_key:
+                    space_key = target_space_key
+                else:
+                    # Look up the target parent's space key
+                    target_page = self.confluence.get_page_by_id(target_parent_id)
+                    space_key = target_page.get("space", {}).get("key", "")
+
+                self.confluence.move_page(
+                    space_key,
+                    page_id,
+                    target_id=target_parent_id,
+                    position=position,
+                )
+
+            # Re-fetch the page to return updated state
+            return self.get_page_content(page_id)
+        except HTTPError:
+            raise  # let decorator handle auth errors
+        except ValueError:
+            raise  # re-raise our own validation error
+        except Exception as e:
+            logger.error(f"Error moving page {page_id}: {str(e)}")
+            raise Exception(f"Failed to move page {page_id}: {str(e)}") from e
+
+    @handle_auth_errors("Confluence API")
+    def get_page_version_diff(
+        self,
+        page_id: str,
+        from_version: int,
+        to_version: int,
+    ) -> dict[str, Any]:
+        """Get unified diff between two versions of a page.
+
+        Args:
+            page_id: Page ID.
+            from_version: Source version number.
+            to_version: Target version number.
+
+        Returns:
+            Dict with page_id, title, from_version, to_version,
+            and diff string.
+
+        Raises:
+            MCPAtlassianAuthenticationError: If authentication fails.
+        """
+        from_page = self.get_page_history(page_id=page_id, version=from_version)
+        to_page = self.get_page_history(page_id=page_id, version=to_version)
+
+        from_lines = (from_page.content or "").splitlines()
+        to_lines = (to_page.content or "").splitlines()
+
+        diff_lines = difflib.unified_diff(
+            from_lines,
+            to_lines,
+            fromfile=f"v{from_version}",
+            tofile=f"v{to_version}",
+            lineterm="",
+        )
+        diff_string = "\n".join(diff_lines)
+
+        return {
+            "page_id": page_id,
+            "title": to_page.title,
+            "from_version": from_version,
+            "to_version": to_version,
+            "diff": diff_string,
+        }
+
+    @handle_auth_errors("Confluence API")
+    def copy_page(
+        self,
+        source_page_id: str,
+        destination_space_key: str,
+        new_title: str,
+        destination_parent_id: str | None = None,
+        *,
+        copy_attachments: bool = True,
+    ) -> ConfluencePage:
+        """Copy a Confluence page to a new location.
+
+        On Confluence Cloud the native copy endpoint is used
+        (``POST /wiki/rest/api/content/{id}/copy``).  On Server/Data Center
+        the page body and title are fetched and a new page is created manually
+        (attachments are not copied in the Server/DC fallback path).
+
+        Args:
+            source_page_id: The ID of the page to copy.
+            destination_space_key: Space key for the new page.
+            new_title: Title of the new page.
+            destination_parent_id: Optional parent page ID in the destination space.
+                When omitted the new page is created at the space root.
+            copy_attachments: Whether to copy attachments (Cloud only, keyword-only).
+
+        Returns:
+            ConfluencePage model for the newly created copy.
+
+        Raises:
+            MCPAtlassianAuthenticationError: If authentication fails.
+            Exception: If the copy operation fails.
+        """
+        try:
+            if self.config.is_cloud:
+                payload: dict[str, object] = {
+                    "copyAttachments": copy_attachments,
+                    "copyPermissions": False,
+                    "copyProperties": False,
+                    "copyLabels": False,
+                    "pageTitle": new_title,
+                    "destination": {
+                        "type": "parent_page" if destination_parent_id else "space",
+                        "value": destination_parent_id or destination_space_key,
+                    },
+                }
+                result = self.confluence.post(
+                    f"{self._v1_rest_base_url()}/rest/api/content/"
+                    f"{source_page_id}/copy",
+                    data=payload,
+                    absolute=True,
+                )
+            else:
+                # Server/DC: manual GET + POST (no native copy endpoint)
+                source = self.confluence.get_page_by_id(
+                    source_page_id, expand="body.storage,version,space"
+                )
+                body = source.get("body", {}).get("storage", {}).get("value", "")
+                create_kwargs: dict[str, object] = {
+                    "space": destination_space_key,
+                    "title": new_title,
+                    "body": body,
+                    "representation": "storage",
+                }
+                if destination_parent_id:
+                    create_kwargs["parent_id"] = destination_parent_id
+                result = self.confluence.create_page(**create_kwargs)
+
+            new_page_id = result.get("id")
+            if not new_page_id:
+                raise ValueError("Copy response did not contain a page ID")
+
+            return self.get_page_content(new_page_id)
+        except HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error copying page {source_page_id}: {str(e)}")
+            raise Exception(f"Failed to copy page {source_page_id}: {str(e)}") from e

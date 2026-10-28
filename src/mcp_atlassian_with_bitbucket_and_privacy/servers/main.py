@@ -1,0 +1,1095 @@
+"""Main FastMCP server setup for Atlassian integration."""
+
+import base64
+import json
+import logging
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any, Literal, Optional
+from urllib.parse import urlparse
+
+from fastmcp import FastMCP
+from fastmcp import settings as fastmcp_settings
+from fastmcp.exceptions import NotFoundError
+from fastmcp.server.event_store import EventStore
+from fastmcp.server.http import StarletteWithLifespan
+from fastmcp.tools import Tool as FastMCPTool
+from mcp.types import Tool as MCPTool
+from starlette.middleware import Middleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from mcp_atlassian_with_bitbucket_and_privacy.bitbucket.config import (
+    BitbucketConfig,
+    _is_bitbucket_cloud_url,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.confluence.config import ConfluenceConfig
+from mcp_atlassian_with_bitbucket_and_privacy.jira.config import JiraConfig
+from mcp_atlassian_with_bitbucket_and_privacy.privacy import (
+    IdentityPrivacyConfig,
+    install_identity_privacy,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.utils.env import is_env_truthy
+from mcp_atlassian_with_bitbucket_and_privacy.utils.environment import (
+    get_available_services,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.utils.io import is_read_only_mode
+from mcp_atlassian_with_bitbucket_and_privacy.utils.logging import mask_sensitive
+from mcp_atlassian_with_bitbucket_and_privacy.utils.oauth import (
+    CLOUD_AUTHORIZE_URL,
+    CLOUD_TOKEN_URL,
+    DC_AUTHORIZE_PATH,
+    DC_TOKEN_PATH,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.utils.token_verifier import (
+    AtlassianOpaqueTokenVerifier,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.utils.tools import (
+    get_enabled_tools,
+    should_include_tool,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.utils.toolsets import (
+    get_enabled_toolsets,
+    should_include_tool_by_toolset,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.utils.urls import (
+    is_atlassian_cloud_url,
+    validate_url_for_ssrf,
+)
+
+from .bitbucket import bitbucket_mcp
+from .client_storage import build_oauth_client_storage_from_env
+from .confluence import confluence_mcp
+from .context import MainAppContext
+from .error_handling import ErrorPreservingFastMCP
+from .jira import jira_mcp
+from .oauth_proxy import HardenedOAuthProxy, parse_env_list
+
+logger = logging.getLogger("mcp-atlassian-with-bitbucket-and-privacy.server.main")
+
+DEFAULT_HOST = "0.0.0.0"  # noqa: S104
+DEFAULT_ALLOWED_REDIRECT_URIS = [
+    "http://localhost:*",
+    "http://127.0.0.1:*",
+    "https://chatgpt.com/connector_platform_oauth_redirect",
+    "https://chat.openai.com/connector_platform_oauth_redirect",
+]
+DEFAULT_ALLOWED_GRANT_TYPES = ["authorization_code", "refresh_token"]
+OAUTH_PROXY_ENABLE_ENV = "ATLASSIAN_OAUTH_PROXY_ENABLE"
+
+# Bitbucket Cloud OAuth 2.0 endpoints
+BITBUCKET_CLOUD_AUTHORIZE_URL = "https://bitbucket.org/site/oauth2/authorize"
+BITBUCKET_CLOUD_TOKEN_URL = "https://bitbucket.org/site/oauth2/access_token"  # noqa: S105
+
+
+def _sanitize_schema_for_compatibility(tool: MCPTool) -> MCPTool:
+    """Sanitize tool inputSchema for AI platform compatibility.
+
+    Collapses simple nullable ``anyOf`` unions that Pydantic v2 generates
+    for ``T | None`` into a plain ``{"type": T}`` property.  This fixes
+    Vertex AI / Google ADK rejecting ``anyOf`` alongside ``default`` or
+    ``description`` fields (issues #640, #733).
+
+    The transform is intentionally conservative — it only flattens nullable
+    unions with exactly one non-null branch so that complex multi-type schemas
+    are left untouched. FastMCP/Pydantic can emit nested nullable unions on
+    Python 3.10, so nullable branches are resolved recursively.
+
+    Note: Only top-level ``properties`` are processed.  Nested schemas
+    (e.g. ``items`` of arrays or ``properties`` of sub-objects) are not
+    walked.  This is sufficient for current tool definitions; extend if
+    nested ``anyOf`` patterns appear in the future.
+
+    Args:
+        tool: The MCP tool whose inputSchema will be sanitized in-place.
+
+    Returns:
+        The same MCPTool instance (mutated) for chaining convenience.
+    """
+    schema = tool.inputSchema
+    if not schema or not isinstance(schema, dict):
+        return tool
+
+    properties = schema.get("properties")
+    if not properties or not isinstance(properties, dict):
+        return tool
+
+    def resolve_nullable_schema(schema_def: dict[str, Any]) -> dict[str, Any] | None:
+        any_of = schema_def.get("anyOf")
+        if not any_of or not isinstance(any_of, list):
+            return None
+
+        # Only flatten nullable unions with exactly one non-null branch.
+        non_null = [v for v in any_of if v != {"type": "null"}]
+        null_present = any(v == {"type": "null"} for v in any_of)
+        if not null_present or len(non_null) != 1 or not isinstance(non_null[0], dict):
+            return None
+
+        candidate = non_null[0]
+        nested = resolve_nullable_schema(candidate)
+        resolved = nested if nested is not None else candidate
+        if "type" not in resolved:
+            return None
+
+        return {key: value for key, value in resolved.items() if key != "anyOf"}
+
+    for _prop_name, prop_def in properties.items():
+        if not isinstance(prop_def, dict):
+            continue
+
+        resolved_schema = resolve_nullable_schema(prop_def)
+        if resolved_schema is None:
+            continue
+
+        # Collapse: pull the real schema up, drop anyOf, and preserve outer
+        # metadata such as description/default when both levels provide it.
+        prop_def.pop("anyOf")
+        for key, value in resolved_schema.items():
+            if key in {"default", "description"} and key in prop_def:
+                continue
+            prop_def[key] = value
+
+    return tool
+
+
+async def health_check(request: Request) -> JSONResponse:
+    mode = IdentityPrivacyConfig.from_env().mode.value
+    return JSONResponse({"status": "ok", "identity_privacy": mode})
+
+
+@asynccontextmanager
+async def main_lifespan(app: FastMCP[MainAppContext]) -> AsyncIterator[dict[str, Any]]:
+    logger.info("Main Atlassian MCP server lifespan starting...")
+    services = get_available_services()
+    read_only = is_read_only_mode()
+    enabled_tools = get_enabled_tools()
+    enabled_toolsets = get_enabled_toolsets()
+
+    loaded_jira_config: JiraConfig | None = None
+    loaded_confluence_config: ConfluenceConfig | None = None
+    loaded_bitbucket_config: BitbucketConfig | None = None
+
+    if services.get("jira"):
+        try:
+            jira_config = JiraConfig.from_env()
+            if jira_config.is_auth_configured():
+                loaded_jira_config = jira_config
+                logger.info(
+                    "Jira configuration loaded and authentication is configured."
+                )
+            else:
+                logger.warning(
+                    "Jira URL found, but authentication is not fully configured. Jira tools will be unavailable."
+                )
+        except Exception as e:
+            logger.error(f"Failed to load Jira configuration: {e}", exc_info=True)
+
+    if services.get("confluence"):
+        try:
+            confluence_config = ConfluenceConfig.from_env()
+            if confluence_config.is_auth_configured():
+                loaded_confluence_config = confluence_config
+                logger.info(
+                    "Confluence configuration loaded and authentication is configured."
+                )
+            else:
+                logger.warning(
+                    "Confluence URL found, but authentication is not fully configured. Confluence tools will be unavailable."
+                )
+        except Exception as e:
+            logger.error(f"Failed to load Confluence configuration: {e}", exc_info=True)
+
+    if services.get("bitbucket"):
+        try:
+            bitbucket_config = BitbucketConfig.from_env()
+            if bitbucket_config.is_auth_configured():
+                loaded_bitbucket_config = bitbucket_config
+                logger.info(
+                    "Bitbucket configuration loaded and authentication is configured."
+                )
+            else:
+                logger.warning(
+                    "Bitbucket URL found, but authentication is not fully configured. Bitbucket tools will be unavailable."
+                )
+        except Exception as e:
+            logger.error(f"Failed to load Bitbucket configuration: {e}", exc_info=True)
+
+    app_context = MainAppContext(
+        full_jira_config=loaded_jira_config,
+        full_confluence_config=loaded_confluence_config,
+        full_bitbucket_config=loaded_bitbucket_config,
+        read_only=read_only,
+        enabled_tools=enabled_tools,
+        enabled_toolsets=enabled_toolsets,
+    )
+    logger.info(f"Read-only mode: {'ENABLED' if read_only else 'DISABLED'}")
+    logger.info(f"Enabled tools filter: {enabled_tools or 'All tools enabled'}")
+    logger.info(f"Enabled toolsets filter: {sorted(enabled_toolsets)}")
+
+    try:
+        yield {"app_lifespan_context": app_context}
+    except Exception as e:
+        logger.error(f"Error during lifespan: {e}", exc_info=True)
+        raise
+    finally:
+        logger.info("Main Atlassian MCP server lifespan shutting down...")
+        # Perform any necessary cleanup here
+        try:
+            # Close any open connections if needed
+            if loaded_jira_config:
+                logger.debug("Cleaning up Jira resources...")
+            if loaded_confluence_config:
+                logger.debug("Cleaning up Confluence resources...")
+            if loaded_bitbucket_config:
+                logger.debug("Cleaning up Bitbucket resources...")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}", exc_info=True)
+        logger.info("Main Atlassian MCP server lifespan shutdown complete.")
+
+
+class AtlassianMCP(ErrorPreservingFastMCP[MainAppContext]):
+    """Custom FastMCP server class for Atlassian integration with tool filtering."""
+
+    _active_streamable_http_path: str | None = None
+
+    @staticmethod
+    def _normalize_http_path(path: str) -> str:
+        normalized_path = path.strip()
+        if not normalized_path:
+            return "/"
+        if not normalized_path.startswith("/"):
+            normalized_path = f"/{normalized_path}"
+        normalized_path = normalized_path.rstrip("/")
+        return normalized_path or "/"
+
+    def get_streamable_http_path(self) -> str:
+        if self._active_streamable_http_path:
+            return self._active_streamable_http_path
+        return self._normalize_http_path(fastmcp_settings.streamable_http_path)
+
+    def _tool_filter_context(self) -> dict[str, Any] | None:
+        """Gather the per-request tool-enablement context (read-only mode, enabled
+        tools/toolsets, service availability) from the lifespan/request context.
+
+        Returns None when the lifespan context is unavailable.
+        """
+        req_context = self._mcp_server.request_context
+        if req_context is None or req_context.lifespan_context is None:
+            return None
+
+        lifespan_ctx_dict = req_context.lifespan_context
+        app_lifespan_state: MainAppContext | None = (
+            lifespan_ctx_dict.get("app_lifespan_context")
+            if isinstance(lifespan_ctx_dict, dict)
+            else None
+        )
+        read_only = (
+            getattr(app_lifespan_state, "read_only", False)
+            if app_lifespan_state
+            else False
+        )
+        enabled_tools_filter = (
+            getattr(app_lifespan_state, "enabled_tools", None)
+            if app_lifespan_state
+            else None
+        )
+        enabled_toolsets_filter: set[str] | None = (
+            getattr(app_lifespan_state, "enabled_toolsets", None)
+            if app_lifespan_state
+            else None
+        )
+
+        header_based_services = {
+            "jira": False,
+            "confluence": False,
+            "bitbucket": False,
+        }
+        service_headers: dict[str, str] = {}
+        request = getattr(req_context, "request", None)
+        if request is not None:
+            request_service_headers = getattr(
+                request.state, "atlassian_service_headers", {}
+            )
+            if isinstance(request_service_headers, dict) and request_service_headers:
+                service_headers = request_service_headers
+                header_based_services = get_available_services(service_headers)
+
+        jira_config = (
+            app_lifespan_state.full_jira_config if app_lifespan_state else None
+        )
+        jira_url_header = service_headers.get("X-Atlassian-Jira-Url")
+        jira_is_cloud: bool | None = None
+        if jira_url_header:
+            jira_is_cloud = is_atlassian_cloud_url(jira_url_header)
+        elif jira_config is not None:
+            jira_is_cloud = bool(jira_config.is_cloud)
+
+        return {
+            "read_only": read_only,
+            "enabled_tools_filter": enabled_tools_filter,
+            "enabled_toolsets_filter": enabled_toolsets_filter,
+            "app_lifespan_state": app_lifespan_state,
+            "header_based_services": header_based_services,
+            "jira_is_cloud": jira_is_cloud,
+        }
+
+    def _is_tool_authorized(
+        self, registered_name: str, tool_obj: FastMCPTool, ctx: dict[str, Any]
+    ) -> bool:
+        """Authorization boundaries enforced at BOTH listing and call time: the
+        ENABLED_TOOLS allowlist, the enabled toolsets, and read-only mode.
+
+        These are security boundaries — a tool excluded here must not be invocable
+        by name. (Service availability, below, is a listing-only UX filter: an
+        unavailable-service tool simply fails naturally if called.)
+        """
+        tool_tags = tool_obj.tags
+        if not should_include_tool_by_toolset(
+            tool_tags, ctx["enabled_toolsets_filter"]
+        ):
+            return False
+        if not should_include_tool(registered_name, ctx["enabled_tools_filter"]):
+            return False
+        if ctx["read_only"] and "write" in tool_tags:
+            return False
+        return True
+
+    @staticmethod
+    def _is_tool_supported_on_deployment(
+        tool_obj: FastMCPTool, ctx: dict[str, Any]
+    ) -> bool:
+        """Return whether a tool is supported by the configured deployment."""
+        tool_tags = tool_obj.tags
+        if "cloud_only" in tool_tags and "jira" in tool_tags:
+            return ctx["jira_is_cloud"] is not False
+        return True
+
+    def _is_tool_enabled(
+        self, registered_name: str, tool_obj: FastMCPTool, ctx: dict[str, Any]
+    ) -> bool:
+        """Listing filter: the tool is authorized AND its backing service is
+        configured/available (the latter is a listing-only graceful-hide)."""
+        if not self._is_tool_authorized(registered_name, tool_obj, ctx):
+            return False
+        if not self._is_tool_supported_on_deployment(tool_obj, ctx):
+            return False
+
+        app_lifespan_state = ctx["app_lifespan_state"]
+        header_based_services = ctx["header_based_services"]
+        tool_tags = tool_obj.tags
+
+        is_jira_tool = "jira" in tool_tags
+        is_confluence_tool = "confluence" in tool_tags
+        is_bitbucket_tool = "bitbucket" in tool_tags
+        if app_lifespan_state:
+            jira_available = (
+                app_lifespan_state.full_jira_config is not None
+            ) or header_based_services.get("jira", False)
+            confluence_available = (
+                app_lifespan_state.full_confluence_config is not None
+            ) or header_based_services.get("confluence", False)
+            bitbucket_available = (
+                app_lifespan_state.full_bitbucket_config is not None
+            ) or header_based_services.get("bitbucket", False)
+            if is_jira_tool and not jira_available:
+                return False
+            if is_confluence_tool and not confluence_available:
+                return False
+            if is_bitbucket_tool and not bitbucket_available:
+                return False
+        elif is_jira_tool or is_confluence_tool or is_bitbucket_tool:
+            if is_jira_tool and not header_based_services.get("jira", False):
+                return False
+            if is_confluence_tool and not header_based_services.get(
+                "confluence", False
+            ):
+                return False
+            if is_bitbucket_tool and not header_based_services.get("bitbucket", False):
+                return False
+        return True
+
+    async def _list_tools_mcp(self) -> list[MCPTool]:
+        # Filter tools based on enabled_tools, read_only mode, and service configuration from the lifespan context.
+        ctx = self._tool_filter_context()
+        if ctx is None:
+            logger.warning(
+                "Lifespan context not available during _list_tools_mcp call."
+            )
+            return []
+
+        all_tools: list[FastMCPTool] = await self.list_tools()
+        logger.debug(
+            f"Aggregated {len(all_tools)} tools before filtering: "
+            f"{[tool.name for tool in all_tools]}"
+        )
+
+        filtered_tools: list[MCPTool] = []
+        for tool_obj in all_tools:
+            registered_name = tool_obj.name
+            if not self._is_tool_enabled(registered_name, tool_obj, ctx):
+                logger.debug(f"Excluding tool '{registered_name}' (filtered)")
+                continue
+            mcp_tool = tool_obj.to_mcp_tool(name=registered_name)
+            _sanitize_schema_for_compatibility(mcp_tool)
+            filtered_tools.append(mcp_tool)
+
+        logger.debug(
+            f"_list_tools_mcp: Total tools after filtering: {len(filtered_tools)}"
+        )
+        return filtered_tools
+
+    async def _call_tool_mcp(self, key: str, arguments: dict[str, Any]) -> Any:
+        # Enforce the same enablement filter at call time as at listing time, so a
+        # tool hidden from the listing (read-only mode, not in ENABLED_TOOLS, toolset
+        # disabled, or deployment-incompatible) cannot be invoked directly by name.
+        # Under an active filter context, denials and genuinely unknown tools raise
+        # byte-identical messages here (no exists-but-disabled leak), decoupled from
+        # upstream's error format (FastMCP uses a repr-quoted name).
+        ctx = self._tool_filter_context()
+        if ctx is not None:
+            tool_obj = await self.get_tool(key)
+            if (
+                tool_obj is None
+                or not self._is_tool_authorized(key, tool_obj, ctx)
+                or not self._is_tool_supported_on_deployment(tool_obj, ctx)
+            ):
+                raise NotFoundError(f"Unknown tool: {key}")
+        return await super()._call_tool_mcp(key, arguments)
+
+    def http_app(
+        self,
+        path: str | None = None,
+        middleware: list[Middleware] | None = None,
+        json_response: bool | None = None,
+        stateless_http: bool | None = None,
+        transport: Literal["http", "streamable-http", "sse"] = "streamable-http",
+        event_store: EventStore | None = None,
+        retry_interval: int | None = None,
+        host_origin_protection: bool | Literal["auto"] | None = None,
+        allowed_hosts: list[str] | None = None,
+        allowed_origins: list[str] | None = None,
+    ) -> StarletteWithLifespan:
+        final_path = path
+        if transport == "streamable-http":
+            configured_path = path or fastmcp_settings.streamable_http_path
+            final_path = self._normalize_http_path(configured_path)
+            self._active_streamable_http_path = final_path
+
+        user_token_mw = Middleware(UserTokenMiddleware, mcp_server_ref=self)
+        final_middleware_list = [user_token_mw]
+        if middleware:
+            final_middleware_list.extend(middleware)
+        app = super().http_app(
+            path=final_path,
+            middleware=final_middleware_list,
+            json_response=json_response,
+            stateless_http=stateless_http,
+            transport=transport,
+            event_store=event_store,
+            retry_interval=retry_interval,
+            host_origin_protection=host_origin_protection,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=allowed_origins,
+        )
+        return app
+
+
+class UserTokenMiddleware:
+    """ASGI-compliant middleware to extract Atlassian user tokens/credentials.
+
+    Based on PR #700 by @isaacpalomero - fixes ASGI protocol violations that caused
+    server crashes when MCP clients disconnect during HTTP requests.
+    """
+
+    def __init__(
+        self, app: ASGIApp, mcp_server_ref: Optional["AtlassianMCP"] = None
+    ) -> None:
+        self.app = app
+        self.mcp_server_ref = mcp_server_ref
+        if not self.mcp_server_ref:
+            logger.warning(
+                "UserTokenMiddleware initialized without mcp_server_ref. "
+                "Path matching for MCP endpoint might fail if settings are needed."
+            )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Pass through non-HTTP requests directly per ASGI spec
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # According to ASGI spec, middleware should copy scope when modifying it
+        scope_copy: Scope = dict(scope)
+
+        # Ensure state exists in scope - this is where Starlette stores request state
+        if "state" not in scope_copy:
+            scope_copy["state"] = {}
+
+        # Initialize default authentication state (only initialize fields that should always exist)
+        # Note: user_atlassian_token and user_atlassian_auth_type are NOT initialized
+        # They are only set when present, so hasattr() checks work correctly
+        scope_copy["state"]["user_atlassian_email"] = None
+        scope_copy["state"]["user_atlassian_cloud_id"] = None
+        scope_copy["state"]["auth_validation_error"] = None
+
+        logger.debug(
+            f"UserTokenMiddleware: Processing {scope_copy.get('method', 'UNKNOWN')} "
+            f"{scope_copy.get('path', 'UNKNOWN')}"
+        )
+
+        # Skip auth header processing if IGNORE_HEADER_AUTH is set
+        # (useful for GCP Cloud Run / AWS ALB that inject Authorization headers)
+        ignore_header_auth = is_env_truthy("IGNORE_HEADER_AUTH")
+
+        # Only process authentication for our MCP endpoint
+        if (
+            not ignore_header_auth
+            and self.mcp_server_ref
+            and self._should_process_auth(scope_copy)
+        ):
+            self._process_authentication_headers(scope_copy)
+
+        # Create wrapped send function to handle client disconnections gracefully
+        async def safe_send(message: Message) -> None:
+            try:
+                await send(message)
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                # Client disconnected - log but don't propagate to avoid ASGI violations
+                logger.debug(
+                    f"Client disconnected during response: {type(e).__name__}: {e}"
+                )
+                # Don't re-raise - this prevents the ASGI protocol violation
+                return
+            except Exception:
+                # Re-raise unexpected errors
+                raise
+
+        # Check for auth errors and return 401 before calling app
+        auth_error = scope_copy["state"].get("auth_validation_error")
+        if auth_error:
+            logger.warning(f"Authentication failed: {auth_error}")
+            await self._send_json_error_response(safe_send, 401, auth_error)
+            return  # Don't call self.app - request is rejected
+
+        # Without an OAuth provider, reject unauthenticated MCP requests at the
+        # transport boundary so the downstream handler cannot fall back to the
+        # operator's global credentials. When a provider is attached, defer to
+        # FastMCP so it can return the RFC 9728 OAuth discovery challenge.
+        if (
+            not ignore_header_auth
+            and self.mcp_server_ref
+            and self._should_process_auth(scope_copy)
+            and not scope_copy["state"].get("user_atlassian_auth_type")
+            and self.mcp_server_ref.auth is None
+            and not is_env_truthy("ALLOW_GLOBAL_CRED_FALLBACK")
+        ):
+            logger.warning(
+                "UserTokenMiddleware: rejecting unauthenticated MCP request "
+                "(no user identity and ALLOW_GLOBAL_CRED_FALLBACK is off)"
+            )
+            await self._send_json_error_response(
+                safe_send,
+                401,
+                "Authentication required: no Atlassian credentials were provided.",
+            )
+            return  # Don't call self.app - request is rejected
+
+        # Call the next application with modified scope and safe send wrapper
+        await self.app(scope_copy, receive, safe_send)
+
+    async def _send_json_error_response(
+        self, send: Send, status_code: int, error_message: str
+    ) -> None:
+        """Send a JSON error response via ASGI protocol.
+
+        Args:
+            send: ASGI send callable (should be safe_send wrapper).
+            status_code: HTTP status code (e.g., 401).
+            error_message: Error message to include in JSON body.
+        """
+        body = json.dumps({"error": error_message}).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status_code,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    def _should_process_auth(self, scope: Scope) -> bool:
+        """Check if this request should be processed for authentication."""
+        if not self.mcp_server_ref or scope.get("method") != "POST":
+            return False
+
+        try:
+            mcp_path = self.mcp_server_ref.get_streamable_http_path()
+            request_path = AtlassianMCP._normalize_http_path(scope.get("path", ""))
+            return request_path == mcp_path
+        except (AttributeError, ValueError) as e:
+            logger.warning(f"Error checking auth path: {e}")
+            return False
+
+    def _process_authentication_headers(self, scope: Scope) -> None:
+        """Process authentication headers and store in scope state."""
+        try:
+            # Parse headers from scope (headers are byte tuples per ASGI spec)
+            headers = dict(scope.get("headers", []))
+            auth_header = headers.get(b"authorization")
+            cloud_id_header = headers.get(b"x-atlassian-cloud-id")
+
+            # Convert bytes to strings (ASGI headers are always bytes)
+            auth_header_str = auth_header.decode("latin-1") if auth_header else None
+            cloud_id_str = (
+                cloud_id_header.decode("latin-1") if cloud_id_header else None
+            )
+
+            # Extract additional Atlassian service headers for service availability detection
+            jira_token_header = headers.get(b"x-atlassian-jira-personal-token")
+            jira_url_header = headers.get(b"x-atlassian-jira-url")
+            confluence_token_header = headers.get(
+                b"x-atlassian-confluence-personal-token"
+            )
+            confluence_url_header = headers.get(b"x-atlassian-confluence-url")
+            bitbucket_token_header = headers.get(
+                b"x-atlassian-bitbucket-personal-token"
+            )
+            bitbucket_url_header = headers.get(b"x-atlassian-bitbucket-url")
+
+            # Convert service header bytes to strings
+            jira_token_str = (
+                jira_token_header.decode("latin-1") if jira_token_header else None
+            )
+            jira_url_str = (
+                jira_url_header.decode("latin-1") if jira_url_header else None
+            )
+            confluence_token_str = (
+                confluence_token_header.decode("latin-1")
+                if confluence_token_header
+                else None
+            )
+            confluence_url_str = (
+                confluence_url_header.decode("latin-1")
+                if confluence_url_header
+                else None
+            )
+            bitbucket_token_str = (
+                bitbucket_token_header.decode("latin-1")
+                if bitbucket_token_header
+                else None
+            )
+            bitbucket_url_str = (
+                bitbucket_url_header.decode("latin-1") if bitbucket_url_header else None
+            )
+
+            # Validate URLs to prevent SSRF
+            if jira_url_str:
+                ssrf_error = validate_url_for_ssrf(jira_url_str)
+                if ssrf_error:
+                    scope["state"]["auth_validation_error"] = (
+                        f"Forbidden: Invalid Jira URL - {ssrf_error}"
+                    )
+                    return
+
+            if confluence_url_str:
+                ssrf_error = validate_url_for_ssrf(confluence_url_str)
+                if ssrf_error:
+                    scope["state"]["auth_validation_error"] = (
+                        f"Forbidden: Invalid Confluence URL - {ssrf_error}"
+                    )
+                    return
+
+            if bitbucket_url_str:
+                ssrf_error = validate_url_for_ssrf(bitbucket_url_str)
+                if ssrf_error:
+                    scope["state"]["auth_validation_error"] = (
+                        f"Forbidden: Invalid Bitbucket URL - {ssrf_error}"
+                    )
+                    return
+
+            # Build service headers dict
+            service_headers = {}
+            if jira_token_str:
+                service_headers["X-Atlassian-Jira-Personal-Token"] = jira_token_str
+            if jira_url_str:
+                service_headers["X-Atlassian-Jira-Url"] = jira_url_str
+            if confluence_token_str:
+                service_headers["X-Atlassian-Confluence-Personal-Token"] = (
+                    confluence_token_str
+                )
+            if confluence_url_str:
+                service_headers["X-Atlassian-Confluence-Url"] = confluence_url_str
+            if bitbucket_token_str:
+                service_headers["X-Atlassian-Bitbucket-Personal-Token"] = (
+                    bitbucket_token_str
+                )
+            if bitbucket_url_str:
+                service_headers["X-Atlassian-Bitbucket-Url"] = bitbucket_url_str
+
+            scope["state"]["atlassian_service_headers"] = service_headers
+            if service_headers:
+                logger.debug(
+                    f"UserTokenMiddleware: Extracted service headers: {list(service_headers.keys())}"
+                )
+
+            # Log mcp-session-id for debugging
+            mcp_session_id = headers.get(b"mcp-session-id")
+            if mcp_session_id:
+                session_id_str = mcp_session_id.decode("latin-1")
+                logger.debug(
+                    f"UserTokenMiddleware: MCP-Session-ID header found: {session_id_str}"
+                )
+
+            logger.debug(
+                f"UserTokenMiddleware: Processing auth for {scope.get('path')}, "
+                f"AuthHeader present: {bool(auth_header_str)}, "
+                f"CloudId present: {bool(cloud_id_str)}"
+            )
+
+            # Process Cloud ID
+            if cloud_id_str and cloud_id_str.strip():
+                scope["state"]["user_atlassian_cloud_id"] = cloud_id_str.strip()
+                logger.debug(
+                    f"UserTokenMiddleware: Extracted cloudId: {cloud_id_str.strip()}"
+                )
+
+            # Process Authorization header
+            if auth_header_str:
+                self._parse_auth_header(auth_header_str, scope)
+            else:
+                logger.debug("UserTokenMiddleware: No Authorization header provided")
+                # If service headers are present without Authorization header, set PAT auth type
+                if service_headers and (
+                    (jira_token_str and jira_url_str)
+                    or (confluence_token_str and confluence_url_str)
+                    or (bitbucket_token_str and bitbucket_url_str)
+                ):
+                    scope["state"]["user_atlassian_auth_type"] = "pat"
+                    scope["state"]["user_atlassian_email"] = None
+                    logger.debug(
+                        "UserTokenMiddleware: Header-based authentication detected. Setting PAT auth type."
+                    )
+
+        except Exception as e:
+            logger.error(f"Error processing authentication headers: {e}", exc_info=True)
+            scope["state"]["auth_validation_error"] = "Authentication processing error"
+
+    def _parse_auth_header(self, auth_header: str, scope: Scope) -> None:
+        """Parse the Authorization header and store credentials in scope state."""
+        # Check prefix BEFORE stripping to preserve "Bearer " / "Token " matching
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()  # Remove "Bearer " prefix and strip token
+            if not token:
+                scope["state"]["auth_validation_error"] = (
+                    "Unauthorized: Empty Bearer token"
+                )
+            else:
+                scope["state"]["user_atlassian_token"] = token
+                scope["state"]["user_atlassian_auth_type"] = "oauth"
+                logger.debug(
+                    "UserTokenMiddleware: Bearer token extracted (masked): "
+                    f"...{mask_sensitive(token, 8)}"
+                )
+
+        elif auth_header.startswith("Token "):
+            token = auth_header[6:].strip()  # Remove "Token " prefix and strip token
+            if not token:
+                scope["state"]["auth_validation_error"] = (
+                    "Unauthorized: Empty Token (PAT)"
+                )
+            else:
+                scope["state"]["user_atlassian_token"] = token
+                scope["state"]["user_atlassian_auth_type"] = "pat"
+                logger.debug(
+                    "UserTokenMiddleware: PAT token extracted (masked): "
+                    f"...{mask_sensitive(token, 8)}"
+                )
+
+        elif auth_header.startswith("Basic "):
+            encoded = auth_header[6:].strip()
+            if not encoded:
+                scope["state"]["auth_validation_error"] = (
+                    "Unauthorized: Empty Basic auth credentials"
+                )
+                return
+            try:
+                decoded = base64.b64decode(encoded).decode("utf-8")
+            except (ValueError, UnicodeDecodeError) as e:
+                logger.warning(f"Failed to decode Basic auth: {e}")
+                scope["state"]["auth_validation_error"] = (
+                    "Unauthorized: Invalid Basic auth encoding"
+                )
+                return
+            if ":" not in decoded:
+                scope["state"]["auth_validation_error"] = (
+                    "Unauthorized: Invalid Basic auth format. "
+                    "Expected 'email:api_token'"
+                )
+                return
+            email, api_token = decoded.split(":", 1)
+            if not email or not api_token:
+                scope["state"]["auth_validation_error"] = (
+                    "Unauthorized: Email or API token is empty"
+                )
+                return
+            scope["state"]["user_atlassian_email"] = email
+            scope["state"]["user_atlassian_api_token"] = api_token
+            scope["state"]["user_atlassian_auth_type"] = "basic"
+            scope["state"]["user_atlassian_token"] = None
+            logger.debug("UserTokenMiddleware: Basic auth credentials extracted")
+
+        elif auth_header.strip():
+            # Non-empty but unsupported auth type
+            auth_value = auth_header.strip()
+            if " " in auth_value:
+                auth_type = auth_value.split(" ", 1)[0]
+            else:
+                # No space means no type prefix — likely a raw token.
+                # Redact to avoid leaking credentials in logs.
+                auth_type = "<redacted>"
+            logger.warning(f"Unsupported Authorization type: {auth_type}")
+            scope["state"]["auth_validation_error"] = (
+                "Unauthorized: Only 'Bearer <OAuthToken>', "
+                "'Token <PAT>', or 'Basic <base64(email:api_token)>' "
+                "types are supported."
+            )
+        else:
+            # Empty or whitespace-only
+            scope["state"]["auth_validation_error"] = (
+                "Unauthorized: Empty Authorization header"
+            )
+
+
+def _get_allowed_redirect_uris() -> list[str] | None:
+    raw = os.getenv("ATLASSIAN_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS")
+    parsed = parse_env_list(raw)
+    if parsed is None:
+        return DEFAULT_ALLOWED_REDIRECT_URIS
+    return parsed
+
+
+def _get_allowed_grant_types() -> list[str]:
+    raw = os.getenv("ATLASSIAN_OAUTH_ALLOWED_GRANT_TYPES")
+    parsed = parse_env_list(raw)
+    if parsed is None:
+        return DEFAULT_ALLOWED_GRANT_TYPES
+    if not parsed:
+        logger.warning(
+            "ATLASSIAN_OAUTH_ALLOWED_GRANT_TYPES is empty; defaulting to %s",
+            DEFAULT_ALLOWED_GRANT_TYPES,
+        )
+        return DEFAULT_ALLOWED_GRANT_TYPES
+    return parsed
+
+
+def _resolve_upstream_oauth_endpoints(instance_url: str) -> tuple[str, str]:
+    parsed_host = (urlparse(instance_url).hostname or "").lower()
+
+    # Bitbucket Cloud uses separate OAuth endpoints from Atlassian Cloud
+    if _is_bitbucket_cloud_url(instance_url):
+        return BITBUCKET_CLOUD_AUTHORIZE_URL, BITBUCKET_CLOUD_TOKEN_URL
+
+    is_cloud = (
+        is_atlassian_cloud_url(instance_url) or parsed_host == "auth.atlassian.com"
+    )
+
+    if is_cloud:
+        return CLOUD_AUTHORIZE_URL, CLOUD_TOKEN_URL
+
+    base_url = instance_url.rstrip("/")
+    return f"{base_url}{DC_AUTHORIZE_PATH}", f"{base_url}{DC_TOKEN_PATH}"
+
+
+def _is_cloud_instance(instance_url: str) -> bool:
+    parsed_host = (urlparse(instance_url).hostname or "").lower()
+    return (
+        is_atlassian_cloud_url(instance_url)
+        or parsed_host == "auth.atlassian.com"
+        or _is_bitbucket_cloud_url(instance_url)
+    )
+
+
+def _build_auth_provider() -> HardenedOAuthProxy | None:
+    """Create an opt-in OAuth proxy auth provider with DCR + discovery support."""
+    if not is_env_truthy(OAUTH_PROXY_ENABLE_ENV, "false"):
+        logger.info(
+            "OAuth proxy auth provider disabled; set %s=true to enable DCR/proxy routes.",
+            OAUTH_PROXY_ENABLE_ENV,
+        )
+        return None
+
+    instance_url = (
+        os.getenv("ATLASSIAN_OAUTH_INSTANCE_URL")
+        or os.getenv("JIRA_URL")
+        or os.getenv("CONFLUENCE_URL")
+        or os.getenv("BITBUCKET_URL")
+    )
+    client_id = (
+        os.getenv("ATLASSIAN_OAUTH_CLIENT_ID")
+        or os.getenv("JIRA_OAUTH_CLIENT_ID")
+        or os.getenv("CONFLUENCE_OAUTH_CLIENT_ID")
+        or os.getenv("BITBUCKET_OAUTH_CLIENT_ID")
+    )
+    client_secret = (
+        os.getenv("ATLASSIAN_OAUTH_CLIENT_SECRET")
+        or os.getenv("JIRA_OAUTH_CLIENT_SECRET")
+        or os.getenv("CONFLUENCE_OAUTH_CLIENT_SECRET")
+        or os.getenv("BITBUCKET_OAUTH_CLIENT_SECRET")
+    )
+    redirect_uri = os.getenv("ATLASSIAN_OAUTH_REDIRECT_URI")
+    scope_env = os.getenv("ATLASSIAN_OAUTH_SCOPE", "")
+
+    if not all([instance_url, client_id, client_secret, redirect_uri]):
+        logger.warning(
+            "OAuth proxy requested but required vars are missing. "
+            "Need instance URL + client credentials + redirect URI."
+        )
+        return None
+
+    scopes = [s for part in scope_env.replace(",", " ").split() if (s := part)]
+    is_cloud = _is_cloud_instance(instance_url)
+    upstream_authorize, upstream_token = _resolve_upstream_oauth_endpoints(instance_url)
+
+    parsed_redirect = urlparse(redirect_uri)
+    raw_redirect_path = parsed_redirect.path or "/callback"
+
+    base_url = os.getenv("PUBLIC_BASE_URL")
+    if not base_url and parsed_redirect.scheme and parsed_redirect.netloc:
+        redirect_dir = raw_redirect_path.rsplit("/", 1)[0]
+        base_url = f"{parsed_redirect.scheme}://{parsed_redirect.netloc}{redirect_dir}"
+
+    if not base_url:
+        host = os.getenv("HOST", DEFAULT_HOST)
+        port = os.getenv("PORT", "3000")
+        host_for_url = "localhost" if host in (DEFAULT_HOST, "127.0.0.1") else host
+        base_url = f"http://{host_for_url}:{port}"
+
+    base_path = urlparse(base_url).path.rstrip("/")
+    redirect_path = raw_redirect_path
+    if base_path:
+        if redirect_path == base_path:
+            redirect_path = "/"
+        elif redirect_path.startswith(base_path + "/"):
+            redirect_path = redirect_path[len(base_path) :]
+
+    if not redirect_path.startswith("/"):
+        redirect_path = f"/{redirect_path}"
+
+    allowed_client_redirect_uris = _get_allowed_redirect_uris()
+    allowed_grant_types = _get_allowed_grant_types()
+    require_consent = is_env_truthy("ATLASSIAN_OAUTH_REQUIRE_CONSENT", "true")
+    verifier = AtlassianOpaqueTokenVerifier(required_scopes=scopes)
+
+    return HardenedOAuthProxy(
+        upstream_authorization_endpoint=upstream_authorize,
+        upstream_token_endpoint=upstream_token,
+        upstream_client_id=client_id,
+        upstream_client_secret=client_secret,
+        token_verifier=verifier,
+        base_url=base_url,
+        redirect_path=redirect_path,
+        allowed_client_redirect_uris=allowed_client_redirect_uris,
+        valid_scopes=scopes or None,
+        allowed_grant_types=allowed_grant_types,
+        forced_scopes=scopes or None,
+        token_endpoint_auth_method="client_secret_post",  # noqa: S106
+        extra_authorize_params=(
+            # Bitbucket Cloud doesn't need audience; Atlassian Cloud does
+            {"audience": "api.atlassian.com", "prompt": "consent"}
+            if is_cloud and not _is_bitbucket_cloud_url(instance_url)
+            else None
+        ),
+        client_storage=build_oauth_client_storage_from_env(),
+        require_authorization_consent=require_consent,
+    )
+
+
+main_mcp = AtlassianMCP(
+    name="Atlassian MCP",
+    lifespan=main_lifespan,
+    auth=_build_auth_provider(),
+)
+main_mcp.mount(jira_mcp, namespace="jira")
+main_mcp.mount(confluence_mcp, namespace="confluence")
+main_mcp.mount(bitbucket_mcp, namespace="bitbucket")
+install_identity_privacy(main_mcp)
+_privacy_config = IdentityPrivacyConfig.from_env()
+if _privacy_config.enabled:
+    logger.info(
+        "Identity privacy mode=%s correlation_scope=%s rotation_hours=%s",
+        _privacy_config.mode.value,
+        _privacy_config.correlation_scope.value,
+        _privacy_config.rotation_hours,
+    )
+
+
+@main_mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
+async def _health_check_route(request: Request) -> JSONResponse:
+    return await health_check(request)
+
+
+logger.info("Added /healthz endpoint for Kubernetes probes")
+
+
+async def oauth_discovery_not_found(request: Request) -> JSONResponse:
+    """JSON 404 for OAuth discovery well-known paths without an OAuth provider.
+
+    Several MCP clients (observed: Claude Code CLI, all versions from at least 2.1.87
+    through 2.1.284) unconditionally probe ``/.well-known/oauth-authorization-server``
+    (and ``/.well-known/oauth-protected-resource``) after a 401 from the MCP endpoint,
+    even when the client already sent static credentials via configured headers. When
+    this server has no auth provider attached (the default; see
+    ``_build_auth_provider``), these paths are not routes we define, so they fall
+    through to Starlette's default 404 handler - which returns a plain-text
+    ``Not Found`` body. Some clients then try to ``JSON.parse`` that body and crash
+    with a parse error instead of gracefully falling back to the configured header,
+    e.g.:
+
+        HTTP 404: Invalid OAuth error response: SyntaxError: JSON Parse error:
+        Unexpected identifier "Not". Raw body: Not Found
+
+    Confirmed upstream (anthropics/claude-code #80785, #46640, #34008): no client-side
+    fix or opt-out flag exists as of Claude Code 2.1.284. A community-reported
+    workaround (anthropics/claude-code #46640, comment by @m13v) is to serve a JSON
+    body (even an empty object) instead of plain text at exactly this 404 - which is
+    what this route does. Registered ONLY when ``main_mcp.auth is None`` (see below):
+    with a real OAuth provider attached (``ATLASSIAN_OAUTH_PROXY_ENABLE=true``),
+    FastMCP/the OAuth proxy already serves real discovery metadata at these same
+    paths, and these stubs must never shadow that.
+    """
+    return JSONResponse({"error": "not_found"}, status_code=404)
+
+
+if main_mcp.auth is None:
+
+    @main_mcp.custom_route(
+        "/.well-known/oauth-authorization-server",
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    async def _oauth_authorization_server_discovery_route(
+        request: Request,
+    ) -> JSONResponse:
+        return await oauth_discovery_not_found(request)
+
+    @main_mcp.custom_route(
+        "/.well-known/oauth-protected-resource",
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    async def _oauth_protected_resource_discovery_route(
+        request: Request,
+    ) -> JSONResponse:
+        return await oauth_discovery_not_found(request)
+
+    logger.info(
+        "No OAuth provider attached: added JSON-404 stubs at the OAuth discovery "
+        "well-known paths so clients that probe them before using static header "
+        "auth (e.g. Claude Code CLI) get a parseable response instead of a "
+        "plain-text 404 (see anthropics/claude-code#80785)."
+    )

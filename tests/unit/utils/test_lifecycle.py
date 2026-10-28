@@ -3,7 +3,7 @@
 import signal
 from unittest.mock import patch
 
-from mcp_atlassian.utils.lifecycle import (
+from mcp_atlassian_with_bitbucket_and_privacy.utils.lifecycle import (
     _shutdown_event,
     ensure_clean_exit,
     setup_signal_handlers,

@@ -1,12 +1,14 @@
 """Tests for the OAuth setup utilities."""
 
+import io
 import json
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from mcp_atlassian.utils.oauth_setup import (
+from mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup import (
+    CallbackHandler,
     OAuthSetupArgs,
     parse_redirect_uri,
     run_oauth_flow,
@@ -45,6 +47,38 @@ class TestCallbackHandlerLogic:
             assert params[key] == expected_values
 
 
+class TestCallbackHandlerXssRegression:
+    """Regression (GHSA-g2r2) — reflected XSS in the OAuth callback page.
+
+    ``CallbackHandler._send_response`` used to interpolate the caller-supplied
+    ``message`` straight into the HTML body (``<p>{message}</p>``). For the error
+    branch that message is built from the attacker-controlled ``error`` query
+    parameter, so a crafted ``?error=<script>…`` rendered executable markup in the
+    victim's browser. This test asserts the secure outcome: the payload is
+    HTML-escaped in the rendered page.
+    """
+
+    @pytest.mark.security_regression
+    def test_send_response_escapes_html_in_message(self) -> None:
+        """A ``<script>`` payload in the callback message must not be reflected raw."""
+        handler = CallbackHandler.__new__(CallbackHandler)
+        # _send_response only touches these members — stub them so no real socket
+        # I/O happens and we can capture the rendered HTML body.
+        handler.wfile = io.BytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+
+        payload = "<script>alert('xss-g2r2')</script>"
+        handler._send_response(f"Authorization failed: {payload}")
+
+        body = handler.wfile.getvalue().decode()
+        assert payload not in body, (
+            "attacker-controlled callback message must be HTML-escaped, "
+            "not reflected as raw executable markup"
+        )
+
+
 class TestRedirectUriParsing:
     """Tests for redirect URI parsing functionality."""
 
@@ -72,7 +106,7 @@ class TestOAuthFlow:
     @pytest.fixture(autouse=True)
     def reset_oauth_state(self):
         """Reset OAuth global state before each test."""
-        import mcp_atlassian.utils.oauth_setup as oauth_module
+        import mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup as oauth_module
 
         oauth_module.authorization_code = None
         oauth_module.authorization_state = None
@@ -84,16 +118,18 @@ class TestOAuthFlow:
         with MockOAuthServer.mock_oauth_flow() as mocks:
             with (
                 patch(
-                    "mcp_atlassian.utils.oauth_setup.OAuthConfig"
+                    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup.OAuthConfig"
                 ) as mock_oauth_config,
-                patch("mcp_atlassian.utils.oauth_setup.wait_for_callback") as mock_wait,
                 patch(
-                    "mcp_atlassian.utils.oauth_setup.start_callback_server"
+                    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup.wait_for_callback"
+                ) as mock_wait,
+                patch(
+                    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup.start_callback_server"
                 ) as mock_start_server,
             ):
                 # Setup global state after callback
                 def setup_callback_state():
-                    import mcp_atlassian.utils.oauth_setup as oauth_module
+                    import mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup as oauth_module
 
                     oauth_module.authorization_code = "test-auth-code"
                     oauth_module.authorization_state = "test-state-token"
@@ -137,16 +173,18 @@ class TestOAuthFlow:
         with MockOAuthServer.mock_oauth_flow() as mocks:
             with (
                 patch(
-                    "mcp_atlassian.utils.oauth_setup.OAuthConfig"
+                    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup.OAuthConfig"
                 ) as mock_oauth_config,
-                patch("mcp_atlassian.utils.oauth_setup.wait_for_callback") as mock_wait,
                 patch(
-                    "mcp_atlassian.utils.oauth_setup.start_callback_server"
+                    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup.wait_for_callback"
+                ) as mock_wait,
+                patch(
+                    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup.start_callback_server"
                 ) as mock_start_server,
             ):
                 # Setup callback state
                 def setup_callback_state():
-                    import mcp_atlassian.utils.oauth_setup as oauth_module
+                    import mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup as oauth_module
 
                     oauth_module.authorization_code = "test-auth-code"
                     oauth_module.authorization_state = "test-state-token"
@@ -185,7 +223,7 @@ class TestOAuthFlow:
         """Test OAuth flow when server fails to start."""
         with MockOAuthServer.mock_oauth_flow() as mocks:
             with patch(
-                "mcp_atlassian.utils.oauth_setup.start_callback_server"
+                "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup.start_callback_server"
             ) as mock_start_server:
                 mock_start_server.side_effect = OSError("Port already in use")
 
@@ -213,11 +251,13 @@ class TestOAuthFlow:
         with MockOAuthServer.mock_oauth_flow() as mocks:
             with (
                 patch(
-                    "mcp_atlassian.utils.oauth_setup.OAuthConfig"
+                    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup.OAuthConfig"
                 ) as mock_oauth_config,
-                patch("mcp_atlassian.utils.oauth_setup.wait_for_callback") as mock_wait,
                 patch(
-                    "mcp_atlassian.utils.oauth_setup.start_callback_server"
+                    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup.wait_for_callback"
+                ) as mock_wait,
+                patch(
+                    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup.start_callback_server"
                 ) as mock_start_server,
             ):
                 mock_httpd = MagicMock()
@@ -230,7 +270,7 @@ class TestOAuthFlow:
                 elif failure_condition == "state_mismatch":
 
                     def setup_mismatched_state():
-                        import mcp_atlassian.utils.oauth_setup as oauth_module
+                        import mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup as oauth_module
 
                         oauth_module.authorization_code = "test-auth-code"
                         oauth_module.authorization_state = "wrong-state"
@@ -240,7 +280,7 @@ class TestOAuthFlow:
                 elif failure_condition == "token_exchange_failure":
 
                     def setup_callback_state():
-                        import mcp_atlassian.utils.oauth_setup as oauth_module
+                        import mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup as oauth_module
 
                         oauth_module.authorization_code = "test-auth-code"
                         oauth_module.authorization_state = "test-state-token"
@@ -270,7 +310,8 @@ class TestInteractiveSetup(BaseAuthTest):
             with (
                 patch("builtins.input", side_effect=["", "", "", ""]),
                 patch(
-                    "mcp_atlassian.utils.oauth_setup.run_oauth_flow", return_value=True
+                    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup.run_oauth_flow",
+                    return_value=True,
                 ) as mock_flow,
             ):
                 result = run_oauth_setup()
@@ -306,7 +347,8 @@ class TestInteractiveSetup(BaseAuthTest):
             with (
                 patch("builtins.input", side_effect=input_values),
                 patch(
-                    "mcp_atlassian.utils.oauth_setup.run_oauth_flow", return_value=True
+                    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup.run_oauth_flow",
+                    return_value=True,
                 ) as mock_flow,
             ):
                 result = run_oauth_setup()
@@ -325,7 +367,8 @@ class TestInteractiveSetup(BaseAuthTest):
                     "builtins.input", side_effect=["client-id", "client-secret", "", ""]
                 ),
                 patch(
-                    "mcp_atlassian.utils.oauth_setup.run_oauth_flow", return_value=False
+                    "mcp_atlassian_with_bitbucket_and_privacy.utils.oauth_setup.run_oauth_flow",
+                    return_value=False,
                 ),
             ):
                 result = run_oauth_setup()

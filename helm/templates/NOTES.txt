@@ -1,4 +1,4 @@
-🎉 MCP Atlassian has been deployed!
+🎉 MCP Atlassian with Bitbucket and Privacy has been deployed!
 
 Release: {{ .Release.Name }}
 Namespace: {{ .Release.Namespace }}
@@ -15,7 +15,7 @@ integration with MCP clients that communicate via standard input/output.
 To connect to the pod:
 
   kubectl exec -it -n {{ .Release.Namespace }} \
-    $(kubectl get pods -n {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "mcp-atlassian.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}") \
+    $(kubectl get pods -n {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "mcp-atlassian-with-bitbucket-and-privacy.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}") \
     -- /bin/sh
 
 Note: No HTTP endpoints or health checks are available in stdio mode.
@@ -43,13 +43,13 @@ The server is running in {{ .Values.transport }} mode on port {{ .Values.port }}
 Option 1 - Port Forward (for local testing):
 
   kubectl port-forward -n {{ .Release.Namespace }} \
-    svc/{{ include "mcp-atlassian.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+    svc/{{ include "mcp-atlassian-with-bitbucket-and-privacy.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
 
   Then access at: http://localhost:{{ .Values.service.port }}
 
 Option 2 - Within Cluster:
 
-  Service URL: http://{{ include "mcp-atlassian.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+  Service URL: http://{{ include "mcp-atlassian-with-bitbucket-and-privacy.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
 
 {{- end }}
 
@@ -94,6 +94,6 @@ View logs:
   kubectl logs -n {{ .Release.Namespace }} -l "app.kubernetes.io/instance={{ .Release.Name }}" -f
 
 Describe deployment:
-  kubectl describe deployment -n {{ .Release.Namespace }} {{ include "mcp-atlassian.fullname" . }}
+  kubectl describe deployment -n {{ .Release.Namespace }} {{ include "mcp-atlassian-with-bitbucket-and-privacy.fullname" . }}
 
-For more information, visit: https://github.com/sooperset/mcp-atlassian
+For more information, visit: https://github.com/ulikoenig/mcp-atlassian-with-bitbucket

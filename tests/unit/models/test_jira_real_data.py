@@ -10,12 +10,12 @@ import os
 import pytest
 from atlassian import Jira
 
-from mcp_atlassian.jira import JiraConfig, JiraFetcher
-from mcp_atlassian.jira.issues import IssuesMixin
-from mcp_atlassian.jira.projects import ProjectsMixin
-from mcp_atlassian.jira.transitions import TransitionsMixin
-from mcp_atlassian.jira.worklog import WorklogMixin
-from mcp_atlassian.models.jira import (
+from mcp_atlassian_with_bitbucket_and_privacy.jira import JiraConfig, JiraFetcher
+from mcp_atlassian_with_bitbucket_and_privacy.jira.issues import IssuesMixin
+from mcp_atlassian_with_bitbucket_and_privacy.jira.projects import ProjectsMixin
+from mcp_atlassian_with_bitbucket_and_privacy.jira.transitions import TransitionsMixin
+from mcp_atlassian_with_bitbucket_and_privacy.jira.worklog import WorklogMixin
+from mcp_atlassian_with_bitbucket_and_privacy.models.jira import (
     JiraIssue,
     JiraProject,
     JiraResolution,

@@ -1,4 +1,4 @@
-# MCP Atlassian
+# MCP Atlassian with Bitbucket and Privacy
 
 > **Audience**: LLM-driven engineering agents
 
@@ -8,9 +8,9 @@
 
 | Path | Purpose |
 | --- | --- |
-| `src/mcp_atlassian/` | Library source (Python ≥ 3.10) |
-| `  ├─ jira/` | Jira client + 16 mixins (issues, search, SLA, metrics, …) |
-| `  ├─ confluence/` | Confluence client + 7 mixins (pages, search, analytics, …) |
+| `src/mcp_atlassian_with_bitbucket_and_privacy/` | Library source (Python ≥ 3.10) |
+| `  ├─ jira/` | Jira client + mixins (issues, search, SLA, metrics, …) |
+| `  ├─ confluence/` | Confluence client + mixins (pages, search, analytics, …) |
 | `  ├─ models/` | Pydantic v2 data models (`ApiModel` base) |
 | `  ├─ servers/` | FastMCP server instances (`jira_mcp`, `confluence_mcp`) |
 | `  ├─ preprocessing/` | Content conversion (ADF/Storage → Markdown) |
@@ -22,7 +22,7 @@
 
 ## Architecture
 
-- **Mixin composition**: `JiraFetcher` composes 16 mixins, `ConfluenceFetcher` composes 7. Client inheritance is transitive through mixins.
+- **Mixin composition**: `JiraFetcher` and `ConfluenceFetcher` are composed from the mixins listed in their `__init__.py`; client inheritance is transitive through mixins.
 - **FastMCP servers**: `servers/main.py` → lifespan → dependency injection via `get_jira_fetcher(ctx)` / `get_confluence_fetcher(ctx)`.
 - **Tool naming**: `{service}_{action}_{target}` (e.g., `jira_create_issue`, `confluence_get_page`).
 - **Config**: Environment-based `from_env()` factory on `JiraConfig` / `ConfluenceConfig` dataclasses.
@@ -40,7 +40,7 @@ pre-commit run --all-files           # Ruff + mypy
 uv run pytest -xvs                   # full test suite
 uv run pytest tests/unit/ -xvs       # unit tests only
 uv run pytest tests/integration/     # integration tests
-uv run pytest --cov=src/mcp_atlassian --cov-report=term-missing  # coverage
+uv run pytest --cov=src/mcp_atlassian_with_bitbucket_and_privacy --cov-report=term-missing  # coverage
 ```
 
 *Tests must pass* and *lint/typing must be clean* before committing.
@@ -56,6 +56,7 @@ uv run pytest --cov=src/mcp_atlassian --cov-report=term-missing  # coverage
 5. **Commits**: Use trailers for attribution, never mention tools/AI
 6. **Commit types**: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `perf`, `ci` — scopes: `jira`, `confluence`, `server`, `auth`, `docker`, `docs`
 7. **File hygiene**: Prefer editing existing files over creating new ones
+8. **Tool docs**: After changing tool signatures or registrations, run `uv run python scripts/generate_tool_docs.py` and commit the diff; CI (`Docs / check`) enforces this
 
 ---
 
@@ -84,9 +85,9 @@ uv run pytest --cov=src/mcp_atlassian --cov-report=term-missing  # coverage
 
 ```bash
 # Running the server
-uv run mcp-atlassian                 # Start server
-uv run mcp-atlassian --oauth-setup   # OAuth wizard
-uv run mcp-atlassian -v              # Verbose mode
+uv run mcp-atlassian-with-bitbucket-and-privacy                 # Start server
+uv run mcp-atlassian-with-bitbucket-and-privacy --oauth-setup   # OAuth wizard
+uv run mcp-atlassian-with-bitbucket-and-privacy -v              # Verbose mode
 
 # Git workflow
 git checkout -b feature/description   # New feature

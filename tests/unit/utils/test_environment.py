@@ -1,10 +1,13 @@
 """Tests for the environment utilities module."""
 
 import logging
+import os
 
 import pytest
 
-from mcp_atlassian.utils.environment import get_available_services
+from mcp_atlassian_with_bitbucket_and_privacy.utils.environment import (
+    get_available_services,
+)
 from tests.utils.assertions import assert_log_contains
 from tests.utils.mocks import MockEnvironment
 
@@ -12,7 +15,9 @@ from tests.utils.mocks import MockEnvironment
 @pytest.fixture(autouse=True)
 def setup_logger():
     """Ensure logger is set to INFO level for capturing log messages."""
-    logger = logging.getLogger("mcp-atlassian.utils.environment")
+    logger = logging.getLogger(
+        "mcp-atlassian-with-bitbucket-and-privacy.utils.environment"
+    )
     original_level = logger.level
     logger.setLevel(logging.INFO)
     yield
@@ -54,6 +59,12 @@ def env_scenarios():
             "JIRA_USERNAME": "admin",
             "JIRA_API_TOKEN": "password",
         },
+        "mtls_server": {
+            "CONFLUENCE_URL": "https://confluence.company.com",
+            "CONFLUENCE_CLIENT_CERT": "/path/to/confluence-client.pem",
+            "JIRA_URL": "https://jira.company.com",
+            "JIRA_CLIENT_CERT": "/path/to/jira-client.pem",
+        },
     }
 
 
@@ -72,6 +83,7 @@ def _assert_authentication_logs(caplog, auth_type, services):
         "oauth": "OAuth 2.0 (3LO) authentication (Cloud)",
         "cloud_basic": "Cloud Basic Authentication (API Token)",
         "server": "Server/Data Center authentication (PAT or Basic Auth)",
+        "mtls": "mTLS client certificate authentication",
         "not_configured": "is not configured or required environment variables are missing",
     }
 
@@ -108,6 +120,7 @@ class TestGetAvailableServices:
             ("basic_auth_cloud", True, True),
             ("pat_server", True, True),
             ("basic_auth_server", True, True),
+            ("mtls_server", True, True),
         ],
     )
     def test_valid_authentication_scenarios(
@@ -136,6 +149,28 @@ class TestGetAvailableServices:
                 )
             elif scenario in ["pat_server", "basic_auth_server"]:
                 _assert_authentication_logs(caplog, "server", ["confluence", "jira"])
+            elif scenario == "mtls_server":
+                _assert_authentication_logs(caplog, "mtls", ["confluence", "jira"])
+
+    def test_mtls_client_cert_alone_does_not_enable_cloud_services(self, caplog):
+        """Test that client certificates alone do not enable Cloud services."""
+        with MockEnvironment.clean_env():
+            import os
+
+            os.environ["CONFLUENCE_URL"] = "https://company.atlassian.net"
+            os.environ["CONFLUENCE_CLIENT_CERT"] = "/path/to/confluence-client.pem"
+            os.environ["JIRA_URL"] = "https://company.atlassian.net"
+            os.environ["JIRA_CLIENT_CERT"] = "/path/to/jira-client.pem"
+
+            result = get_available_services()
+
+            _assert_service_availability(
+                result, confluence_expected=False, jira_expected=False
+            )
+            _assert_authentication_logs(
+                caplog, "not_configured", ["confluence", "jira"]
+            )
+            assert "mTLS client certificate authentication" not in caplog.text
 
     @pytest.mark.parametrize(
         "missing_oauth_var",
@@ -506,3 +541,35 @@ class TestGetAvailableServicesWithHeaders:
             _assert_service_availability(
                 result, confluence_expected=False, jira_expected=False
             )
+
+
+class TestMockEnvironmentCleanEnv:
+    """Regression tests for MockEnvironment.clean_env().
+
+    clean_env() previously only cleared JIRA_URL/USERNAME/API_TOKEN and the
+    Confluence/OAuth equivalents, silently leaving PERSONAL_TOKEN and
+    CLIENT_CERT/CLIENT_KEY* vars untouched. Any developer with real PAT or
+    mTLS credentials already exported in their shell (e.g. for manual
+    testing against a live instance) would have those values leak into
+    parametrized auth-scenario tests that assume a clean environment,
+    causing spurious failures unrelated to the code under test.
+    """
+
+    @pytest.mark.parametrize(
+        "var_name",
+        [
+            "JIRA_PERSONAL_TOKEN",
+            "JIRA_CLIENT_CERT",
+            "JIRA_CLIENT_KEY",
+            "JIRA_CLIENT_KEY_PASSWORD",
+            "CONFLUENCE_PERSONAL_TOKEN",
+            "CONFLUENCE_CLIENT_CERT",
+            "CONFLUENCE_CLIENT_KEY",
+            "CONFLUENCE_CLIENT_KEY_PASSWORD",
+        ],
+    )
+    def test_clean_env_clears_pat_and_mtls_vars(self, var_name, monkeypatch):
+        """clean_env() must clear PAT and mTLS-related env vars too."""
+        monkeypatch.setenv(var_name, "leaked-from-developer-shell")
+        with MockEnvironment.clean_env():
+            assert os.environ.get(var_name) is None

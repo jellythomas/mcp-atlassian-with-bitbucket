@@ -1,4 +1,4 @@
-"""Reusable mock utilities and fixtures for MCP Atlassian tests."""
+"""Reusable mock utilities and fixtures for MCP Atlassian with Bitbucket and Privacy tests."""
 
 import os
 from contextlib import contextmanager
@@ -22,6 +22,8 @@ def setup_api3_passthrough_mocks(mixin: Any) -> None:
     def _mock_post_api3(resource: str, data: dict) -> dict:
         if resource == "issue":
             return mixin.jira.create_issue(fields=data.get("fields", data))
+        if resource == "issue/bulk":
+            return mixin.jira.create_issues(data["issueUpdates"])
         return mixin.jira.post(resource, data=data)
 
     def _mock_put_api3(resource: str, data: dict) -> dict:
@@ -77,9 +79,17 @@ class MockEnvironment:
             "JIRA_URL",
             "JIRA_USERNAME",
             "JIRA_API_TOKEN",
+            "JIRA_PERSONAL_TOKEN",
+            "JIRA_CLIENT_CERT",
+            "JIRA_CLIENT_KEY",
+            "JIRA_CLIENT_KEY_PASSWORD",
             "CONFLUENCE_URL",
             "CONFLUENCE_USERNAME",
             "CONFLUENCE_API_TOKEN",
+            "CONFLUENCE_PERSONAL_TOKEN",
+            "CONFLUENCE_CLIENT_CERT",
+            "CONFLUENCE_CLIENT_KEY",
+            "CONFLUENCE_CLIENT_KEY_PASSWORD",
             "ATLASSIAN_OAUTH_CLIENT_ID",
             "ATLASSIAN_OAUTH_CLIENT_SECRET",
             "ATLASSIAN_OAUTH_REDIRECT_URI",
@@ -241,6 +251,14 @@ class MockConfluenceClient:
         """Mock user details by username (Server/DC)."""
         return {
             "displayName": f"Test User {username}",
+            "accountType": "atlassian",
+            "accountStatus": "active",
+        }
+
+    def get_user_details_by_userkey(self, userkey: str) -> dict[str, str]:
+        """Mock user details by userkey (Server/DC)."""
+        return {
+            "displayName": f"Test User {userkey}",
             "accountType": "atlassian",
             "accountStatus": "active",
         }

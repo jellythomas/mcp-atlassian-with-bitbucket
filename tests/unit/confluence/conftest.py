@@ -11,9 +11,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mcp_atlassian.confluence.client import ConfluenceClient
-from mcp_atlassian.confluence.config import ConfluenceConfig
-from mcp_atlassian.utils.oauth import OAuthConfig
+from mcp_atlassian_with_bitbucket_and_privacy.confluence.client import ConfluenceClient
+from mcp_atlassian_with_bitbucket_and_privacy.confluence.config import ConfluenceConfig
+from mcp_atlassian_with_bitbucket_and_privacy.utils.oauth import OAuthConfig
 from tests.fixtures.confluence_mocks import (
     MOCK_COMMENTS_RESPONSE,
     MOCK_CONFLUENCE_CONTENT_TYPES,
@@ -161,7 +161,9 @@ def mock_atlassian_confluence(
     Returns:
         MagicMock: Fully configured mock Confluence client
     """
-    with patch("mcp_atlassian.confluence.client.Confluence") as mock:
+    with patch(
+        "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.Confluence"
+    ) as mock:
         confluence_instance = mock.return_value
 
         # Use original mock data to maintain backward compatibility for existing tests
@@ -247,7 +249,9 @@ def mock_atlassian_confluence_with_session_data(
     Returns:
         MagicMock: Mock Confluence client with session-scoped data
     """
-    with patch("mcp_atlassian.confluence.client.Confluence") as mock:
+    with patch(
+        "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.Confluence"
+    ) as mock:
         confluence_instance = mock.return_value
 
         # Use session-scoped data for improved performance
@@ -361,13 +365,13 @@ def oauth_confluence_client(mock_preprocessor):
 
     # Mock the OAuth session setup and Confluence client
     with patch(
-        "mcp_atlassian.confluence.client.configure_oauth_session"
+        "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_oauth_session"
     ) as mock_oauth_session:
         with patch(
-            "mcp_atlassian.confluence.client.Confluence"
+            "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.Confluence"
         ) as mock_confluence_class:
             with patch(
-                "mcp_atlassian.preprocessing.TextPreprocessor"
+                "mcp_atlassian_with_bitbucket_and_privacy.preprocessing.TextPreprocessor"
             ) as mock_text_preprocessor:
                 # Mock OAuth session configuration to succeed
                 mock_oauth_session.return_value = True
@@ -421,7 +425,7 @@ def confluence_client(mock_config, mock_atlassian_confluence, mock_preprocessor)
     """
     # Create a client with a mocked configuration
     with patch(
-        "mcp_atlassian.preprocessing.TextPreprocessor"
+        "mcp_atlassian_with_bitbucket_and_privacy.preprocessing.TextPreprocessor"
     ) as mock_text_preprocessor:
         mock_text_preprocessor.return_value = mock_preprocessor
 
@@ -446,10 +450,10 @@ def confluence_fetcher(mock_config, mock_atlassian_confluence, mock_preprocessor
     Returns:
         ConfluenceFetcher: Configured fetcher instance
     """
-    from mcp_atlassian.confluence import ConfluenceFetcher
+    from mcp_atlassian_with_bitbucket_and_privacy.confluence import ConfluenceFetcher
 
     with patch(
-        "mcp_atlassian.preprocessing.TextPreprocessor"
+        "mcp_atlassian_with_bitbucket_and_privacy.preprocessing.TextPreprocessor"
     ) as mock_text_preprocessor:
         mock_text_preprocessor.return_value = mock_preprocessor
 

@@ -3,9 +3,11 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 from requests.exceptions import HTTPError
 
-from mcp_atlassian.exceptions import MCPAtlassianAuthenticationError
-from mcp_atlassian.jira.links import LinksMixin
-from mcp_atlassian.models.jira import JiraIssueLinkType
+from mcp_atlassian_with_bitbucket_and_privacy.exceptions import (
+    MCPAtlassianAuthenticationError,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.jira.links import LinksMixin
+from mcp_atlassian_with_bitbucket_and_privacy.models.jira import JiraIssueLinkType
 
 
 class TestLinksMixin:
@@ -73,6 +75,75 @@ class TestLinksMixin:
 
         assert response["success"] is True
         assert "Link created between PROJ-123 and PROJ-456" in response["message"]
+        links_mixin.jira.create_issue_link.assert_called_once_with(data)
+
+    # --- JIRA_INTERNAL_ONLY_PROJECTS guard on link comments ---
+
+    @pytest.mark.parametrize("issue_key", ["CC-123", "CC%2D123", "%43C-123"])
+    def test_create_issue_link_comment_internal_only_inward_rejected(
+        self, links_mixin, issue_key
+    ):
+        """A link comment is rejected when the INWARD issue is in a listed
+        project, before any API call."""
+        links_mixin.config.internal_only_projects = frozenset({"CC"})
+        data = {
+            "type": {"name": "Blocks"},
+            "inwardIssue": {"key": issue_key},
+            "outwardIssue": {"key": "PROJ-456"},
+            "comment": {"body": "Client update"},
+        }
+
+        with pytest.raises(ValueError, match="internal-only"):
+            links_mixin.create_issue_link(data)
+        links_mixin.jira.create_issue_link.assert_not_called()
+
+    def test_create_issue_link_comment_internal_only_outward_rejected(
+        self, links_mixin
+    ):
+        """A link comment is rejected when the OUTWARD issue is in a listed
+        project — the guard errs safe by checking both sides rather than
+        resolving which issue Jira attaches the comment to."""
+        links_mixin.config.internal_only_projects = frozenset({"CC"})
+        data = {
+            "type": {"name": "Blocks"},
+            "inwardIssue": {"key": "PROJ-123"},
+            "outwardIssue": {"key": "CC-456"},
+            "comment": {"body": "Client update"},
+        }
+
+        with pytest.raises(ValueError, match="internal-only"):
+            links_mixin.create_issue_link(data)
+        links_mixin.jira.create_issue_link.assert_not_called()
+
+    def test_create_issue_link_without_comment_internal_only_passes(self, links_mixin):
+        """Linking listed-project issues WITHOUT a comment is allowed — the
+        guard only blocks the comment, not the link itself."""
+        links_mixin.config.internal_only_projects = frozenset({"CC"})
+        data = {
+            "type": {"name": "Blocks"},
+            "inwardIssue": {"key": "CC-123"},
+            "outwardIssue": {"key": "CC-456"},
+        }
+
+        response = links_mixin.create_issue_link(data)
+
+        assert response["success"] is True
+        links_mixin.jira.create_issue_link.assert_called_once_with(data)
+
+    def test_create_issue_link_comment_unlisted_projects_unaffected(self, links_mixin):
+        """A link comment between two unlisted projects passes through even
+        with the guard configured for another project."""
+        links_mixin.config.internal_only_projects = frozenset({"CC"})
+        data = {
+            "type": {"name": "Blocks"},
+            "inwardIssue": {"key": "PROJ-123"},
+            "outwardIssue": {"key": "PROJ-456"},
+            "comment": {"body": "Linked related issue"},
+        }
+
+        response = links_mixin.create_issue_link(data)
+
+        assert response["success"] is True
         links_mixin.jira.create_issue_link.assert_called_once_with(data)
 
     def test_create_issue_link_missing_type(self, links_mixin):
@@ -204,3 +275,93 @@ class TestLinksMixin:
 
         with pytest.raises(MCPAtlassianAuthenticationError):
             links_mixin.remove_issue_link(link_id)
+
+    @pytest.mark.parametrize(
+        "url, api_version",
+        [
+            pytest.param("https://test.atlassian.net", "3", id="cloud"),
+            pytest.param("https://jira.example.com", "2", id="server"),
+        ],
+    )
+    def test_get_remote_issue_links_success(
+        self,
+        jira_config_factory,
+        mock_atlassian_jira,
+        url: str,
+        api_version: str,
+    ):
+        """Test successful retrieval of remote issue links."""
+        config = jira_config_factory(url=url)
+        mixin = LinksMixin(config=config)
+        mixin.jira = mock_atlassian_jira
+        mock_links = [
+            {
+                "id": 1,
+                "object": {
+                    "url": "https://example.com",
+                    "title": "Link 1",
+                },
+            },
+            {
+                "id": 2,
+                "object": {
+                    "url": "https://example.org",
+                    "title": "Link 2",
+                },
+            },
+        ]
+        mixin.jira.get.return_value = mock_links
+
+        result = mixin.get_remote_issue_links("PROJ-123")
+
+        assert result == mock_links
+        mixin.jira.get.assert_called_once_with(
+            f"rest/api/{api_version}/issue/PROJ-123/remotelink"
+        )
+
+    def test_get_remote_issue_links_dict_response(self, links_mixin):
+        """Test dict responses are unwrapped correctly."""
+        inner = [
+            {
+                "id": 1,
+                "object": {
+                    "url": "https://example.com",
+                    "title": "A",
+                },
+            }
+        ]
+        links_mixin.jira.get.return_value = {"remoteLinks": inner}
+
+        result = links_mixin.get_remote_issue_links("PROJ-123")
+
+        assert result == inner
+
+    def test_get_remote_issue_links_dict_without_key(self, links_mixin):
+        """Dict without remoteLinks wraps as single-element list."""
+        single = {
+            "id": 1,
+            "object": {
+                "url": "https://example.com",
+                "title": "A",
+            },
+        }
+        links_mixin.jira.get.return_value = single
+
+        result = links_mixin.get_remote_issue_links("PROJ-123")
+
+        assert result == [single]
+
+    def test_get_remote_issue_links_empty(self, links_mixin):
+        """Test empty list response."""
+        links_mixin.jira.get.return_value = []
+
+        result = links_mixin.get_remote_issue_links("PROJ-123")
+
+        assert result == []
+
+    def test_get_remote_issue_links_auth_error(self, links_mixin):
+        """Test authentication error is raised correctly."""
+        links_mixin.jira.get.side_effect = HTTPError(response=Mock(status_code=401))
+
+        with pytest.raises(MCPAtlassianAuthenticationError):
+            links_mixin.get_remote_issue_links("PROJ-123")

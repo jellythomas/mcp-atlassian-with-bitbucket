@@ -3,8 +3,9 @@
 from unittest.mock import Mock
 
 import pytest
+from requests.exceptions import HTTPError
 
-from mcp_atlassian.jira.comments import CommentsMixin
+from mcp_atlassian_with_bitbucket_and_privacy.jira.comments import CommentsMixin
 
 
 class TestCommentsMixin:
@@ -153,6 +154,57 @@ class TestCommentsMixin:
         with pytest.raises(Exception, match="Error getting comments"):
             comments_mixin.get_issue_comments("TEST-123")
 
+    def test_get_issue_comments_adf_body(self, comments_mixin):
+        """Regression test for #1488: Jira Cloud (REST API v3) returns
+        comment bodies as ADF dicts; get_issue_comments previously raised
+        TypeError from re.sub() in _process_mentions because the dict was
+        passed straight to _clean_text. adf_to_text() must be applied
+        first, matching the pattern in add_comment / edit_comment."""
+        comments_mixin.jira.issue_get_comments.return_value = {
+            "comments": [
+                {
+                    "id": "10001",
+                    "body": {
+                        "type": "doc",
+                        "version": 1,
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Hello from ADF",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    "created": "2024-01-01T10:00:00.000+0000",
+                    "updated": "2024-01-01T11:00:00.000+0000",
+                    "author": {"displayName": "John Doe"},
+                },
+                {
+                    "id": "10002",
+                    # Plain string body must still work unchanged
+                    "body": "This is a plain text comment",
+                    "created": "2024-01-02T10:00:00.000+0000",
+                    "updated": "2024-01-02T11:00:00.000+0000",
+                    "author": {"displayName": "Jane Smith"},
+                },
+            ]
+        }
+
+        result = comments_mixin.get_issue_comments("TEST-123")
+
+        assert len(result) == 2
+        # ADF body converted to plain text and forwarded to _clean_text.
+        # The fixture's mock _clean_text is the identity function, so the
+        # plain-text extraction result is what comes back.
+        assert "Hello from ADF" in result[0]["body"]
+        assert "doc" not in result[0]["body"]
+        # Plain string body passes through adf_to_text unchanged.
+        assert result[1]["body"] == "This is a plain text comment"
+
     def test_add_comment_basic(self, comments_mixin):
         """Test add_comment with basic data (Cloud → ADF via v3 API)."""
         # Setup mock response for v3 API path
@@ -206,6 +258,29 @@ class TestCommentsMixin:
         comments_mixin.preprocessor.markdown_to_jira.assert_not_called()
         assert result["body"] == "Heading and content"
 
+    def test_add_comment_with_accountid_mention_uses_adf_node(
+        self, comments_mixin: CommentsMixin
+    ) -> None:
+        """Test [~accountid:...] comments become ADF mention nodes on Cloud."""
+        mock_response = {
+            "id": "10001",
+            "body": "Mention comment",
+            "created": "2024-01-01T10:00:00.000+0000",
+            "author": {"displayName": "John Doe"},
+        }
+        comments_mixin._post_api3 = Mock(return_value=mock_response)
+
+        account_id = "712020:1cfc6d16-950f-4096-8e57-f2c6c60d8ffa"
+        comments_mixin.add_comment("TEST-123", f"Hello [~accountid:{account_id}]")
+
+        call_args = comments_mixin._post_api3.call_args
+        adf_body = call_args[0][1]["body"]
+        assert adf_body["content"][0]["content"] == [
+            {"type": "text", "text": "Hello "},
+            {"type": "mention", "attrs": {"id": account_id}},
+        ]
+        comments_mixin.preprocessor.markdown_to_jira.assert_not_called()
+
     def test_add_comment_with_empty_comment(self, comments_mixin):
         """Test add_comment with an empty comment (Cloud → minimal ADF)."""
         # Setup mock response for v3 API path
@@ -256,6 +331,34 @@ class TestCommentsMixin:
         assert result["body"] == "This is a comment"
         assert result["created"] == "2024-01-01 10:00:00+00:00"
         assert result["author"] == "John Doe"
+
+    def test_add_comment_with_role_visibility(self, comments_mixin):
+        """Test add_comment with role visibility set (Cloud → ADF via v3)."""
+        mock_response = {
+            "id": "10002",
+            "body": "Admin-only comment",
+            "created": "2024-01-01T10:00:00.000+0000",
+            "author": {"displayName": "Jane Smith"},
+        }
+        comments_mixin._post_api3 = Mock(return_value=mock_response)
+
+        result = comments_mixin.add_comment(
+            "TEST-456",
+            "Admin-only comment",
+            visibility={"type": "role", "value": "Administrators"},
+        )
+
+        call_args = comments_mixin._post_api3.call_args
+        assert call_args[0][0] == "issue/TEST-456/comment"
+        payload = call_args[0][1]
+        assert isinstance(payload["body"], dict)
+        assert payload["body"]["version"] == 1
+        assert payload["visibility"] == {"type": "role", "value": "Administrators"}
+        comments_mixin.preprocessor.markdown_to_jira.assert_not_called()
+        assert result["id"] == "10002"
+        assert result["body"] == "Admin-only comment"
+        assert result["created"] == "2024-01-01 10:00:00+00:00"
+        assert result["author"] == "Jane Smith"
 
     def test_add_comment_with_error(self, comments_mixin):
         """Test add_comment with an error response."""
@@ -389,6 +492,17 @@ class TestCommentsMixin:
         assert result["type"] == "doc"
         comments_mixin.preprocessor.markdown_to_jira.assert_not_called()
 
+    def test_markdown_to_jira_cloud_links_issue_keys(self, comments_mixin):
+        """Cloud ADF links bare Jira issue keys to the configured Jira site."""
+        result = comments_mixin._markdown_to_jira("Blocked by PROJ-123.")
+        assert isinstance(result, dict)
+        para = result["content"][0]
+        link_node = next(n for n in para["content"] if n.get("text") == "PROJ-123")
+        link_mark = next(m for m in link_node["marks"] if m["type"] == "link")
+        assert (
+            link_mark["attrs"]["href"] == "https://test.atlassian.net/browse/PROJ-123"
+        )
+
     def test_markdown_to_jira_cloud_empty(self, comments_mixin):
         """Test _markdown_to_jira with empty text on Cloud returns ADF."""
         result = comments_mixin._markdown_to_jira("")
@@ -517,12 +631,28 @@ class TestCommentsMixin:
         with pytest.raises(Exception, match="not a JSM service desk issue"):
             comments_mixin.add_comment("TEST-123", "Test", public=True)
 
-    def test_add_comment_servicedesk_404(self, comments_mixin):
-        """public=True on non-existent issue gives clear 404 error."""
+    def test_add_servicedesk_comment_404_is_strict(self, comments_mixin):
+        """The ServiceDesk helper keeps raising its 404 error."""
         comments_mixin.jira.post.side_effect = Exception("404 Client Error: Not Found")
 
         with pytest.raises(Exception, match="not a JSM service desk issue"):
-            comments_mixin.add_comment("TEST-123", "Test", public=True)
+            comments_mixin._add_servicedesk_comment("TEST-123", "Test", public=True)
+
+    def test_add_comment_servicedesk_failure_never_reaches_jira(self, comments_mixin):
+        """A failed internal-comment request must not become an ordinary one.
+
+        Falling through to the normal Jira comment path could publish the text to
+        the customer portal, so the request has to fail instead.
+        """
+        comments_mixin.jira.post.side_effect = HTTPError(response=Mock(status_code=404))
+        comments_mixin._post_api3 = Mock()
+        comments_mixin.jira.issue_add_comment = Mock()
+
+        with pytest.raises(Exception, match="ServiceDesk|JSM service desk"):
+            comments_mixin.add_comment("TEST-123", "Internal note", public=False)
+
+        comments_mixin._post_api3.assert_not_called()
+        comments_mixin.jira.issue_add_comment.assert_not_called()
 
     def test_add_comment_public_with_visibility_raises(self, comments_mixin):
         """public + visibility together raises ValueError."""
@@ -551,3 +681,599 @@ class TestCommentsMixin:
         # ServiceDesk post should NOT be called
         comments_mixin.jira.post.assert_not_called()
         assert result["id"] == "10001"
+
+
+class TestInternalCommentPublicParam:
+    """Regression tests for add_comment public parameter (internal comments).
+
+    Regression for https://github.com/sooperset/mcp-atlassian/issues/716
+    Feature was requested: make comment internal (public: false) via JSM API.
+    Already implemented: add_comment(public=False) routes through
+    _add_servicedesk_comment which posts to rest/servicedeskapi/request/.../comment.
+    """
+
+    SERVICEDESK_COMMENT_RESPONSE = {
+        "id": 10001,
+        "body": "Test comment",
+        "public": True,
+        "created": {
+            "iso8601": "2024-01-01T10:00:00.000+0000",
+            "jira": "2024-01-01T10:00:00.000+0000",
+            "friendly": "Today 10:00 AM",
+            "epochMillis": 1704099600000,
+        },
+        "author": {
+            "accountId": "test-id",
+            "displayName": "Test User",
+        },
+    }
+
+    @pytest.fixture
+    def comments_mixin(self, jira_client):
+        """Create a CommentsMixin instance with mocked dependencies."""
+        mixin = CommentsMixin(config=jira_client.config)
+        mixin.jira = jira_client.jira
+        mixin.preprocessor = Mock()
+        mixin.preprocessor.markdown_to_jira = Mock(
+            return_value="*This* is _Jira_ formatted"
+        )
+        mixin._clean_text = Mock(side_effect=lambda x: x)
+        return mixin
+
+    def test_public_false_calls_servicedesk_comment(self, comments_mixin):
+        """add_comment(public=False) routes through _add_servicedesk_comment."""
+        captured: list[tuple] = []
+        original = comments_mixin._add_servicedesk_comment
+
+        def spy(*args, **kwargs):
+            captured.append((args, kwargs))
+            return original(*args, **kwargs)
+
+        comments_mixin._add_servicedesk_comment = spy
+        response = {**self.SERVICEDESK_COMMENT_RESPONSE, "public": False}
+        comments_mixin.jira.post.return_value = response
+
+        comments_mixin.add_comment("ISSUE-1", "Internal note", public=False)
+
+        assert len(captured) == 1
+        assert captured[0][0] == ("ISSUE-1", "Internal note", False)  # noqa: FBT003
+
+    def test_public_true_calls_servicedesk_comment(self, comments_mixin):
+        """add_comment(public=True) routes through _add_servicedesk_comment."""
+        captured: list[tuple] = []
+        original = comments_mixin._add_servicedesk_comment
+
+        def spy(*args, **kwargs):
+            captured.append((args, kwargs))
+            return original(*args, **kwargs)
+
+        comments_mixin._add_servicedesk_comment = spy
+        response = {**self.SERVICEDESK_COMMENT_RESPONSE, "public": True}
+        comments_mixin.jira.post.return_value = response
+
+        comments_mixin.add_comment("ISSUE-1", "Customer reply", public=True)
+
+        assert len(captured) == 1
+        assert captured[0][0] == ("ISSUE-1", "Customer reply", True)  # noqa: FBT003
+
+    def test_public_none_does_not_call_servicedesk_comment(self, comments_mixin):
+        """add_comment(public=None default) does NOT call _add_servicedesk_comment."""
+        captured: list[tuple] = []
+
+        def spy(*args, **kwargs):
+            captured.append((args, kwargs))
+
+        comments_mixin._add_servicedesk_comment = spy
+        mock_response = {
+            "id": "10001",
+            "body": "Normal comment",
+            "created": "2024-01-01T10:00:00.000+0000",
+            "author": {"displayName": "John Doe"},
+        }
+        comments_mixin._post_api3 = Mock(return_value=mock_response)
+
+        comments_mixin.add_comment("ISSUE-1", "text")
+
+        assert len(captured) == 0
+
+
+class TestInternalOnlyProjectsGuard:
+    """Tests for the JIRA_INTERNAL_ONLY_PROJECTS server-side guard.
+
+    Covers issue #1: add_comment must reject anything but an explicit
+    public=False on a listed project, and edit_comment must reject edits
+    to a currently-public comment on a listed project. The env var is
+    opt-in: an unlisted project (or the default empty config used by the
+    `comments_mixin`/`mixin` fixtures elsewhere in this file) must see
+    zero behavior change.
+    """
+
+    @pytest.fixture
+    def guarded_mixin(self, jira_config_factory):
+        """CommentsMixin with 'CC' configured as an internal-only project."""
+        config = jira_config_factory(internal_only_projects=frozenset({"CC"}))
+        mixin = CommentsMixin(config=config)
+        mixin.jira = Mock()
+        mixin.jira.default_headers = {}
+        mixin.preprocessor = Mock()
+        mixin.preprocessor.markdown_to_jira = Mock(return_value="formatted")
+        mixin._clean_text = Mock(side_effect=lambda x: x)
+        return mixin
+
+    # --- add_comment ---
+
+    def test_add_comment_unlisted_project_unaffected(self, guarded_mixin):
+        """A project not in JIRA_INTERNAL_ONLY_PROJECTS sees no behavior
+        change: public=None (the API default, i.e. public) still goes
+        through normally."""
+        guarded_mixin._post_api3 = Mock(
+            return_value={
+                "id": "1",
+                "body": "hi",
+                "created": "2024-01-01T10:00:00.000+0000",
+                "author": {"displayName": "A"},
+            }
+        )
+        result = guarded_mixin.add_comment("TEST-123", "hi")
+        guarded_mixin._post_api3.assert_called_once()
+        guarded_mixin.jira.post.assert_not_called()
+        assert result["id"] == "1"
+
+    def test_add_comment_internal_only_rejects_public_true(self, guarded_mixin):
+        """Listed project + public=True is rejected."""
+        with pytest.raises(ValueError, match="internal-only"):
+            guarded_mixin.add_comment("CC-1", "Client update", public=True)
+        guarded_mixin.jira.post.assert_not_called()
+
+    def test_add_comment_internal_only_rejects_public_absent(self, guarded_mixin):
+        """Listed project + public omitted (defaults to public) is rejected."""
+        with pytest.raises(ValueError, match="internal-only"):
+            guarded_mixin.add_comment("CC-1", "Client update")
+        guarded_mixin.jira.post.assert_not_called()
+
+    def test_add_comment_internal_only_accepts_public_false(self, guarded_mixin):
+        """Listed project + public=False passes through untouched."""
+        guarded_mixin.jira.post.return_value = {
+            "id": 1,
+            "body": "Internal note",
+            "public": False,
+            "created": {"iso8601": "2024-01-01T10:00:00.000+0000"},
+            "author": {"displayName": "A"},
+        }
+        result = guarded_mixin.add_comment("CC-1", "Internal note", public=False)
+        guarded_mixin.jira.post.assert_called_once()
+        assert result["public"] is False
+
+    @pytest.mark.parametrize("status_code", [403, 404, 500])
+    def test_add_comment_internal_only_failure_never_reaches_jira(
+        self, guarded_mixin, status_code
+    ):
+        """An internal comment must never be downgraded to an ordinary one.
+
+        Whatever the ServiceDesk API answers, falling through to the normal Jira
+        comment path could publish the text to the customer portal, so the
+        request has to fail instead.
+        """
+        guarded_mixin.jira.post.side_effect = HTTPError(
+            response=Mock(status_code=status_code)
+        )
+        guarded_mixin._post_api3 = Mock()
+        guarded_mixin.jira.issue_add_comment = Mock()
+
+        with pytest.raises(Exception, match="ServiceDesk|JSM service desk"):
+            guarded_mixin.add_comment("CC-1", "Internal note", public=False)
+
+        guarded_mixin.jira.post.assert_called_once()
+        guarded_mixin._post_api3.assert_not_called()
+        guarded_mixin.jira.issue_add_comment.assert_not_called()
+
+    def test_add_comment_internal_only_case_insensitive_project_match(
+        self, guarded_mixin
+    ):
+        """Project key matching is case-insensitive on both sides."""
+        with pytest.raises(ValueError, match="internal-only"):
+            guarded_mixin.add_comment("cc-1", "Client update", public=True)
+
+    @pytest.mark.parametrize(
+        "padded_key",
+        [
+            " CC-1",  # leading space
+            "\tCC-1",  # leading tab
+            "CC -1",  # space before the dash
+            " cc-1 ",  # padded + lowercase
+            "C\u200bC-1",  # zero-width space inside the project key
+            "\ufeffCC-1",  # BOM before the project key
+        ],
+    )
+    def test_add_comment_internal_only_whitespace_padded_key_still_guarded(
+        self, guarded_mixin, padded_key
+    ):
+        """Whitespace-padded issue keys must NOT bypass the guard.
+
+        The guard normalizes its own input: config keys are stripped at
+        parse time, and the issue key is normalized (around the whole key
+        AND around the extracted project segment) at check time. Pins
+        the whitespace and invisible-character bypass classes.
+        """
+        with pytest.raises(ValueError, match="internal-only"):
+            guarded_mixin.add_comment(padded_key, "Client update", public=True)
+
+    @pytest.mark.parametrize("issue_key", [" CC-1", "CC%2D1", "%43C-1"])
+    def test_edit_comment_internal_only_noncanonical_key_still_guarded(
+        self, guarded_mixin, issue_key
+    ):
+        """The edit guard accounts for input and request URL normalization."""
+        guarded_mixin.jira.get.return_value = {"id": "5", "public": True}
+        guarded_mixin._put_api3 = Mock()
+        with pytest.raises(ValueError, match="PUBLIC"):
+            guarded_mixin.edit_comment(issue_key, "5", "Updated text")
+        guarded_mixin.jira.get.assert_called_once()
+        guarded_mixin._put_api3.assert_not_called()
+
+    # --- edit_comment ---
+
+    def test_edit_comment_unlisted_project_skips_visibility_fetch(self, guarded_mixin):
+        """An unlisted project never pays the extra ServiceDesk lookup."""
+        guarded_mixin._put_api3 = Mock(
+            return_value={
+                "id": "1",
+                "body": "updated",
+                "updated": "2024-01-01T10:00:00.000+0000",
+                "author": {"displayName": "A"},
+            }
+        )
+        result = guarded_mixin.edit_comment("TEST-1", "1", "updated")
+        guarded_mixin.jira.get.assert_not_called()
+        guarded_mixin._put_api3.assert_called_once()
+        assert result["id"] == "1"
+
+    def test_edit_comment_internal_only_rejects_public_comment(self, guarded_mixin):
+        """Listed project + currently-public target comment is rejected."""
+        guarded_mixin.jira.get.return_value = {"id": "5", "public": True}
+        with pytest.raises(ValueError, match="PUBLIC"):
+            guarded_mixin.edit_comment("CC-1", "5", "Updated text")
+        guarded_mixin.jira.get.assert_called_once()
+        call_args = guarded_mixin.jira.get.call_args
+        assert "rest/servicedeskapi/request/CC-1/comment/5" in str(call_args)
+
+    def test_edit_comment_internal_only_accepts_internal_comment(self, guarded_mixin):
+        """Listed project + currently-internal target comment passes through."""
+        guarded_mixin.jira.get.return_value = {"id": "5", "public": False}
+        guarded_mixin._put_api3 = Mock(
+            return_value={
+                "id": "5",
+                "body": "updated",
+                "updated": "2024-01-01T10:00:00.000+0000",
+                "author": {"displayName": "A"},
+            }
+        )
+        result = guarded_mixin.edit_comment("CC-1", "5", "Updated text")
+        guarded_mixin.jira.get.assert_called_once()
+        guarded_mixin._put_api3.assert_called_once()
+        assert result["id"] == "5"
+
+    def test_edit_comment_internal_only_visibility_lookup_fails_closed(
+        self, guarded_mixin
+    ):
+        """If the ServiceDesk visibility lookup errors, the edit is refused
+        rather than silently allowed through (fail closed)."""
+        guarded_mixin.jira.get.side_effect = Exception("500 Server Error")
+        with pytest.raises(Exception, match="Could not verify"):
+            guarded_mixin.edit_comment("CC-1", "5", "Updated text")
+
+    @pytest.mark.parametrize("public", [None, 0, 1, "false", []])
+    def test_edit_comment_internal_only_non_boolean_visibility_fails_closed(
+        self, guarded_mixin, public
+    ):
+        """Only a real boolean false proves that a comment is internal."""
+        response = {"id": "5"}
+        if public is not None:
+            response["public"] = public
+        guarded_mixin.jira.get.return_value = response
+        with pytest.raises(ValueError, match="PUBLIC"):
+            guarded_mixin.edit_comment("CC-1", "5", "Updated text")
+
+
+class TestInternalOnlyNonRequestIssues:
+    """A guarded project may also hold issues that are not JSM requests.
+
+    JIRA_INTERNAL_ONLY_PROJECTS names a project, but only a customer
+    request has a portal view. An agent-created Task or Sub-task in the
+    same project has no portal audience, and the ServiceDesk comment API
+    does not exist for it — so enforcing the guard there left no way to
+    comment on it at all.
+    """
+
+    @pytest.fixture
+    def guarded_mixin(self, jira_config_factory):
+        """CommentsMixin with 'CC' configured as an internal-only project."""
+        config = jira_config_factory(internal_only_projects=frozenset({"CC"}))
+        mixin = CommentsMixin(config=config)
+        mixin.jira = Mock()
+        mixin.jira.default_headers = {}
+        mixin.preprocessor = Mock()
+        mixin.preprocessor.markdown_to_jira = Mock(return_value="formatted")
+        mixin._clean_text = Mock(side_effect=lambda x: x)
+        mixin._post_api3 = Mock(
+            return_value={
+                "id": "1",
+                "body": "note",
+                "created": "2024-01-01T10:00:00.000+0000",
+                "author": {"displayName": "A"},
+            }
+        )
+        return mixin
+
+    @staticmethod
+    def _not_a_request(guarded_mixin) -> None:
+        """Make the request lookup answer 404 (definitely not a request)."""
+        guarded_mixin.jira.get.side_effect = HTTPError(response=Mock(status_code=404))
+
+    @pytest.mark.parametrize("public", [None, True, False])
+    def test_non_request_issue_posts_via_ordinary_path(self, guarded_mixin, public):
+        """A non-request issue accepts a comment whatever `public` says.
+
+        There is no portal audience to leak to, so the guard does not apply
+        and the ordinary comment path is used. Before this, public=True and
+        an omitted public were rejected outright, while public=False failed
+        against a ServiceDesk endpoint that does not exist for the issue —
+        leaving no way in.
+        """
+        self._not_a_request(guarded_mixin)
+        result = guarded_mixin.add_comment("CC-1", "note", public=public)
+        guarded_mixin._post_api3.assert_called_once()
+        guarded_mixin.jira.post.assert_not_called()
+        assert result["id"] == "1"
+
+    def test_restricted(self, guarded_mixin):
+        """A non-request issue can use ordinary Jira visibility restrictions."""
+        self._not_a_request(guarded_mixin)
+        visibility = {"type": "group", "value": "jira-users"}
+
+        result = guarded_mixin.add_comment(
+            "CC-1", "note", visibility=visibility, public=True
+        )
+
+        guarded_mixin._post_api3.assert_called_once()
+        assert guarded_mixin._post_api3.call_args.args[1]["visibility"] == visibility
+        guarded_mixin.jira.post.assert_not_called()
+        assert result["id"] == "1"
+
+    def test_request_issue_still_guarded(self, guarded_mixin):
+        """A genuine customer request keeps the guard."""
+        guarded_mixin.jira.get.return_value = {"issueId": "10001"}
+        with pytest.raises(ValueError, match="internal-only"):
+            guarded_mixin.add_comment("CC-1", "Client update", public=True)
+        guarded_mixin._post_api3.assert_not_called()
+        guarded_mixin.jira.post.assert_not_called()
+
+    @pytest.mark.parametrize("status_code", [401, 403, 429, 500, 503])
+    def test_lookup_failure_keeps_guard(self, guarded_mixin, status_code):
+        """Anything short of a definite 404 fails closed."""
+        guarded_mixin.jira.get.side_effect = HTTPError(
+            response=Mock(status_code=status_code)
+        )
+        with pytest.raises(ValueError, match="internal-only"):
+            guarded_mixin.add_comment("CC-1", "Client update", public=True)
+        guarded_mixin._post_api3.assert_not_called()
+
+    def test_lookup_non_http_error_keeps_guard(self, guarded_mixin):
+        """A transport error is not evidence that the issue is unguarded."""
+        guarded_mixin.jira.get.side_effect = Exception("connection reset")
+        with pytest.raises(ValueError, match="internal-only"):
+            guarded_mixin.add_comment("CC-1", "Client update", public=True)
+
+    @pytest.mark.parametrize("response", [{}, {"issueId": None}, "not a dict", None])
+    def test_lookup_unexpected_body_keeps_guard(self, guarded_mixin, response):
+        """An unrecognisable response is not proof of a non-request."""
+        guarded_mixin.jira.get.return_value = response
+        with pytest.raises(ValueError, match="internal-only"):
+            guarded_mixin.add_comment("CC-1", "Client update", public=True)
+
+    @pytest.mark.parametrize(
+        "issue_key",
+        [
+            " CC-1",
+            "\tCC-1",
+            "CC -1",
+            " cc-1 ",
+            "C\u200bC-1",
+            "\ufeffCC-1",
+            "CC-1-2",
+            "CC-1/../../PROJ-2",
+            "CC-1?comment=public",
+            "CC-1#comment",
+            "CC%2D1",
+            "%43C-1",
+            "%43%43%2D1",
+        ],
+    )
+    @pytest.mark.parametrize("public", [None, True, False])
+    def test_noncanonical_guarded_key_never_uses_404_fallback(
+        self, guarded_mixin, issue_key, public
+    ):
+        """A 404 for a malformed spelling cannot relax the project guard."""
+        self._not_a_request(guarded_mixin)
+        guarded_mixin.jira.issue_add_comment = Mock()
+
+        with pytest.raises(ValueError, match="not canonical"):
+            guarded_mixin.add_comment(issue_key, "note", public=public)
+
+        guarded_mixin.jira.get.assert_not_called()
+        guarded_mixin._post_api3.assert_not_called()
+        guarded_mixin.jira.post.assert_not_called()
+        guarded_mixin.jira.issue_add_comment.assert_not_called()
+
+    def test_unlisted_project_pays_no_lookup(self, guarded_mixin):
+        """Projects outside the setting never pay the extra round-trip."""
+        guarded_mixin.add_comment("TEST-1", "note")
+        guarded_mixin.jira.get.assert_not_called()
+
+
+class TestServiceDeskErrorStatusDetection:
+    """Status classification must not depend on the exception's text.
+
+    An HTTPError raised for a response with an empty body stringifies to
+    "", so the 403/404 branches that matched on str(e) never fired and the
+    caller got the generic message with nothing after the colon.
+    """
+
+    @pytest.fixture
+    def comments_mixin(self, jira_config_factory):
+        mixin = CommentsMixin(config=jira_config_factory())
+        mixin.jira = Mock()
+        mixin.jira.default_headers = {}
+        mixin._clean_text = Mock(side_effect=lambda x: x)
+        return mixin
+
+    @pytest.mark.parametrize(
+        ("status_code", "expected"),
+        [(403, "lack permission"), (404, "does not exist")],
+    )
+    def test_empty_message_still_classified(
+        self, comments_mixin, status_code, expected
+    ):
+        """The status on the exception is used when the message is empty."""
+        comments_mixin.jira.post.side_effect = HTTPError(
+            response=Mock(status_code=status_code)
+        )
+        with pytest.raises(Exception, match=expected):
+            comments_mixin._add_servicedesk_comment("TEST-1", "note", public=False)
+
+    def test_generic_failure_names_the_exception_type(self, comments_mixin):
+        """An unclassified failure still says something after the colon."""
+        comments_mixin.jira.post.side_effect = HTTPError(response=Mock(status_code=500))
+        with pytest.raises(Exception, match="HTTPError"):
+            comments_mixin._add_servicedesk_comment("TEST-1", "note", public=False)
+
+
+def _strong_text_nodes(adf: dict) -> list[str]:
+    """Collect the text of every node carrying a `strong` mark in an ADF doc."""
+    out: list[str] = []
+
+    def walk(node: dict) -> None:
+        marks = [m.get("type") for m in node.get("marks", [])]
+        if node.get("type") == "text" and "strong" in marks:
+            out.append(node.get("text", ""))
+        for child in node.get("content", []):
+            walk(child)
+
+    walk(adf)
+    return out
+
+
+def _node_types(adf: dict) -> list[str]:
+    """Flatten all node `type` values in an ADF doc (depth-first)."""
+    out: list[str] = []
+
+    def walk(node: dict) -> None:
+        if "type" in node:
+            out.append(node["type"])
+        for child in node.get("content", []):
+            walk(child)
+
+    walk(adf)
+    return out
+
+
+class TestAddEditConversionParity:
+    """Regression guard: add_comment must not double-convert markdown.
+
+    The bug: the ADD path applied an extra markdown→jira-wiki-ish
+    transformation before markdown_to_adf, so `**bold**` reached the
+    converter as `****bold****` (stray `*` text nodes around the strong
+    mark) and `## Heading` was turned into a numbered/ordered list.
+    The EDIT path never did this. These tests pin add_comment's posted
+    body to be byte-identical to edit_comment's for the same markdown,
+    and assert the conversion happens exactly once with the output
+    posted unmodified.
+    """
+
+    @pytest.fixture
+    def mixin(self, jira_client):
+        mixin = CommentsMixin(config=jira_client.config)
+        mixin.jira = jira_client.jira
+        mixin.preprocessor = Mock()
+        mixin.preprocessor.markdown_to_jira = Mock(
+            return_value="should-not-be-used-on-cloud"
+        )
+        mixin._clean_text = Mock(side_effect=lambda x: x)
+        return mixin
+
+    MARKDOWN = "## Heading\n\nThis is **bold** and `code_x` text.\n\n- one\n- two"
+
+    def _add_body(self, mixin) -> dict:
+        mixin._post_api3 = Mock(
+            return_value={
+                "id": "1",
+                "body": {},
+                "created": "2024-01-01T10:00:00.000+0000",
+                "author": {"displayName": "A"},
+            }
+        )
+        mixin.add_comment("TEST-1", self.MARKDOWN)
+        return mixin._post_api3.call_args[0][1]["body"]
+
+    def _edit_body(self, mixin) -> dict:
+        mixin._put_api3 = Mock(
+            return_value={
+                "id": "1",
+                "body": {},
+                "updated": "2024-01-01T10:00:00.000+0000",
+                "author": {"displayName": "A"},
+            }
+        )
+        mixin.edit_comment("TEST-1", "1", self.MARKDOWN)
+        return mixin._put_api3.call_args[0][1]["body"]
+
+    def test_add_body_equals_edit_body(self, mixin):
+        """add_comment and edit_comment produce identical ADF for same markdown."""
+        assert self._add_body(mixin) == self._edit_body(mixin)
+
+    def test_add_body_is_clean_adf(self, mixin):
+        """The ADD body has clean marks: no stray '*', heading lvl2, code mark."""
+        body = self._add_body(mixin)
+        # bold renders as a strong-marked node with text exactly "bold"
+        # (not "*bold*" / "**bold**" which is the double-conversion signature)
+        assert _strong_text_nodes(body) == ["bold"]
+        types = _node_types(body)
+        # "## Heading" is a heading, NOT an ordered list
+        assert "heading" in types
+        assert "orderedList" not in types
+        # heading level is 2
+        heading = next(n for n in body["content"] if n.get("type") == "heading")
+        assert heading["attrs"]["level"] == 2
+        # `code_x` carries a code mark
+        assert "code" in [m for n in _node_types_with_marks(body) for m in n]
+
+    def test_add_calls_markdown_to_jira_once_and_posts_unmodified(self, mixin):
+        """_markdown_to_jira is invoked exactly once; its output is posted as-is."""
+        sentinel = {"version": 1, "type": "doc", "content": [{"type": "x"}]}
+        mixin._markdown_to_jira = Mock(return_value=sentinel)
+        mixin._post_api3 = Mock(
+            return_value={
+                "id": "1",
+                "body": {},
+                "created": "2024-01-01T10:00:00.000+0000",
+                "author": {"displayName": "A"},
+            }
+        )
+        mixin.add_comment("TEST-1", self.MARKDOWN)
+        mixin._markdown_to_jira.assert_called_once_with(self.MARKDOWN)
+        # posted body is the exact object returned by _markdown_to_jira
+        assert mixin._post_api3.call_args[0][1]["body"] is sentinel
+        # and the Cloud ADD path must not touch the wiki preprocessor
+        mixin.preprocessor.markdown_to_jira.assert_not_called()
+
+
+def _node_types_with_marks(adf: dict) -> list[list[str]]:
+    """For every node, return its list of mark types (for code-mark checks)."""
+    out: list[list[str]] = []
+
+    def walk(node: dict) -> None:
+        out.append([m.get("type") for m in node.get("marks", [])])
+        for child in node.get("content", []):
+            walk(child)
+
+    walk(adf)
+    return out

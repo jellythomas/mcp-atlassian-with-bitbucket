@@ -13,8 +13,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_atlassian import main
-from mcp_atlassian.utils.lifecycle import _shutdown_event
+from mcp_atlassian_with_bitbucket_and_privacy import main
+from mcp_atlassian_with_bitbucket_and_privacy.utils.lifecycle import _shutdown_event
 
 
 class TestTransportLifecycleBehavior:
@@ -37,7 +37,7 @@ class TestTransportLifecycleBehavior:
                 with patch.dict("os.environ", {"TRANSPORT": transport}, clear=False):
                     with (
                         patch(
-                            "mcp_atlassian.servers.main.AtlassianMCP"
+                            "mcp_atlassian_with_bitbucket_and_privacy.servers.main.AtlassianMCP"
                         ) as mock_server_class,
                         patch("click.core.Context") as mock_click_ctx,
                     ):
@@ -57,7 +57,9 @@ class TestTransportLifecycleBehavior:
                         mock_click_ctx.return_value = mock_ctx_instance
 
                         # Execute main
-                        with patch("sys.argv", ["mcp-atlassian"]):
+                        with patch(
+                            "sys.argv", ["mcp-atlassian-with-bitbucket-and-privacy"]
+                        ):
                             try:
                                 main()
                             except SystemExit:
@@ -141,7 +143,7 @@ class TestTransportLifecycleBehavior:
                 with patch.dict("os.environ", env_vars, clear=False):
                     with (
                         patch(
-                            "mcp_atlassian.servers.main.AtlassianMCP"
+                            "mcp_atlassian_with_bitbucket_and_privacy.servers.main.AtlassianMCP"
                         ) as mock_server_class,
                         patch("click.core.Context") as mock_click_ctx,
                     ):
@@ -161,7 +163,9 @@ class TestTransportLifecycleBehavior:
                         mock_click_ctx.return_value = mock_ctx_instance
 
                         # Run main
-                        with patch("sys.argv", ["mcp-atlassian"]):
+                        with patch(
+                            "sys.argv", ["mcp-atlassian-with-bitbucket-and-privacy"]
+                        ):
                             try:
                                 main()
                             except SystemExit:
@@ -211,7 +215,7 @@ class TestTransportLifecycleBehavior:
             with patch.dict("os.environ", docker_env, clear=False):
                 with (
                     patch(
-                        "mcp_atlassian.servers.main.AtlassianMCP"
+                        "mcp_atlassian_with_bitbucket_and_privacy.servers.main.AtlassianMCP"
                     ) as mock_server_class,
                     patch("sys.stdin", StringIO()),  # Simulate available stdin
                 ):
@@ -221,7 +225,9 @@ class TestTransportLifecycleBehavior:
                     mock_server_class.return_value = mock_server
 
                     # Simulate Docker container startup
-                    with patch("sys.argv", ["mcp-atlassian"]):
+                    with patch(
+                        "sys.argv", ["mcp-atlassian-with-bitbucket-and-privacy"]
+                    ):
                         try:
                             main()
                         except SystemExit:
@@ -247,7 +253,7 @@ class TestRegressionPrevention:
         that caused issues #519 and #524.
         """
         # Check that the problematic function doesn't exist
-        from mcp_atlassian.utils import lifecycle
+        from mcp_atlassian_with_bitbucket_and_privacy.utils import lifecycle
 
         assert not hasattr(lifecycle, "run_with_stdio_monitoring"), (
             "run_with_stdio_monitoring should not exist in lifecycle module"
@@ -255,10 +261,16 @@ class TestRegressionPrevention:
 
     def test_signal_handlers_are_setup(self):
         """Verify signal handlers are properly configured."""
-        with patch("mcp_atlassian.setup_signal_handlers") as mock_setup:
+        with patch(
+            "mcp_atlassian_with_bitbucket_and_privacy.setup_signal_handlers"
+        ) as mock_setup:
             with patch("asyncio.run"):
-                with patch("mcp_atlassian.servers.main.AtlassianMCP"):
-                    with patch("sys.argv", ["mcp-atlassian"]):
+                with patch(
+                    "mcp_atlassian_with_bitbucket_and_privacy.servers.main.AtlassianMCP"
+                ):
+                    with patch(
+                        "sys.argv", ["mcp-atlassian-with-bitbucket-and-privacy"]
+                    ):
                         try:
                             main()
                         except SystemExit:

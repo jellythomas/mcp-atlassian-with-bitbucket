@@ -2,12 +2,12 @@
 Tests for the JiraProject Pydantic model.
 """
 
-from mcp_atlassian.models.constants import (
+from mcp_atlassian_with_bitbucket_and_privacy.models.constants import (
     EMPTY_STRING,
     JIRA_DEFAULT_PROJECT,
     UNKNOWN,
 )
-from mcp_atlassian.models.jira import (
+from mcp_atlassian_with_bitbucket_and_privacy.models.jira import (
     JiraProject,
 )
 

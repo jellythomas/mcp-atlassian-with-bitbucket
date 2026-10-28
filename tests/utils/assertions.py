@@ -1,4 +1,4 @@
-"""Custom assertions and helpers for MCP Atlassian tests."""
+"""Custom assertions and helpers for MCP Atlassian with Bitbucket and Privacy tests."""
 
 from typing import Any
 from unittest.mock import MagicMock

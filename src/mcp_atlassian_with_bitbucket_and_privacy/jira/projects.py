@@ -1,0 +1,743 @@
+"""Module for Jira project operations."""
+
+import logging
+from typing import Any
+
+from ..models import JiraProject
+from ..models.jira.search import JiraSearchResult
+from ..models.jira.version import JiraVersion
+from .client import JiraClient
+from .protocols import SearchOperationsProto
+
+logger = logging.getLogger("mcp-jira")
+
+
+class ProjectsMixin(JiraClient, SearchOperationsProto):
+    """Mixin for Jira project operations.
+
+    This mixin provides methods for retrieving and working with Jira projects,
+    including project details, components, versions, and other project-related operations.
+    """
+
+    def get_all_projects(self, include_archived: bool = False) -> list[dict[str, Any]]:
+        """
+        Get all projects visible to the current user.
+
+        Returns simplified project dictionaries.
+
+        Args:
+            include_archived: Whether to include archived projects
+
+        Returns:
+            List of simplified project data dictionaries
+        """
+        try:
+            # The bare /project list omits descriptions unless explicitly expanded.
+            projects = self.jira.projects(
+                included_archived=include_archived, expand="description"
+            )
+            if not isinstance(projects, list):
+                return []
+            return [
+                JiraProject.from_api_response(p).to_simplified_dict()
+                for p in projects
+                if isinstance(p, dict)
+            ]
+
+        except Exception as e:
+            logger.error(f"Error getting all projects: {str(e)}")
+            return []
+
+    def search_projects(
+        self,
+        query: str,
+        max_results: int = 20,
+        current_project_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Search for projects by name or key prefix.
+
+        Uses Jira Cloud's project search endpoint or Server/DC's project picker
+        endpoint to return matching projects without fetching every visible
+        project.
+
+        Args:
+            query: Name or key prefix to search for
+            max_results: Maximum number of results to return
+            current_project_ids: Project IDs to exclude from results
+
+        Returns:
+            List of matching project data dictionaries
+        """
+        try:
+            is_cloud = self.config.is_cloud
+            endpoint = (
+                "rest/api/3/project/search"
+                if is_cloud
+                else "rest/api/2/projects/picker"
+            )
+            params: dict[str, Any] = {"query": query, "maxResults": max_results}
+            if current_project_ids and not is_cloud:
+                params["currentProjectIds"] = ",".join(current_project_ids)
+
+            response = self.jira.get(endpoint, params=params)
+            if not isinstance(response, dict):
+                logger.error(
+                    f"Unexpected return type from {endpoint}: {type(response)}"
+                )
+                return []
+
+            projects = response.get("values" if is_cloud else "projects", [])
+            if not isinstance(projects, list):
+                return []
+
+            if current_project_ids and is_cloud:
+                excluded_project_ids = set(current_project_ids)
+                projects = [
+                    p for p in projects if str(p.get("id")) not in excluded_project_ids
+                ]
+
+            # Apply project filter if configured
+            if self.config.projects_filter:
+                allowed_keys = {
+                    k.strip().upper() for k in self.config.projects_filter.split(",")
+                }
+                projects = [
+                    p for p in projects if p.get("key", "").upper() in allowed_keys
+                ]
+
+            return projects
+
+        except Exception as e:
+            logger.error(f"Error searching projects with query '{query}': {str(e)}")
+            return []
+
+    def get_project(self, project_key: str) -> dict[str, Any] | None:
+        """
+        Get project information by key.
+
+        Args:
+            project_key: The project key (e.g. 'PROJ')
+
+        Returns:
+            Project data or None if not found
+        """
+        try:
+            project_data = self.jira.project(project_key)
+            if not isinstance(project_data, dict):
+                msg = f"Unexpected return value type from `jira.project`: {type(project_data)}"
+                logger.error(msg)
+                raise TypeError(msg)
+            return project_data
+        except Exception as e:
+            logger.warning(f"Error getting project {project_key}: {e}")
+            return None
+
+    def get_project_model(self, project_key: str) -> JiraProject | None:
+        """
+        Get project information as a JiraProject model.
+
+        Args:
+            project_key: The project key (e.g. 'PROJ')
+
+        Returns:
+            JiraProject model or None if not found
+        """
+        project_data = self.get_project(project_key)
+        if not project_data:
+            return None
+
+        return JiraProject.from_api_response(project_data)
+
+    def project_exists(self, project_key: str) -> bool:
+        """
+        Check if a project exists.
+
+        Args:
+            project_key: The project key to check
+
+        Returns:
+            True if the project exists, False otherwise
+        """
+        try:
+            project = self.get_project(project_key)
+            return project is not None
+
+        except Exception:
+            return False
+
+    def get_project_components(self, project_key: str) -> list[dict[str, Any]]:
+        """
+        Get all components for a project.
+
+        Args:
+            project_key: The project key
+
+        Returns:
+            List of component data dictionaries
+        """
+        try:
+            components = self.jira.get_project_components(key=project_key)
+            return components if isinstance(components, list) else []
+
+        except Exception as e:
+            logger.error(
+                f"Error getting components for project {project_key}: {str(e)}"
+            )
+            return []
+
+    def get_project_versions(self, project_key: str) -> list[dict[str, Any]]:
+        """
+        Get all versions for a project.
+
+        Args:
+            project_key: The project key.
+
+        Returns:
+            List of version data dictionaries
+        """
+        try:
+            raw_versions = self.jira.get_project_versions(key=project_key)
+            if not isinstance(raw_versions, list):
+                return []
+            versions: list[dict[str, Any]] = []
+            for v in raw_versions:
+                ver = JiraVersion.from_api_response(v)
+                versions.append(ver.to_simplified_dict())
+            return versions
+        except Exception as e:
+            logger.error(f"Error getting versions for project {project_key}: {str(e)}")
+            return []
+
+    def get_project_roles(self, project_key: str) -> dict[str, Any]:
+        """
+        Get all roles for a project.
+
+        Args:
+            project_key: The project key
+
+        Returns:
+            Dictionary of role names mapped to role details
+        """
+        try:
+            roles = self.jira.get_project_roles(project_key=project_key)
+            return roles if isinstance(roles, dict) else {}
+
+        except Exception as e:
+            logger.error(f"Error getting roles for project {project_key}: {str(e)}")
+            return {}
+
+    def get_project_role_members(
+        self, project_key: str, role_id: str
+    ) -> list[dict[str, Any]]:
+        """
+        Get members assigned to a specific role in a project.
+
+        Args:
+            project_key: The project key
+            role_id: The role ID
+
+        Returns:
+            List of role members
+        """
+        try:
+            members = self.jira.get_project_actors_for_role_project(
+                project_key=project_key, role_id=role_id
+            )
+            # Extract the actors from the response
+            actors = []
+            if isinstance(members, dict) and "actors" in members:
+                actors = members.get("actors", [])
+            return actors
+
+        except Exception as e:
+            logger.error(
+                f"Error getting role members for project {project_key}, role {role_id}: {str(e)}"
+            )
+            return []
+
+    def get_project_permission_scheme(self, project_key: str) -> dict[str, Any] | None:
+        """
+        Get the permission scheme for a project.
+
+        Args:
+            project_key: The project key
+
+        Returns:
+            Permission scheme data if found, None otherwise
+        """
+        try:
+            scheme = self.jira.get_project_permission_scheme(
+                project_id_or_key=project_key
+            )
+            if not isinstance(scheme, dict):
+                msg = f"Unexpected return value type from `jira.get_project_permission_scheme`: {type(scheme)}"
+                logger.error(msg)
+                raise TypeError(msg)
+            return scheme
+
+        except Exception as e:
+            logger.error(
+                f"Error getting permission scheme for project {project_key}: {str(e)}"
+            )
+            return None
+
+    def get_project_notification_scheme(
+        self, project_key: str
+    ) -> dict[str, Any] | None:
+        """
+        Get the notification scheme for a project.
+
+        Args:
+            project_key: The project key
+
+        Returns:
+            Notification scheme data if found, None otherwise
+        """
+        try:
+            scheme = self.jira.get_project_notification_scheme(
+                project_id_or_key=project_key
+            )
+            if not isinstance(scheme, dict):
+                msg = f"Unexpected return value type from `jira.get_project_notification_scheme`: {type(scheme)}"
+                logger.error(msg)
+                raise TypeError(msg)
+            return scheme
+
+        except Exception as e:
+            logger.error(
+                f"Error getting notification scheme for project {project_key}: {str(e)}"
+            )
+            return None
+
+    def get_project_issue_types(self, project_key: str) -> list[dict[str, Any]]:
+        """
+        Get all issue types available for a project.
+
+        Args:
+            project_key: The project key
+
+        Returns:
+            List of issue type data dictionaries
+        """
+        try:
+            issue_types: list[dict[str, Any]] = []
+            start_at = 0
+            page_size = 50
+
+            while True:
+                meta = self.jira.issue_createmeta_issuetypes(
+                    project=project_key,
+                    start=start_at,
+                    limit=page_size,
+                )
+                if not isinstance(meta, dict):
+                    msg = (
+                        "Unexpected return value type from "
+                        f"`jira.issue_createmeta_issuetypes`: {type(meta)}"
+                    )
+                    logger.error(msg)
+                    raise TypeError(msg)
+
+                # Jira uses both keys across Cloud and Server/DC versions.
+                page = meta.get("values", [])
+                if not isinstance(page, list) or not page:
+                    page = meta.get("issueTypes", [])
+
+                if not isinstance(page, list) or not page:
+                    # Fallback for the legacy, non-paginated response format.
+                    projects = meta.get("projects", [])
+                    if isinstance(projects, list) and projects:
+                        first_project = projects[0]
+                        if isinstance(first_project, dict):
+                            page = first_project.get("issuetypes", [])
+
+                if not isinstance(page, list):
+                    page = []
+                issue_types.extend(item for item in page if isinstance(item, dict))
+
+                total = meta.get("total")
+                start_at += len(page)
+                if (
+                    not page
+                    or meta.get("isLast") is True
+                    or not isinstance(total, int)
+                    or start_at >= total
+                ):
+                    break
+
+            return issue_types
+
+        except Exception as e:
+            logger.error(
+                f"Error getting issue types for project {project_key}: {str(e)}"
+            )
+            return []
+
+    def get_create_fields(
+        self, project_key: str, issue_type_id: str
+    ) -> list[dict[str, Any]]:
+        """Get all fields available when creating an issue of a given type.
+
+        Uses the non-deprecated ``issue_createmeta_fieldtypes`` endpoint to
+        return field metadata for the specified project and issue type.
+
+        Args:
+            project_key: The project key (e.g., 'PROJ')
+            issue_type_id: The issue type ID (from get_project_issue_types)
+
+        Returns:
+            List of field metadata dicts with fieldId, name, required,
+            schema, etc.
+        """
+        try:
+            fields: list[dict[str, Any]] = []
+            start_at = 0
+            page_size = 50
+
+            while True:
+                meta = self.jira.issue_createmeta_fieldtypes(
+                    project=project_key,
+                    issue_type_id=issue_type_id,
+                    start=start_at,
+                    limit=page_size,
+                )
+                if not isinstance(meta, dict):
+                    msg = (
+                        "Unexpected return type from "
+                        f"issue_createmeta_fieldtypes: {type(meta)}"
+                    )
+                    logger.error(msg)
+                    raise TypeError(msg)
+
+                page = meta.get("values", [])
+                if not isinstance(page, list) or not page:
+                    legacy_fields = meta.get("fields", [])
+                    if isinstance(legacy_fields, dict):
+                        page = [
+                            {"fieldId": field_id, **field_data}
+                            for field_id, field_data in legacy_fields.items()
+                            if isinstance(field_data, dict)
+                        ]
+                    elif isinstance(legacy_fields, list):
+                        page = legacy_fields
+                    else:
+                        page = []
+
+                fields.extend(item for item in page if isinstance(item, dict))
+
+                total = meta.get("total")
+                start_at += len(page)
+                if (
+                    not page
+                    or meta.get("isLast") is True
+                    or not isinstance(total, int)
+                    or start_at >= total
+                ):
+                    break
+
+            return fields
+        except Exception as e:
+            logger.error(
+                f"Error getting create fields for {project_key}/{issue_type_id}: {e}"
+            )
+            return []
+
+    def get_project_fields(self, project_key: str) -> list[dict[str, Any]]:
+        """
+        Get the fields available on issues of a project (the full create schema),
+        deduplicated across the project's issue types.
+
+        This answers "which fields do tickets in this project have" regardless of
+        whether they are filled. Uses the createmeta fieldtypes endpoint per issue
+        type (``/rest/api/2/issue/createmeta/{project}/issuetypes/{issueTypeId}``)
+        and merges the results, recording on which issue types each field appears.
+
+        Args:
+            project_key: The project key
+
+        Returns:
+            List of field dicts: {field_id, name, required, schema_type, custom,
+            issue_types: [names]}. Empty list on error.
+        """
+        try:
+            issue_types = self.get_project_issue_types(project_key)
+            merged: dict[str, dict[str, Any]] = {}
+            for it in issue_types:
+                it_id = it.get("id")
+                it_name = it.get("name", "")
+                if not it_id:
+                    continue
+                start_at = 0
+                while True:
+                    meta = self.jira.issue_createmeta_fieldtypes(
+                        project=project_key,
+                        issue_type_id=it_id,
+                        start=start_at,
+                        limit=50,
+                    )
+                    if not isinstance(meta, dict):
+                        break
+                    entries = meta.get("values", [])
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        fid = entry.get("fieldId") or entry.get("key")
+                        if not fid:
+                            continue
+                        rec = merged.get(fid)
+                        if rec is None:
+                            schema = entry.get("schema") or {}
+                            rec = {
+                                "field_id": fid,
+                                "name": entry.get("name", ""),
+                                "required": bool(entry.get("required", False)),
+                                "schema_type": schema.get("type", ""),
+                                "custom": bool(schema.get("custom")),
+                                "issue_types": [],
+                            }
+                            merged[fid] = rec
+                        elif entry.get("required", False):
+                            rec["required"] = True
+                        if it_name and it_name not in rec["issue_types"]:
+                            rec["issue_types"].append(it_name)
+                    # Paginate: stop when we've seen all values.
+                    total = meta.get("total", 0)
+                    start_at += len(entries)
+                    if not entries or start_at >= total:
+                        break
+            return list(merged.values())
+
+        except Exception as e:
+            logger.error(f"Error getting fields for project {project_key}: {str(e)}")
+            return []
+
+    def get_project_issues_count(self, project_key: str) -> int:
+        """
+        Get the total number of issues in a project.
+
+        Args:
+            project_key: The project key
+
+        Returns:
+            Count of issues in the project
+        """
+        try:
+            # Use JQL to count issues in the project
+            jql = f'project = "{project_key}"'
+            result = self.jira.jql(jql=jql, fields="key", limit=1)
+            if not isinstance(result, dict):
+                msg = f"Unexpected return value type from `jira.jql`: {type(result)}"
+                logger.error(msg)
+                raise TypeError(msg)
+
+            # Extract total from the response
+            total = 0
+            if isinstance(result, dict) and "total" in result:
+                total = result.get("total", 0)
+
+            return total
+
+        except Exception as e:
+            logger.error(
+                f"Error getting issue count for project {project_key}: {str(e)}"
+            )
+            return 0
+
+    def get_project_issues(
+        self, project_key: str, start: int = 0, limit: int = 50
+    ) -> JiraSearchResult:
+        """
+        Get issues for a specific project.
+
+        Args:
+            project_key: The project key
+            start: Index of the first issue to return
+            limit: Maximum number of issues to return
+
+        Returns:
+            List of JiraIssue models representing the issues
+        """
+        try:
+            # Use JQL to get issues in the project
+            jql = f'project = "{project_key}"'
+
+            return self.search_issues(jql, start=start, limit=limit)
+
+        except Exception as e:
+            logger.error(f"Error getting issues for project {project_key}: {str(e)}")
+            return JiraSearchResult(issues=[], total=0)
+
+    def get_project_keys(self) -> list[str]:
+        """
+        Get all project keys.
+
+        Returns:
+            List of project keys
+        """
+        try:
+            projects = self.get_all_projects()
+            project_keys: list[str] = []
+            for project in projects:
+                key = project.get("key")
+                if not isinstance(key, str):
+                    msg = f"Unexpected return value type from `get_all_projects`: {type(key)}"
+                    logger.error(msg)
+                    raise TypeError(msg)
+                project_keys.append(key)
+            return project_keys
+
+        except Exception as e:
+            logger.error(f"Error getting project keys: {str(e)}")
+            return []
+
+    def get_project_leads(self) -> dict[str, str]:
+        """
+        Get all project leads mapped to their projects.
+
+        Returns:
+            Dictionary mapping project keys to lead usernames
+        """
+        try:
+            projects = self.get_all_projects()
+            leads = {}
+
+            for project in projects:
+                if "key" in project and "lead" in project:
+                    key = project.get("key")
+                    lead = project.get("lead", {})
+
+                    # Handle different formats of lead information
+                    lead_name = None
+                    if isinstance(lead, dict):
+                        lead_name = lead.get("name") or lead.get("displayName")
+                    elif isinstance(lead, str):
+                        lead_name = lead
+
+                    if key and lead_name:
+                        leads[key] = lead_name
+
+            return leads
+
+        except Exception as e:
+            logger.error(f"Error getting project leads: {str(e)}")
+            return {}
+
+    def get_user_accessible_projects(self, username: str) -> list[dict[str, Any]]:
+        """
+        Get projects that a specific user can access.
+
+        Args:
+            username: The username to check access for
+
+        Returns:
+            List of accessible project data dictionaries
+        """
+        try:
+            # This requires admin permissions
+            # For non-admins, a different approach might be needed
+            all_projects = self.get_all_projects()
+            accessible_projects = []
+
+            for project in all_projects:
+                project_key = project.get("key")
+                if not project_key:
+                    continue
+
+                try:
+                    # Check if user has browse permission for this project
+                    browse_users = (
+                        self.jira.get_users_with_browse_permission_to_a_project(
+                            username=username, project_key=project_key, limit=1
+                        )
+                    )
+
+                    # If the user is in the list, they have access
+                    user_has_access = False
+                    if isinstance(browse_users, list):
+                        for user in browse_users:
+                            if isinstance(user, dict) and user.get("name") == username:
+                                user_has_access = True
+                                break
+
+                    if user_has_access:
+                        accessible_projects.append(project)
+
+                except Exception:
+                    # Skip projects that cause errors
+                    continue
+
+            return accessible_projects
+
+        except Exception as e:
+            logger.error(
+                f"Error getting accessible projects for user {username}: {str(e)}"
+            )
+            return []
+
+    def create_project_version(
+        self,
+        project_key: str,
+        name: str,
+        start_date: str | None = None,
+        release_date: str | None = None,
+        description: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Create a new version in the specified Jira project.
+
+        Args:
+            project_key: The project key (e.g., 'PROJ')
+            name: The name of the version
+            start_date: The start date (YYYY-MM-DD, optional)
+            release_date: The release date (YYYY-MM-DD, optional)
+            description: Description of the version (optional)
+
+        Returns:
+            The created version object as returned by Jira
+        """
+        return self.create_version(
+            project=project_key,
+            name=name,
+            start_date=start_date,
+            release_date=release_date,
+            description=description,
+        )
+
+    def update_project_version(
+        self,
+        version_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        start_date: str | None = None,
+        release_date: str | None = None,
+        archived: bool | None = None,
+        released: bool | None = None,
+    ) -> dict[str, Any]:
+        """
+        Update an existing version in a Jira project.
+
+        Only fields that are not None are sent to Jira, so callers can flip a
+        single attribute (e.g. ``archived``) without overwriting the others.
+
+        Args:
+            version_id: The numeric ID of the version to update.
+            name: New name for the version (optional).
+            description: New description for the version (optional).
+            start_date: New start date (YYYY-MM-DD, optional).
+            release_date: New release date (YYYY-MM-DD, optional).
+            archived: Archived flag (optional).
+            released: Released flag (optional).
+
+        Returns:
+            The updated version object as returned by Jira.
+        """
+        return self.update_version(
+            version_id=version_id,
+            name=name,
+            description=description,
+            start_date=start_date,
+            release_date=release_date,
+            archived=archived,
+            released=released,
+        )

@@ -1,5 +1,6 @@
 """Unit tests for the Confluence FastMCP server."""
 
+import inspect
 import json
 import logging
 from collections.abc import AsyncGenerator
@@ -9,14 +10,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.client import FastMCPTransport
+from fastmcp.exceptions import ToolError
 from starlette.requests import Request
 
-from src.mcp_atlassian.confluence import ConfluenceFetcher
-from src.mcp_atlassian.confluence.config import ConfluenceConfig
-from src.mcp_atlassian.models.confluence.page import ConfluencePage
-from src.mcp_atlassian.servers.context import MainAppContext
-from src.mcp_atlassian.servers.main import AtlassianMCP
-from src.mcp_atlassian.utils.oauth import OAuthConfig
+from src.mcp_atlassian_with_bitbucket_and_privacy.confluence import ConfluenceFetcher
+from src.mcp_atlassian_with_bitbucket_and_privacy.confluence.config import (
+    ConfluenceConfig,
+)
+from src.mcp_atlassian_with_bitbucket_and_privacy.models.confluence.page import (
+    ConfluencePage,
+)
+from src.mcp_atlassian_with_bitbucket_and_privacy.servers import (
+    confluence as confluence_server,
+)
+from src.mcp_atlassian_with_bitbucket_and_privacy.servers.context import MainAppContext
+from src.mcp_atlassian_with_bitbucket_and_privacy.servers.main import AtlassianMCP
+from src.mcp_atlassian_with_bitbucket_and_privacy.utils.oauth import OAuthConfig
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +41,7 @@ def mock_confluence_fetcher():
         "id": "123456",
         "title": "Test Page Mock Title",
         "url": "https://example.atlassian.net/wiki/spaces/TEST/pages/123456/Test+Page",
+        "space": {"key": "TEST", "name": "Test Space"},
         "content": {
             "value": "This is a test page content in Markdown",
             "format": "markdown",
@@ -43,8 +53,23 @@ def mock_confluence_fetcher():
     mock_fetcher.search.return_value = [mock_page]
     mock_fetcher.get_page_content.return_value = mock_page
     mock_fetcher.get_page_children.return_value = [mock_page]
+    mock_fetcher.get_space_page_tree.return_value = {
+        "space_key": "TEST",
+        "total_pages": 1,
+        "has_more": False,
+        "pages": [
+            {
+                "id": "123456",
+                "title": "Test Page Mock Title",
+                "parent_id": None,
+                "position": 0,
+                "depth": 0,
+            }
+        ],
+    }
     mock_fetcher.create_page.return_value = mock_page
     mock_fetcher.update_page.return_value = mock_page
+    mock_fetcher.update_page_section.return_value = mock_page
     mock_fetcher.delete_page.return_value = True
 
     # Mock comment
@@ -103,6 +128,13 @@ def mock_confluence_fetcher():
             "extensions": {"fileSize": 1024},
         },
     }
+    mock_fetcher.upload_attachment_from_content.return_value = {
+        "success": True,
+        "content_id": "123456",
+        "filename": "test-file.txt",
+        "size": 1024,
+        "id": "att123",
+    }
     mock_fetcher.upload_attachments.return_value = {
         "success": True,
         "content_id": "123456",
@@ -141,6 +173,38 @@ def mock_confluence_fetcher():
         "message": "Attachment deleted successfully",
     }
     mock_fetcher.fetch_attachment_content.return_value = b"\x89PNG"
+    mock_fetcher.check_content_permissions.return_value = {"hasPermission": True}
+    mock_fetcher.get_space_permissions.return_value = {
+        "results": [
+            {
+                "id": "perm-1",
+                "principal": {"type": "user", "id": "accountid123"},
+                "operation": {"key": "read", "targetType": "page"},
+            }
+        ],
+        "_links": {},
+    }
+    mock_fetcher.list_page_templates.return_value = [
+        {
+            "templateId": "tpl-001",
+            "name": "Meeting Notes",
+            "templateType": "page",
+            "description": "Meeting template",
+        }
+    ]
+    mock_fetcher.get_page_template.return_value = {
+        "templateId": "tpl-001",
+        "name": "Meeting Notes",
+        "templateType": "page",
+        "description": {"value": "Meeting template"},
+        "body": {"storage": {"value": "<h1>Meeting Notes</h1>"}},
+    }
+    mock_fetcher.create_page_from_template.return_value = {
+        "id": "123456",
+        "title": "Weekly Meeting",
+        "url": "https://example.atlassian.net/wiki/spaces/TEST/pages/123456",
+        "space_key": "TEST",
+    }
 
     # Mock config for tools that need config.url
     mock_config = MagicMock()
@@ -172,23 +236,31 @@ def test_confluence_mcp(mock_confluence_fetcher, mock_base_confluence_config):
     """Create a test FastMCP instance with standard configuration."""
 
     # Import and register tool functions (as they are in confluence.py)
-    from src.mcp_atlassian.servers.confluence import (
+    from src.mcp_atlassian_with_bitbucket_and_privacy.servers.confluence import (
         add_comment,
         add_label,
+        check_content_permissions,
         create_page,
+        create_page_from_template,
         delete_attachment,
         delete_page,
         download_attachment,
         download_content_attachments,
         get_attachments,
         get_comments,
+        get_inline_comments,
         get_labels,
         get_page,
         get_page_children,
         get_page_images,
+        get_page_template,
+        get_space_page_tree,
+        get_space_permissions,
+        list_page_templates,
         search,
         search_user,
         update_page,
+        update_page_section,
         upload_attachment,
         upload_attachments,
     )
@@ -213,12 +285,15 @@ def test_confluence_mcp(mock_confluence_fetcher, mock_base_confluence_config):
     confluence_sub_mcp.add_tool(search)
     confluence_sub_mcp.add_tool(get_page)
     confluence_sub_mcp.add_tool(get_page_children)
+    confluence_sub_mcp.add_tool(get_space_page_tree)
     confluence_sub_mcp.add_tool(get_comments)
+    confluence_sub_mcp.add_tool(get_inline_comments)
     confluence_sub_mcp.add_tool(add_comment)
     confluence_sub_mcp.add_tool(get_labels)
     confluence_sub_mcp.add_tool(add_label)
     confluence_sub_mcp.add_tool(create_page)
     confluence_sub_mcp.add_tool(update_page)
+    confluence_sub_mcp.add_tool(update_page_section)
     confluence_sub_mcp.add_tool(delete_page)
     confluence_sub_mcp.add_tool(search_user)
     confluence_sub_mcp.add_tool(upload_attachment)
@@ -228,8 +303,13 @@ def test_confluence_mcp(mock_confluence_fetcher, mock_base_confluence_config):
     confluence_sub_mcp.add_tool(download_content_attachments)
     confluence_sub_mcp.add_tool(delete_attachment)
     confluence_sub_mcp.add_tool(get_page_images)
+    confluence_sub_mcp.add_tool(check_content_permissions)
+    confluence_sub_mcp.add_tool(get_space_permissions)
+    confluence_sub_mcp.add_tool(list_page_templates)
+    confluence_sub_mcp.add_tool(get_page_template)
+    confluence_sub_mcp.add_tool(create_page_from_template)
 
-    test_mcp.mount(confluence_sub_mcp, prefix="confluence")
+    test_mcp.mount(confluence_sub_mcp, namespace="confluence")
 
     return test_mcp
 
@@ -239,23 +319,31 @@ def no_fetcher_test_confluence_mcp(mock_base_confluence_config):
     """Create a test FastMCP instance that simulates missing Confluence fetcher."""
 
     # Import and register tool functions (as they are in confluence.py)
-    from src.mcp_atlassian.servers.confluence import (
+    from src.mcp_atlassian_with_bitbucket_and_privacy.servers.confluence import (
         add_comment,
         add_label,
+        check_content_permissions,
         create_page,
+        create_page_from_template,
         delete_attachment,
         delete_page,
         download_attachment,
         download_content_attachments,
         get_attachments,
         get_comments,
+        get_inline_comments,
         get_labels,
         get_page,
         get_page_children,
         get_page_images,
+        get_page_template,
+        get_space_page_tree,
+        get_space_permissions,
+        list_page_templates,
         search,
         search_user,
         update_page,
+        update_page_section,
         upload_attachment,
         upload_attachments,
     )
@@ -282,12 +370,15 @@ def no_fetcher_test_confluence_mcp(mock_base_confluence_config):
     confluence_sub_mcp.add_tool(search)
     confluence_sub_mcp.add_tool(get_page)
     confluence_sub_mcp.add_tool(get_page_children)
+    confluence_sub_mcp.add_tool(get_space_page_tree)
     confluence_sub_mcp.add_tool(get_comments)
+    confluence_sub_mcp.add_tool(get_inline_comments)
     confluence_sub_mcp.add_tool(add_comment)
     confluence_sub_mcp.add_tool(get_labels)
     confluence_sub_mcp.add_tool(add_label)
     confluence_sub_mcp.add_tool(create_page)
     confluence_sub_mcp.add_tool(update_page)
+    confluence_sub_mcp.add_tool(update_page_section)
     confluence_sub_mcp.add_tool(delete_page)
     confluence_sub_mcp.add_tool(search_user)
     confluence_sub_mcp.add_tool(upload_attachment)
@@ -297,8 +388,13 @@ def no_fetcher_test_confluence_mcp(mock_base_confluence_config):
     confluence_sub_mcp.add_tool(download_content_attachments)
     confluence_sub_mcp.add_tool(delete_attachment)
     confluence_sub_mcp.add_tool(get_page_images)
+    confluence_sub_mcp.add_tool(check_content_permissions)
+    confluence_sub_mcp.add_tool(get_space_permissions)
+    confluence_sub_mcp.add_tool(list_page_templates)
+    confluence_sub_mcp.add_tool(get_page_template)
+    confluence_sub_mcp.add_tool(create_page_from_template)
 
-    test_mcp.mount(confluence_sub_mcp, prefix="confluence")
+    test_mcp.mount(confluence_sub_mcp, namespace="confluence")
 
     return test_mcp
 
@@ -316,11 +412,11 @@ async def client(test_confluence_mcp, mock_confluence_fetcher):
     """Create a FastMCP client with mocked Confluence fetcher and request state."""
     with (
         patch(
-            "src.mcp_atlassian.servers.confluence.get_confluence_fetcher",
+            "src.mcp_atlassian_with_bitbucket_and_privacy.servers.confluence.get_confluence_fetcher",
             AsyncMock(return_value=mock_confluence_fetcher),
         ),
         patch(
-            "src.mcp_atlassian.servers.dependencies.get_http_request",
+            "src.mcp_atlassian_with_bitbucket_and_privacy.servers.dependencies.get_http_request",
             MagicMock(spec=Request, state=MagicMock()),
         ),
     ):
@@ -337,6 +433,70 @@ async def no_fetcher_client_fixture(no_fetcher_test_confluence_mcp, mock_request
     )
     async with client_for_no_fetcher_test as connected_client_for_no_fetcher:
         yield connected_client_for_no_fetcher
+
+
+@pytest.mark.parametrize(
+    ("encoded", "expected"),
+    [
+        ("AQ", 1),
+        ("N4CIO", 948469815),
+        ("_", 248),
+        ("-", 252),
+        ("AAAAAAE", 4294967296),
+        ("QgQzWVKOvQM", 269528037047075906),
+        ("---------38", (1 << 63) - 1),
+    ],
+)
+def test_decode_confluence_tiny_id(encoded: str, expected: int) -> None:
+    """Test tiny-link decoding, including URL-safe and 64-bit IDs."""
+    assert confluence_server._decode_confluence_tiny_id(encoded) == expected
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "",
+        "A",
+        "N4CIOA",
+        "N4CI!",
+        "abcdefghijkl",
+        "AAAAAAAAAIA",
+    ],
+)
+def test_decode_confluence_tiny_id_rejects_invalid_values(encoded: str) -> None:
+    """Test malformed, non-canonical, zero, and signed-overflow IDs."""
+    assert confluence_server._decode_confluence_tiny_id(encoded) is None
+
+
+@pytest.mark.parametrize(
+    ("page_reference", "expected"),
+    [
+        ("123456789", "123456789"),
+        (
+            "https://example.atlassian.net/wiki/spaces/TEAM/pages/123456789/Title",
+            "123456789",
+        ),
+        (
+            "https://confluence.example.com/spaces/TEAM/pages/123456789/Title",
+            "123456789",
+        ),
+        (
+            "https://confluence.example.com/pages/viewpage.action?pageId=123456789",
+            "123456789",
+        ),
+        ("https://example.atlassian.net/wiki/x/N4CIO", "948469815"),
+        ("https://confluence.example.com/confluence/x/N4CIO", "948469815"),
+    ],
+)
+def test_resolve_page_id(page_reference: str, expected: str) -> None:
+    """Test supported Cloud and Data Center page-reference formats."""
+    assert confluence_server._resolve_page_id(page_reference) == expected
+
+
+def test_resolve_page_id_preserves_unsupported_reference() -> None:
+    """Test invalid references are not converted to a potentially wrong ID."""
+    reference = "https://example.atlassian.net/wiki/x/N4CIOA"
+    assert confluence_server._resolve_page_id(reference) == reference
 
 
 @pytest.mark.anyio
@@ -357,6 +517,20 @@ async def test_search(client, mock_confluence_fetcher):
 
 
 @pytest.mark.anyio
+async def test_search_returns_error_details(client, mock_confluence_fetcher):
+    """Test that search tool failures preserve the original error message."""
+    mock_confluence_fetcher.search.side_effect = RuntimeError(
+        "Confluence CQL rejected the query"
+    )
+
+    with pytest.raises(ToolError) as excinfo:
+        await client.call_tool("confluence_search", {"query": "type=page"})
+
+    assert "Error calling tool 'search'" in str(excinfo.value)
+    assert "Confluence CQL rejected the query" in str(excinfo.value)
+
+
+@pytest.mark.anyio
 async def test_get_page(client, mock_confluence_fetcher):
     """Test the get_page tool with default parameters."""
     response = await client.call_tool("confluence_get_page", {"page_id": "123456"})
@@ -371,6 +545,36 @@ async def test_get_page(client, mock_confluence_fetcher):
     assert "content" in result_data["metadata"]
     assert "value" in result_data["metadata"]["content"]
     assert "This is a test page content" in result_data["metadata"]["content"]["value"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("page_reference", "expected"),
+    [
+        (
+            "https://example.atlassian.net/wiki/spaces/TEAM/pages/123456789/Title",
+            "123456789",
+        ),
+        (
+            "https://confluence.example.com/pages/viewpage.action?pageId=123456789",
+            "123456789",
+        ),
+        ("https://example.atlassian.net/wiki/x/N4CIO", "948469815"),
+        ("https://confluence.example.com/confluence/x/N4CIO", "948469815"),
+    ],
+)
+async def test_get_page_resolves_page_references(
+    client: Client,
+    mock_confluence_fetcher: MagicMock,
+    page_reference: str,
+    expected: str,
+) -> None:
+    """Test get_page resolves full URLs and tiny links before fetching."""
+    await client.call_tool("confluence_get_page", {"page_id": page_reference})
+
+    mock_confluence_fetcher.get_page_content.assert_called_once_with(
+        expected, convert_to_markdown=True
+    )
 
 
 @pytest.mark.anyio
@@ -433,13 +637,70 @@ async def test_get_page_children(client, mock_confluence_fetcher):
     assert call_kwargs["page_id"] == "123456"
     assert call_kwargs.get("start") == 0
     assert call_kwargs.get("limit") == 25
-    assert call_kwargs.get("expand") == "version"
+    assert call_kwargs.get("expand") == "version,history"
 
     result_data = json.loads(response.content[0].text)
     assert "parent_id" in result_data
     assert "results" in result_data
     assert len(result_data["results"]) > 0
     assert result_data["results"][0]["title"] == "Test Page Mock Title"
+    assert result_data["results"][0]["space"] == {
+        "key": "TEST",
+        "name": "Test Space",
+    }
+    assert result_data["results"][0]["url"] == (
+        "https://example.atlassian.net/wiki/spaces/TEST/pages/123456/Test+Page"
+    )
+
+
+@pytest.mark.anyio
+async def test_get_space_page_tree(client, mock_confluence_fetcher):
+    """Test the get_space_page_tree tool."""
+    response = await client.call_tool(
+        "confluence_get_space_page_tree", {"space_key": "TEST"}
+    )
+
+    mock_confluence_fetcher.get_space_page_tree.assert_called_once()
+    call_kwargs = mock_confluence_fetcher.get_space_page_tree.call_args.kwargs
+    assert call_kwargs["space_key"] == "TEST"
+    assert call_kwargs["limit"] == 100
+
+    result_data = json.loads(response.content[0].text)
+    assert result_data["space_key"] == "TEST"
+    assert result_data["total_pages"] == 1
+    assert len(result_data["pages"]) == 1
+    assert result_data["pages"][0]["title"] == "Test Page Mock Title"
+    assert result_data["has_more"] is False
+    assert "hint" not in result_data
+
+
+@pytest.mark.anyio
+async def test_get_space_page_tree_has_more(client, mock_confluence_fetcher):
+    """Test that has_more=True adds a hint to the response."""
+    mock_confluence_fetcher.get_space_page_tree.return_value = {
+        "space_key": "BIG",
+        "total_pages": 100,
+        "has_more": True,
+        "pages": [
+            {
+                "id": str(i),
+                "title": f"Page {i}",
+                "parent_id": None,
+                "position": i,
+                "depth": 0,
+            }
+            for i in range(100)
+        ],
+    }
+
+    response = await client.call_tool(
+        "confluence_get_space_page_tree", {"space_key": "BIG"}
+    )
+
+    result_data = json.loads(response.content[0].text)
+    assert result_data["has_more"] is True
+    assert "hint" in result_data
+    assert "truncated" in result_data["hint"].lower()
 
 
 @pytest.mark.anyio
@@ -453,6 +714,42 @@ async def test_get_comments(client, mock_confluence_fetcher):
     assert isinstance(result_data, list)
     assert len(result_data) > 0
     assert result_data[0]["author"] == "Test User"
+
+
+@pytest.mark.anyio
+async def test_get_inline_comments_returns_complete_flat_thread(
+    client, mock_confluence_fetcher
+):
+    """The MCP response preserves every comment and its parent link."""
+    root = MagicMock()
+    root.to_simplified_dict.return_value = {
+        "id": "root",
+        "body": "Root review comment",
+        "location": "inline",
+    }
+    reply = MagicMock()
+    reply.to_simplified_dict.return_value = {
+        "id": "reply",
+        "body": "Review reply",
+        "parent_comment_id": "root",
+        "location": "inline",
+    }
+    mock_confluence_fetcher.get_inline_comments.return_value = [root, reply]
+
+    response = await client.call_tool(
+        "confluence_get_inline_comments", {"page_id": "123456"}
+    )
+
+    mock_confluence_fetcher.get_inline_comments.assert_called_once_with("123456")
+    result_data = json.loads(response.content[0].text)
+    assert result_data["success"] is True
+    assert result_data["page_id"] == "123456"
+    assert result_data["count"] == 2
+    assert [comment["id"] for comment in result_data["comments"]] == [
+        "root",
+        "reply",
+    ]
+    assert result_data["comments"][1]["parent_comment_id"] == "root"
 
 
 @pytest.mark.anyio
@@ -544,6 +841,7 @@ async def test_create_page_with_numeric_parent_id(client, mock_confluence_fetche
     result_data = json.loads(response.content[0].text)
     assert result_data["message"] == "Page created successfully"
     assert result_data["page"]["title"] == "Test Page Mock Title"
+    assert "content" not in result_data["page"]
 
 
 @pytest.mark.anyio
@@ -568,6 +866,79 @@ async def test_create_page_with_string_parent_id(client, mock_confluence_fetcher
     result_data = json.loads(response.content[0].text)
     assert result_data["message"] == "Page created successfully"
     assert result_data["page"]["title"] == "Test Page Mock Title"
+    assert "content" not in result_data["page"]
+
+
+@pytest.mark.anyio
+async def test_create_page_with_subtype(client, mock_confluence_fetcher):
+    """Test creating a page forwards the optional subtype argument."""
+    response = await client.call_tool(
+        "confluence_create_page",
+        {
+            "space_key": "TEST",
+            "title": "Live Doc",
+            "content": "Test content",
+            "subtype": "live",
+        },
+    )
+
+    mock_confluence_fetcher.create_page.assert_called_once()
+    call_kwargs = mock_confluence_fetcher.create_page.call_args.kwargs
+    assert call_kwargs["subtype"] == "live"
+
+    result_data = json.loads(response.content[0].text)
+    assert result_data["message"] == "Page created successfully"
+    assert result_data["page"]["title"] == "Test Page Mock Title"
+
+
+@pytest.mark.anyio
+async def test_create_page_include_content(client, mock_confluence_fetcher):
+    """Test create_page can include content when requested."""
+    response = await client.call_tool(
+        "confluence_create_page",
+        {
+            "space_key": "TEST",
+            "title": "Test Page",
+            "content": "Test content",
+            "include_content": True,
+        },
+    )
+
+    result_data = json.loads(response.content[0].text)
+    assert result_data["message"] == "Page created successfully"
+    assert result_data["page"]["title"] == "Test Page Mock Title"
+    assert "content" in result_data["page"]
+
+
+@pytest.mark.anyio
+async def test_create_page_with_xhtml_format(client, mock_confluence_fetcher):
+    """Test create_page maps xhtml content format to storage representation."""
+    xhtml_body = (
+        "<ac:structured-macro ac:name='code'>"
+        "<ac:plain-text-body>hello</ac:plain-text-body>"
+        "</ac:structured-macro>"
+    )
+
+    response = await client.call_tool(
+        "confluence_create_page",
+        {
+            "space_key": "TEST",
+            "title": "XHTML Page",
+            "content": xhtml_body,
+            "content_format": "xhtml",
+            "enable_heading_anchors": True,
+        },
+    )
+
+    mock_confluence_fetcher.create_page.assert_called_once()
+    call_kwargs = mock_confluence_fetcher.create_page.call_args.kwargs
+    assert call_kwargs["body"] == xhtml_body
+    assert call_kwargs["is_markdown"] is False
+    assert call_kwargs["content_representation"] == "storage"
+    assert call_kwargs["enable_heading_anchors"] is False
+
+    result_data = json.loads(response.content[0].text)
+    assert result_data["message"] == "Page created successfully"
 
 
 @pytest.mark.anyio
@@ -592,6 +963,7 @@ async def test_update_page_with_numeric_parent_id(client, mock_confluence_fetche
     result_data = json.loads(response.content[0].text)
     assert result_data["message"] == "Page updated successfully"
     assert result_data["page"]["title"] == "Test Page Mock Title"
+    assert "content" not in result_data["page"]
 
 
 @pytest.mark.anyio
@@ -616,6 +988,309 @@ async def test_update_page_with_string_parent_id(client, mock_confluence_fetcher
     result_data = json.loads(response.content[0].text)
     assert result_data["message"] == "Page updated successfully"
     assert result_data["page"]["title"] == "Test Page Mock Title"
+    assert "content" not in result_data["page"]
+
+
+@pytest.mark.anyio
+async def test_update_page_include_content(client, mock_confluence_fetcher):
+    """Test update_page can include content when requested."""
+    response = await client.call_tool(
+        "confluence_update_page",
+        {
+            "page_id": "999999",
+            "title": "Updated Page",
+            "content": "Updated content",
+            "include_content": True,
+        },
+    )
+
+    result_data = json.loads(response.content[0].text)
+    assert result_data["message"] == "Page updated successfully"
+    assert result_data["page"]["title"] == "Test Page Mock Title"
+    assert "content" in result_data["page"]
+
+
+@pytest.mark.anyio
+async def test_update_page_with_xhtml_format(client, mock_confluence_fetcher):
+    """Test update_page maps xhtml content format to storage representation."""
+    xhtml_body = (
+        "<ac:structured-macro ac:name='info'>"
+        "<ac:rich-text-body><p>hello</p></ac:rich-text-body>"
+        "</ac:structured-macro>"
+    )
+
+    response = await client.call_tool(
+        "confluence_update_page",
+        {
+            "page_id": "999999",
+            "title": "Updated XHTML Page",
+            "content": xhtml_body,
+            "content_format": "xhtml",
+            "enable_heading_anchors": True,
+        },
+    )
+
+    mock_confluence_fetcher.update_page.assert_called_once()
+    call_kwargs = mock_confluence_fetcher.update_page.call_args.kwargs
+    assert call_kwargs["body"] == xhtml_body
+    assert call_kwargs["is_markdown"] is False
+    assert call_kwargs["content_representation"] == "storage"
+    assert call_kwargs["enable_heading_anchors"] is False
+
+    result_data = json.loads(response.content[0].text)
+    assert result_data["message"] == "Page updated successfully"
+
+
+@pytest.mark.anyio
+async def test_create_page_with_content_file(
+    client, mock_confluence_fetcher, tmp_path, monkeypatch
+):
+    """content_file should load the body from disk and be passed to the fetcher."""
+    body = "# Heading\n\nFrom a file."
+    fp = tmp_path / "page.md"
+    fp.write_text(body, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)  # content_file is confined to the workspace
+
+    await client.call_tool(
+        "confluence_create_page",
+        {
+            "space_key": "TEST",
+            "title": "From File",
+            "content_file": str(fp),
+        },
+    )
+
+    mock_confluence_fetcher.create_page.assert_called_once()
+    call_kwargs = mock_confluence_fetcher.create_page.call_args.kwargs
+    assert call_kwargs["body"] == body
+
+
+@pytest.mark.anyio
+async def test_update_page_with_content_file(
+    client, mock_confluence_fetcher, tmp_path, monkeypatch
+):
+    """content_file should be accepted by update_page as an alternative to content."""
+    body = "Updated body from disk."
+    fp = tmp_path / "update.md"
+    fp.write_text(body, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)  # content_file is confined to the workspace
+
+    await client.call_tool(
+        "confluence_update_page",
+        {
+            "page_id": "999999",
+            "title": "Updated Page",
+            "content_file": str(fp),
+        },
+    )
+
+    mock_confluence_fetcher.update_page.assert_called_once()
+    call_kwargs = mock_confluence_fetcher.update_page.call_args.kwargs
+    assert call_kwargs["body"] == body
+
+
+@pytest.mark.anyio
+async def test_create_page_accepts_empty_content(client, mock_confluence_fetcher):
+    """An empty inline content string should still count as provided."""
+    await client.call_tool(
+        "confluence_create_page",
+        {
+            "space_key": "TEST",
+            "title": "Empty Page",
+            "content": "",
+        },
+    )
+
+    mock_confluence_fetcher.create_page.assert_called_once()
+    call_kwargs = mock_confluence_fetcher.create_page.call_args.kwargs
+    assert call_kwargs["body"] == ""
+
+
+@pytest.mark.anyio
+async def test_update_page_accepts_empty_content(client, mock_confluence_fetcher):
+    """An empty inline content string should still count as provided."""
+    await client.call_tool(
+        "confluence_update_page",
+        {
+            "page_id": "999999",
+            "title": "Empty Page",
+            "content": "",
+        },
+    )
+
+    mock_confluence_fetcher.update_page.assert_called_once()
+    call_kwargs = mock_confluence_fetcher.update_page.call_args.kwargs
+    assert call_kwargs["body"] == ""
+
+
+def test_page_content_file_parameters_preserve_positional_order():
+    """content_file should not shift existing positional parameters."""
+    create_params = list(
+        inspect.signature(confluence_server.create_page.__wrapped__).parameters
+    )
+    assert create_params == [
+        "ctx",
+        "space_key",
+        "title",
+        "content",
+        "parent_id",
+        "content_format",
+        "enable_heading_anchors",
+        "include_content",
+        "emoji",
+        "content_file",
+        "page_width",
+        "table_layout",
+        "subtype",
+    ]
+
+    update_params = list(
+        inspect.signature(confluence_server.update_page.__wrapped__).parameters
+    )
+    assert update_params == [
+        "ctx",
+        "page_id",
+        "title",
+        "content",
+        "is_minor_edit",
+        "version_comment",
+        "parent_id",
+        "content_format",
+        "enable_heading_anchors",
+        "include_content",
+        "emoji",
+        "content_file",
+        "page_width",
+        "table_layout",
+    ]
+
+
+@pytest.mark.anyio
+async def test_create_page_rejects_both_content_and_file(
+    client, mock_confluence_fetcher, tmp_path
+):
+    """Supplying both content and content_file should error cleanly."""
+    fp = tmp_path / "page.md"
+    fp.write_text("x", encoding="utf-8")
+
+    with pytest.raises(Exception, match="not both"):
+        await client.call_tool(
+            "confluence_create_page",
+            {
+                "space_key": "TEST",
+                "title": "Conflict",
+                "content": "inline",
+                "content_file": str(fp),
+            },
+        )
+    mock_confluence_fetcher.create_page.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_create_page_rejects_neither_content_nor_file(
+    client, mock_confluence_fetcher
+):
+    """Supplying neither content nor content_file should error cleanly."""
+    with pytest.raises(Exception, match="must be provided"):
+        await client.call_tool(
+            "confluence_create_page",
+            {"space_key": "TEST", "title": "Missing body"},
+        )
+    mock_confluence_fetcher.create_page.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_create_page_content_file_rejects_path_outside_workspace(
+    client, mock_confluence_fetcher, tmp_path, monkeypatch
+):
+    """Regression — a content_file outside the workspace must be refused.
+
+    The file body is echoed back through the created page, so an unconfined
+    path is an arbitrary-file-read/exfiltration primitive (same class as the
+    attachment-path advisories).
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    secret = tmp_path / "secret.md"  # sibling of workspace -> outside it
+    secret.write_text("SECRET-EXFIL", encoding="utf-8")
+    monkeypatch.chdir(workspace)
+
+    for content_file in [str(secret), "../secret.md"]:
+        with pytest.raises(Exception, match="Path traversal detected"):
+            await client.call_tool(
+                "confluence_create_page",
+                {
+                    "space_key": "TEST",
+                    "title": "Exfil",
+                    "content_file": content_file,
+                },
+            )
+    mock_confluence_fetcher.create_page.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_update_page_rejects_missing_file(client, mock_confluence_fetcher):
+    """A content_file path that does not exist should error before calling fetcher."""
+    with pytest.raises(Exception, match="does not exist"):
+        await client.call_tool(
+            "confluence_update_page",
+            {
+                "page_id": "999999",
+                "title": "Bad Path",
+                "content_file": "definitely-not-here-6f3a2d.md",
+            },
+        )
+    mock_confluence_fetcher.update_page.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_update_page_section(client, mock_confluence_fetcher):
+    """Test update_page_section passes section update parameters."""
+    response = await client.call_tool(
+        "confluence_update_page_section",
+        {
+            "page_id": "999999",
+            "heading_text": "Weekly Update",
+            "new_content": "- Shipped v2.1",
+            "content_format": "markdown",
+            "is_minor_edit": True,
+            "version_comment": "Weekly sync",
+        },
+    )
+
+    mock_confluence_fetcher.update_page_section.assert_called_once_with(
+        page_id="999999",
+        heading_text="Weekly Update",
+        new_content="- Shipped v2.1",
+        content_format="markdown",
+        is_minor_edit=True,
+        version_comment="Weekly sync",
+    )
+
+    result_data = json.loads(response.content[0].text)
+    assert result_data["message"] == "Section 'Weekly Update' updated successfully"
+    assert result_data["page"]["title"] == "Test Page Mock Title"
+    assert "content" not in result_data["page"]
+
+
+@pytest.mark.anyio
+async def test_update_page_section_default_version_comment(
+    client, mock_confluence_fetcher
+):
+    """Test update_page_section sends an empty version comment by default."""
+    await client.call_tool(
+        "confluence_update_page_section",
+        {
+            "page_id": "999999",
+            "heading_text": "Weekly Update",
+            "new_content": "- Shipped v2.1",
+        },
+    )
+
+    call_kwargs = mock_confluence_fetcher.update_page_section.call_args.kwargs
+    assert call_kwargs["content_format"] == "markdown"
+    assert call_kwargs["is_minor_edit"] is False
+    assert call_kwargs["version_comment"] == ""
 
 
 @pytest.mark.anyio
@@ -662,6 +1337,111 @@ async def test_upload_attachment(client, mock_confluence_fetcher):
 
 
 @pytest.mark.anyio
+async def test_upload_attachment_base64(client, mock_confluence_fetcher):
+    """Test uploading an attachment via base64 content (filesystem-free)."""
+    import base64
+
+    raw = b"hello base64 world"
+    encoded = base64.b64encode(raw).decode("ascii")
+
+    response = await client.call_tool(
+        "confluence_upload_attachment",
+        {
+            "content_id": "123456",
+            "content_base64": encoded,
+            "filename": "test-file.txt",
+            "comment": "Test attachment",
+            "minor_edit": True,
+        },
+    )
+
+    mock_confluence_fetcher.upload_attachment_from_content.assert_called_once_with(
+        content_id="123456",
+        filename="test-file.txt",
+        content=raw,
+        comment="Test attachment",
+        minor_edit=True,
+    )
+    # The filesystem-based path must not be used in base64 mode
+    mock_confluence_fetcher.upload_attachment.assert_not_called()
+
+    result_data = json.loads(response.content[0].text)
+    assert result_data["message"] == "Attachment uploaded successfully"
+    assert result_data["attachment"]["id"] == "att123"
+
+
+@pytest.mark.anyio
+async def test_upload_attachment_base64_allows_empty_content(
+    client, mock_confluence_fetcher
+):
+    """Test uploading an empty attachment via base64 content."""
+    await client.call_tool(
+        "confluence_upload_attachment",
+        {
+            "content_id": "123456",
+            "content_base64": "",
+            "filename": "empty.txt",
+        },
+    )
+
+    mock_confluence_fetcher.upload_attachment_from_content.assert_called_once_with(
+        content_id="123456",
+        filename="empty.txt",
+        content=b"",
+        comment=None,
+        minor_edit=False,
+    )
+    mock_confluence_fetcher.upload_attachment.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_upload_attachment_requires_exactly_one_source(
+    client, mock_confluence_fetcher
+):
+    """Test that providing neither or both file_path and content_base64 fails."""
+    # Neither provided
+    with pytest.raises(Exception, match="exactly one of 'file_path'"):
+        await client.call_tool("confluence_upload_attachment", {"content_id": "123456"})
+
+    # Both provided
+    with pytest.raises(Exception, match="exactly one of 'file_path'"):
+        await client.call_tool(
+            "confluence_upload_attachment",
+            {
+                "content_id": "123456",
+                "file_path": "/path/to/file.txt",
+                "content_base64": "Zm9v",
+            },
+        )
+
+
+@pytest.mark.anyio
+async def test_upload_attachment_base64_requires_filename(
+    client, mock_confluence_fetcher
+):
+    """Test that base64 uploads require a filename."""
+    with pytest.raises(Exception, match="'filename' is required"):
+        await client.call_tool(
+            "confluence_upload_attachment",
+            {"content_id": "123456", "content_base64": "Zm9v"},
+        )
+
+
+@pytest.mark.anyio
+async def test_upload_attachment_invalid_base64(client, mock_confluence_fetcher):
+    """Test that invalid base64 content is rejected."""
+    with pytest.raises(Exception, match="Invalid base64 content"):
+        await client.call_tool(
+            "confluence_upload_attachment",
+            {
+                "content_id": "123456",
+                "content_base64": "not valid base64!!!",
+                "filename": "test-file.txt",
+            },
+        )
+
+
+@pytest.mark.anyio
 async def test_delete_attachment(client, mock_confluence_fetcher):
     """Test deleting an attachment."""
     response = await client.call_tool(
@@ -675,6 +1455,111 @@ async def test_delete_attachment(client, mock_confluence_fetcher):
     result_data = json.loads(response.content[0].text)
     assert result_data["message"] == "Attachment deleted successfully"
     assert result_data["attachment_id"] == "att123"
+
+
+@pytest.mark.anyio
+async def test_check_content_permissions(client, mock_confluence_fetcher):
+    """Test checking content permissions."""
+    response = await client.call_tool(
+        "confluence_check_content_permissions",
+        {
+            "content_id": "123456",
+            "user_identifier": "accountid123",
+            "operation": "read",
+            "subject_type": "user",
+        },
+    )
+
+    mock_confluence_fetcher.check_content_permissions.assert_called_once_with(
+        content_id="123456",
+        user_identifier="accountid123",
+        operation="read",
+        subject_type="user",
+    )
+
+    result_data = json.loads(response.content[0].text)
+    assert result_data == {"hasPermission": True}
+
+
+@pytest.mark.anyio
+async def test_get_space_permissions(client, mock_confluence_fetcher):
+    """Test getting space permissions."""
+    response = await client.call_tool(
+        "confluence_get_space_permissions",
+        {
+            "space_id": "98304",
+            "limit": 50,
+            "cursor": "next-page",
+        },
+    )
+
+    mock_confluence_fetcher.get_space_permissions.assert_called_once_with(
+        space_id="98304",
+        limit=50,
+        cursor="next-page",
+    )
+
+    result_data = json.loads(response.content[0].text)
+    assert result_data["results"][0]["id"] == "perm-1"
+
+
+# --- page template tool tests ---
+
+
+@pytest.mark.anyio
+async def test_list_page_templates(client, mock_confluence_fetcher):
+    """Test listing page template summaries."""
+    response = await client.call_tool(
+        "confluence_list_page_templates",
+        {"space_key": "TEST", "limit": 10},
+    )
+
+    mock_confluence_fetcher.list_page_templates.assert_called_once_with(
+        space_key="TEST",
+        limit=10,
+    )
+    result_data = json.loads(response.content[0].text)
+    assert result_data["total"] == 1
+    assert result_data["templates"][0]["templateId"] == "tpl-001"
+    assert result_data["templates"][0]["description"] == "Meeting template"
+
+
+@pytest.mark.anyio
+async def test_get_page_template(client, mock_confluence_fetcher):
+    """Test fetching a page template with its storage body."""
+    response = await client.call_tool(
+        "confluence_get_page_template",
+        {"template_id": "tpl-001"},
+    )
+
+    mock_confluence_fetcher.get_page_template.assert_called_once_with("tpl-001")
+    result_data = json.loads(response.content[0].text)
+    assert result_data["body"] == "<h1>Meeting Notes</h1>"
+    assert result_data["description"] == "Meeting template"
+
+
+@pytest.mark.anyio
+async def test_create_page_from_template(client, mock_confluence_fetcher):
+    """Test creating a page from a template through the write tool."""
+    response = await client.call_tool(
+        "confluence_create_page_from_template",
+        {
+            "space_key": "TEST",
+            "title": "Weekly Meeting",
+            "template_id": "tpl-001",
+            "parent_id": 100,
+        },
+    )
+
+    mock_confluence_fetcher.create_page_from_template.assert_called_once_with(
+        space_key="TEST",
+        title="Weekly Meeting",
+        template_id="tpl-001",
+        parent_id="100",
+    )
+    result_data = json.loads(response.content[0].text)
+    assert result_data["id"] == "123456"
+    assert result_data["space_key"] == "TEST"
 
 
 # --- get_page_images tool tests ---
@@ -853,141 +1738,3 @@ async def test_get_page_images_fetch_failure(client, mock_confluence_fetcher):
     summary = json.loads(response.content[0].text)
     assert summary["downloaded"] == 0
     assert len(summary["failed"]) == 1
-
-
-# Tests for content_file parameter
-@pytest.mark.anyio
-async def test_create_page_with_content_file(client, mock_confluence_fetcher, tmp_path):
-    """Test creating a page with content_file parameter."""
-    # Create a temporary file with test content
-    content_file = tmp_path / "test_content.md"
-    content_file.write_text("# Test Content\n\nThis is test content from file.")
-
-    response = await client.call_tool(
-        "confluence_create_page",
-        {
-            "space_key": "TEST",
-            "title": "Page from File",
-            "content_file": str(content_file),
-        },
-    )
-
-    mock_confluence_fetcher.create_page.assert_called_once()
-    call_kwargs = mock_confluence_fetcher.create_page.call_args.kwargs
-    assert call_kwargs["body"] == "# Test Content\n\nThis is test content from file."
-    assert call_kwargs["title"] == "Page from File"
-
-    result_data = json.loads(response.content[0].text)
-    assert result_data["message"] == "Page created successfully"
-
-
-@pytest.mark.anyio
-async def test_update_page_with_content_file(client, mock_confluence_fetcher, tmp_path):
-    """Test updating a page with content_file parameter."""
-    # Create a temporary file with test content
-    content_file = tmp_path / "test_content.html"
-    content_file.write_text("<h1>Updated Content</h1><p>From file.</p>")
-
-    response = await client.call_tool(
-        "confluence_update_page",
-        {
-            "page_id": "123456",
-            "title": "Updated Page from File",
-            "content_file": str(content_file),
-            "content_format": "storage",
-        },
-    )
-
-    mock_confluence_fetcher.update_page.assert_called_once()
-    call_kwargs = mock_confluence_fetcher.update_page.call_args.kwargs
-    assert call_kwargs["body"] == "<h1>Updated Content</h1><p>From file.</p>"
-    assert call_kwargs["title"] == "Updated Page from File"
-    assert call_kwargs["content_representation"] == "storage"
-
-    result_data = json.loads(response.content[0].text)
-    assert result_data["message"] == "Page updated successfully"
-
-
-@pytest.mark.anyio
-async def test_create_page_requires_content_or_content_file(client, mock_confluence_fetcher):
-    """Test that create_page raises error when neither content nor content_file provided."""
-    with pytest.raises(Exception) as exc_info:
-        await client.call_tool(
-            "confluence_create_page",
-            {
-                "space_key": "TEST",
-                "title": "Page without content",
-            },
-        )
-    # The error message should indicate that content is required
-    assert "content" in str(exc_info.value).lower() or "required" in str(exc_info.value).lower()
-
-
-@pytest.mark.anyio
-async def test_update_page_requires_content_or_content_file(client, mock_confluence_fetcher):
-    """Test that update_page raises error when neither content nor content_file provided."""
-    with pytest.raises(Exception) as exc_info:
-        await client.call_tool(
-            "confluence_update_page",
-            {
-                "page_id": "123456",
-                "title": "Page without content",
-            },
-        )
-    # The error message should indicate that content is required
-    assert "content" in str(exc_info.value).lower() or "required" in str(exc_info.value).lower()
-
-
-@pytest.mark.anyio
-async def test_create_page_content_file_not_found(client, mock_confluence_fetcher):
-    """Test that create_page raises FileNotFoundError for missing content_file."""
-    with pytest.raises(Exception) as exc_info:
-        await client.call_tool(
-            "confluence_create_page",
-            {
-                "space_key": "TEST",
-                "title": "Page with missing file",
-                "content_file": "/nonexistent/path/to/file.md",
-            },
-        )
-    assert "not found" in str(exc_info.value).lower() or "no such file" in str(exc_info.value).lower()
-
-
-@pytest.mark.anyio
-async def test_update_page_content_file_not_found(client, mock_confluence_fetcher):
-    """Test that update_page raises FileNotFoundError for missing content_file."""
-    with pytest.raises(Exception) as exc_info:
-        await client.call_tool(
-            "confluence_update_page",
-            {
-                "page_id": "123456",
-                "title": "Page with missing file",
-                "content_file": "/nonexistent/path/to/file.md",
-            },
-        )
-    assert "not found" in str(exc_info.value).lower() or "no such file" in str(exc_info.value).lower()
-
-
-@pytest.mark.anyio
-async def test_create_page_content_takes_precedence_over_file(
-    client, mock_confluence_fetcher, tmp_path
-):
-    """Test that inline content takes precedence when both content and content_file provided."""
-    # Create a temporary file with different content
-    content_file = tmp_path / "test_content.md"
-    content_file.write_text("Content from file")
-
-    response = await client.call_tool(
-        "confluence_create_page",
-        {
-            "space_key": "TEST",
-            "title": "Page with both",
-            "content": "Inline content",
-            "content_file": str(content_file),
-        },
-    )
-
-    mock_confluence_fetcher.create_page.assert_called_once()
-    call_kwargs = mock_confluence_fetcher.create_page.call_args.kwargs
-    # content_file takes precedence as it's checked first
-    assert call_kwargs["body"] == "Content from file"

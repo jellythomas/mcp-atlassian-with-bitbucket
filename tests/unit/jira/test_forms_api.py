@@ -9,10 +9,15 @@ from unittest.mock import Mock, patch
 import pytest
 from requests.exceptions import HTTPError
 
-from src.mcp_atlassian.exceptions import MCPAtlassianAuthenticationError
-from src.mcp_atlassian.jira.config import JiraConfig, OAuthConfig
-from src.mcp_atlassian.jira.forms_api import FormsApiMixin
-from src.mcp_atlassian.models.jira import ProFormaForm
+from src.mcp_atlassian_with_bitbucket_and_privacy.exceptions import (
+    MCPAtlassianAuthenticationError,
+)
+from src.mcp_atlassian_with_bitbucket_and_privacy.jira.config import (
+    JiraConfig,
+    OAuthConfig,
+)
+from src.mcp_atlassian_with_bitbucket_and_privacy.jira.forms_api import FormsApiMixin
+from src.mcp_atlassian_with_bitbucket_and_privacy.models.jira import ProFormaForm
 from tests.fixtures.proforma_mocks import (
     MOCK_CLOUD_ID,
     MOCK_FORM_UUID_1,
@@ -41,7 +46,7 @@ class TestFormsApiMixinInitialization:
 
         with patch("atlassian.Jira"):
             with patch(
-                "src.mcp_atlassian.utils.oauth.configure_oauth_session",
+                "src.mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.configure_oauth_session",
                 return_value=True,
             ):
                 mixin = FormsApiMixin(config)
@@ -85,7 +90,7 @@ class TestFormsApiMixinInitialization:
 
         with patch("atlassian.Jira"):
             with patch(
-                "src.mcp_atlassian.utils.oauth.configure_oauth_session",
+                "src.mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.configure_oauth_session",
                 return_value=True,
             ):
                 mixin = FormsApiMixin(config)
@@ -258,7 +263,7 @@ class TestFormsApiAuthenticationMethods:
 
         with patch("atlassian.Jira"):
             with patch(
-                "src.mcp_atlassian.utils.oauth.configure_oauth_session",
+                "src.mcp_atlassian_with_bitbucket_and_privacy.utils.oauth.configure_oauth_session",
                 return_value=True,
             ):
                 mixin = FormsApiMixin(config)
@@ -291,7 +296,9 @@ class TestFormsApiAuthenticationMethods:
             mixin = FormsApiMixin(config)
             mixin._cloud_id = MOCK_CLOUD_ID
 
-            with patch("src.mcp_atlassian.jira.forms_api.requests.request") as mock_req:
+            with patch(
+                "src.mcp_atlassian_with_bitbucket_and_privacy.jira.forms_api.requests.request"
+            ) as mock_req:
                 mock_response = Mock()
                 mock_response.content = b'{"success": true}'
                 mock_response.json.return_value = {"success": True}
@@ -323,7 +330,9 @@ class TestFormsApiAuthenticationMethods:
             mixin.jira.username = "test@example.com"
             mixin.jira.password = "test-api-token"
 
-            with patch("src.mcp_atlassian.jira.forms_api.requests.request") as mock_req:
+            with patch(
+                "src.mcp_atlassian_with_bitbucket_and_privacy.jira.forms_api.requests.request"
+            ) as mock_req:
                 mock_response = Mock()
                 mock_response.content = b'{"success": true}'
                 mock_response.json.return_value = {"success": True}
@@ -510,7 +519,9 @@ class TestFormsApiHttpErrorHandling:
         self, mixin_with_cloud_id
     ):
         """Test that 403 errors are converted to MCPAtlassianAuthenticationError."""
-        with patch("src.mcp_atlassian.jira.forms_api.requests.request") as mock_req:
+        with patch(
+            "src.mcp_atlassian_with_bitbucket_and_privacy.jira.forms_api.requests.request"
+        ) as mock_req:
             mock_response = Mock()
             mock_response.status_code = 403
             mock_response.text = "Forbidden"
@@ -524,7 +535,9 @@ class TestFormsApiHttpErrorHandling:
 
     def test_make_forms_api_request_handles_404_not_found(self, mixin_with_cloud_id):
         """Test that 404 errors are converted to ValueError."""
-        with patch("src.mcp_atlassian.jira.forms_api.requests.request") as mock_req:
+        with patch(
+            "src.mcp_atlassian_with_bitbucket_and_privacy.jira.forms_api.requests.request"
+        ) as mock_req:
             mock_response = Mock()
             mock_response.status_code = 404
             mock_response.text = "Not Found"
@@ -540,7 +553,9 @@ class TestFormsApiHttpErrorHandling:
 
     def test_make_forms_api_request_handles_empty_response(self, mixin_with_cloud_id):
         """Test that empty responses (like DELETE) are handled correctly."""
-        with patch("src.mcp_atlassian.jira.forms_api.requests.request") as mock_req:
+        with patch(
+            "src.mcp_atlassian_with_bitbucket_and_privacy.jira.forms_api.requests.request"
+        ) as mock_req:
             mock_response = Mock()
             mock_response.content = b""
             mock_req.return_value = mock_response

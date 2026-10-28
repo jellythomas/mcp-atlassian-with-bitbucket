@@ -2,23 +2,23 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ include "mcp-atlassian.fullname" . }}
+  name: {{ include "mcp-atlassian-with-bitbucket-and-privacy.fullname" . }}
   labels:
-    {{- include "mcp-atlassian.labels" . | nindent 4 }}
+    {{- include "mcp-atlassian-with-bitbucket-and-privacy.labels" . | nindent 4 }}
 rules: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ include "mcp-atlassian.fullname" . }}
+  name: {{ include "mcp-atlassian-with-bitbucket-and-privacy.fullname" . }}
   labels:
-    {{- include "mcp-atlassian.labels" . | nindent 4 }}
+    {{- include "mcp-atlassian-with-bitbucket-and-privacy.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: {{ include "mcp-atlassian.fullname" . }}
+  name: {{ include "mcp-atlassian-with-bitbucket-and-privacy.fullname" . }}
 subjects:
   - kind: ServiceAccount
-    name: {{ include "mcp-atlassian.serviceAccountName" . }}
+    name: {{ include "mcp-atlassian-with-bitbucket-and-privacy.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 {{- end }}

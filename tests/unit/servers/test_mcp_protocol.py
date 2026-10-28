@@ -11,18 +11,22 @@ from fastmcp.tools import Tool as FastMCPTool
 from mcp.types import Tool as MCPTool
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import PlainTextResponse
+from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from mcp_atlassian.confluence import ConfluenceFetcher
-from mcp_atlassian.confluence.config import ConfluenceConfig
-from mcp_atlassian.jira import JiraFetcher
-from mcp_atlassian.jira.config import JiraConfig
-from mcp_atlassian.servers.context import MainAppContext
-from mcp_atlassian.servers.main import (
+from mcp_atlassian_with_bitbucket_and_privacy.confluence import ConfluenceFetcher
+from mcp_atlassian_with_bitbucket_and_privacy.confluence.config import ConfluenceConfig
+from mcp_atlassian_with_bitbucket_and_privacy.jira import JiraFetcher
+from mcp_atlassian_with_bitbucket_and_privacy.jira.config import JiraConfig
+from mcp_atlassian_with_bitbucket_and_privacy.servers.context import MainAppContext
+from mcp_atlassian_with_bitbucket_and_privacy.servers.main import (
     AtlassianMCP,
     UserTokenMiddleware,
     health_check,
     main_lifespan,
+    main_mcp,
 )
 from tests.utils.factories import (
     ConfluencePageFactory,
@@ -31,6 +35,23 @@ from tests.utils.factories import (
 from tests.utils.mocks import MockEnvironment
 
 logger = logging.getLogger(__name__)
+
+JIRA_CLOUD_ONLY_TOOL_NAMES = {
+    "batch_get_changelogs",
+    "move_issue",
+}
+
+
+def _mock_tool(name, tags):
+    tool = MagicMock(spec=FastMCPTool)
+    tool.name = name
+    tool.tags = tags
+    tool.to_mcp_tool.return_value = MCPTool(
+        name=name,
+        description=f"Tool {name}",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    return tool
 
 
 @pytest.mark.anyio
@@ -90,6 +111,136 @@ class TestMCPProtocolIntegration:
         # Mount sub-servers (they're already mounted in the actual server)
         return server
 
+    @pytest.mark.security_regression
+    async def test_call_tool_mcp_enforces_enablement_at_dispatch(
+        self, atlassian_mcp_server, mock_jira_config, mock_confluence_config
+    ):
+        """A tool filtered out of the listing must not be invocable by name.
+
+        `_list_tools_mcp` hides read-only-excluded / non-enabled / disabled-toolset
+        / deployment-incompatible tools, but the call path must re-check — otherwise
+        a client can dispatch a hidden tool directly by name. Verifies denied calls
+        never reach the underlying executor and enabled calls do (GHSA-3r68).
+        """
+        from unittest.mock import AsyncMock
+
+        from fastmcp import FastMCP
+        from fastmcp.exceptions import NotFoundError
+
+        mock_jira_config.is_cloud = False
+        app_context = MainAppContext(
+            full_jira_config=mock_jira_config,
+            full_confluence_config=mock_confluence_config,
+            read_only=True,  # write tools are excluded
+            enabled_tools=None,
+        )
+        request_context = MagicMock()
+        request_context.request = None
+        request_context.lifespan_context = {"app_lifespan_context": app_context}
+        atlassian_mcp_server._mcp_server = MagicMock()
+        atlassian_mcp_server._mcp_server.request_context = request_context
+
+        read_tool = MagicMock(spec=FastMCPTool)
+        read_tool.tags = {"jira", "read"}
+        write_tool = MagicMock(spec=FastMCPTool)
+        write_tool.tags = {"jira", "write"}
+        cloud_only_tool = MagicMock(spec=FastMCPTool)
+        cloud_only_tool.tags = {"jira", "read", "cloud_only"}
+        tools_by_name = {
+            "jira_get_issue": read_tool,
+            "jira_create_issue": write_tool,
+            "jira_batch_get_changelogs": cloud_only_tool,
+        }
+
+        async def mock_get_tool(name, version=None):
+            return tools_by_name.get(name)
+
+        atlassian_mcp_server.get_tool = mock_get_tool
+
+        with patch.object(
+            FastMCP, "_call_tool_mcp", new_callable=AsyncMock
+        ) as mock_super:
+            mock_super.return_value = "EXECUTED"
+
+            # Write tool is read-only-excluded -> denied before reaching the executor.
+            with pytest.raises(NotFoundError) as denied_exc:
+                await atlassian_mcp_server._call_tool_mcp("jira_create_issue", {})
+            mock_super.assert_not_called()
+
+            # Cloud-only tool is deployment-excluded on Server/DC -> denied.
+            with pytest.raises(NotFoundError) as deployment_exc:
+                await atlassian_mcp_server._call_tool_mcp(
+                    "jira_batch_get_changelogs", {}
+                )
+            mock_super.assert_not_called()
+
+            # Genuinely unknown tool -> denied by our override too (never reaches
+            # super, whose repr-quoted message would leak tool existence).
+            with pytest.raises(NotFoundError) as unknown_exc:
+                await atlassian_mcp_server._call_tool_mcp("jira_no_such_tool", {})
+            mock_super.assert_not_called()
+
+            # Message parity: hidden-but-existing and genuinely unknown tools
+            # produce the same unquoted format (no exists-but-disabled leak).
+            assert str(denied_exc.value) == "Unknown tool: jira_create_issue"
+            assert (
+                str(deployment_exc.value) == "Unknown tool: jira_batch_get_changelogs"
+            )
+            assert str(unknown_exc.value) == "Unknown tool: jira_no_such_tool"
+
+            # Read tool is enabled -> passes the gate and reaches the executor.
+            result = await atlassian_mcp_server._call_tool_mcp("jira_get_issue", {})
+            assert result == "EXECUTED"
+            mock_super.assert_called_once()
+
+    @pytest.mark.parametrize("is_cloud", [True, False], ids=["cloud", "server_dc"])
+    async def test_tool_filtering_by_jira_deployment(self, is_cloud):
+        """The production server advertises Cloud-only Jira tools only on Cloud."""
+        jira_config = MagicMock(spec=JiraConfig)
+        jira_config.is_cloud = is_cloud
+        app_context = MainAppContext(full_jira_config=jira_config)
+        request_context = MagicMock()
+        request_context.request = None
+        request_context.lifespan_context = {"app_lifespan_context": app_context}
+
+        with patch.object(main_mcp, "_mcp_server") as mcp_server:
+            mcp_server.request_context = request_context
+            listed_tool_names = {tool.name for tool in await main_mcp._list_tools_mcp()}
+
+        expected_cloud_only_tools = {
+            f"jira_{name}" for name in JIRA_CLOUD_ONLY_TOOL_NAMES
+        }
+        assert "jira_get_issue" in listed_tool_names
+        assert listed_tool_names & expected_cloud_only_tools == (
+            expected_cloud_only_tools if is_cloud else set()
+        )
+
+    async def test_tool_filtering_uses_header_based_jira_deployment(
+        self, atlassian_mcp_server
+    ):
+        """Per-request Jira URLs determine Cloud-only tool availability."""
+        app_context = MainAppContext()
+        request_context = MagicMock()
+        request_context.lifespan_context = {"app_lifespan_context": app_context}
+        request_context.request.state.atlassian_service_headers = {
+            "X-Atlassian-Jira-Personal-Token": "test-token",
+            "X-Atlassian-Jira-Url": "https://jira.example.com",
+        }
+        atlassian_mcp_server._mcp_server = MagicMock()
+        atlassian_mcp_server._mcp_server.request_context = request_context
+
+        tool = _mock_tool("jira_batch_get_changelogs", {"jira", "read", "cloud_only"})
+
+        async def mock_list_tools():
+            return [tool]
+
+        atlassian_mcp_server.list_tools = mock_list_tools
+
+        with MockEnvironment.clean_env():
+            tools = await atlassian_mcp_server._list_tools_mcp()
+
+        assert tools == []
+
     async def test_tool_discovery_with_full_configuration(
         self, atlassian_mcp_server, mock_jira_config, mock_confluence_config
     ):
@@ -98,11 +249,11 @@ class TestMCPProtocolIntegration:
             # Mock the configuration loading
             with (
                 patch(
-                    "mcp_atlassian.jira.config.JiraConfig.from_env",
+                    "mcp_atlassian_with_bitbucket_and_privacy.jira.config.JiraConfig.from_env",
                     return_value=mock_jira_config,
                 ),
                 patch(
-                    "mcp_atlassian.confluence.config.ConfluenceConfig.from_env",
+                    "mcp_atlassian_with_bitbucket_and_privacy.confluence.config.ConfluenceConfig.from_env",
                     return_value=mock_confluence_config,
                 ),
             ):
@@ -122,9 +273,9 @@ class TestMCPProtocolIntegration:
                 atlassian_mcp_server._mcp_server = MagicMock()
                 atlassian_mcp_server._mcp_server.request_context = request_context
 
-                # Mock get_tools to return sample tools
-                async def mock_get_tools():
-                    tools = {}
+                # Mock list_tools to return sample tools
+                async def mock_list_tools():
+                    tools = []
                     # Add sample Jira tools
                     for tool_name in [
                         "jira_get_issue",
@@ -132,6 +283,7 @@ class TestMCPProtocolIntegration:
                         "jira_search_issues",
                     ]:
                         tool = MagicMock(spec=FastMCPTool)
+                        tool.name = tool_name
                         tool.tags = (
                             {"jira", "read"}
                             if "get" in tool_name or "search" in tool_name
@@ -142,11 +294,12 @@ class TestMCPProtocolIntegration:
                             description=f"Tool {tool_name}",
                             inputSchema={"type": "object", "properties": {}},
                         )
-                        tools[tool_name] = tool
+                        tools.append(tool)
 
                     # Add sample Confluence tools
                     for tool_name in ["confluence_get_page", "confluence_create_page"]:
                         tool = MagicMock(spec=FastMCPTool)
+                        tool.name = tool_name
                         tool.tags = (
                             {"confluence", "read"}
                             if "get" in tool_name
@@ -157,11 +310,11 @@ class TestMCPProtocolIntegration:
                             description=f"Tool {tool_name}",
                             inputSchema={"type": "object", "properties": {}},
                         )
-                        tools[tool_name] = tool
+                        tools.append(tool)
 
                     return tools
 
-                atlassian_mcp_server.get_tools = mock_get_tools
+                atlassian_mcp_server.list_tools = mock_list_tools
 
                 # Get filtered tools
                 tools = await atlassian_mcp_server._list_tools_mcp()
@@ -196,9 +349,9 @@ class TestMCPProtocolIntegration:
             atlassian_mcp_server._mcp_server = MagicMock()
             atlassian_mcp_server._mcp_server.request_context = request_context
 
-            # Mock get_tools
-            async def mock_get_tools():
-                tools = {}
+            # Mock list_tools
+            async def mock_list_tools():
+                tools = []
                 # Add mix of read and write tools
                 read_tools = [
                     "jira_get_issue",
@@ -213,6 +366,7 @@ class TestMCPProtocolIntegration:
 
                 for tool_name in read_tools:
                     tool = MagicMock(spec=FastMCPTool)
+                    tool.name = tool_name
                     tool.tags = (
                         {"jira", "read"}
                         if "jira" in tool_name
@@ -223,10 +377,11 @@ class TestMCPProtocolIntegration:
                         description=f"Tool {tool_name}",
                         inputSchema={"type": "object", "properties": {}},
                     )
-                    tools[tool_name] = tool
+                    tools.append(tool)
 
                 for tool_name in write_tools:
                     tool = MagicMock(spec=FastMCPTool)
+                    tool.name = tool_name
                     tool.tags = (
                         {"jira", "write"}
                         if "jira" in tool_name
@@ -237,11 +392,11 @@ class TestMCPProtocolIntegration:
                         description=f"Tool {tool_name}",
                         inputSchema={"type": "object", "properties": {}},
                     )
-                    tools[tool_name] = tool
+                    tools.append(tool)
 
                 return tools
 
-            atlassian_mcp_server.get_tools = mock_get_tools
+            atlassian_mcp_server.list_tools = mock_list_tools
 
             # Get filtered tools
             tools = await atlassian_mcp_server._list_tools_mcp()
@@ -278,9 +433,9 @@ class TestMCPProtocolIntegration:
             atlassian_mcp_server._mcp_server = MagicMock()
             atlassian_mcp_server._mcp_server.request_context = request_context
 
-            # Mock get_tools
-            async def mock_get_tools():
-                tools = {}
+            # Mock list_tools
+            async def mock_list_tools():
+                tools = []
                 all_tools = [
                     "jira_get_issue",
                     "jira_create_issue",
@@ -291,6 +446,7 @@ class TestMCPProtocolIntegration:
 
                 for tool_name in all_tools:
                     tool = MagicMock(spec=FastMCPTool)
+                    tool.name = tool_name
                     if "jira" in tool_name:
                         tool.tags = (
                             {"jira", "read"}
@@ -308,11 +464,11 @@ class TestMCPProtocolIntegration:
                         description=f"Tool {tool_name}",
                         inputSchema={"type": "object", "properties": {}},
                     )
-                    tools[tool_name] = tool
+                    tools.append(tool)
 
                 return tools
 
-            atlassian_mcp_server.get_tools = mock_get_tools
+            atlassian_mcp_server.list_tools = mock_list_tools
 
             # Get filtered tools
             tools = await atlassian_mcp_server._list_tools_mcp()
@@ -347,9 +503,9 @@ class TestMCPProtocolIntegration:
             atlassian_mcp_server._mcp_server = MagicMock()
             atlassian_mcp_server._mcp_server.request_context = request_context
 
-            # Mock get_tools
-            async def mock_get_tools():
-                tools = {}
+            # Mock list_tools
+            async def mock_list_tools():
+                tools = []
                 all_tools = [
                     "jira_get_issue",
                     "jira_create_issue",
@@ -359,6 +515,7 @@ class TestMCPProtocolIntegration:
 
                 for tool_name in all_tools:
                     tool = MagicMock(spec=FastMCPTool)
+                    tool.name = tool_name
                     if "jira" in tool_name:
                         tool.tags = (
                             {"jira", "read"}
@@ -376,11 +533,11 @@ class TestMCPProtocolIntegration:
                         description=f"Tool {tool_name}",
                         inputSchema={"type": "object", "properties": {}},
                     )
-                    tools[tool_name] = tool
+                    tools.append(tool)
 
                 return tools
 
-            atlassian_mcp_server.get_tools = mock_get_tools
+            atlassian_mcp_server.list_tools = mock_list_tools
 
             # Get filtered tools
             tools = await atlassian_mcp_server._list_tools_mcp()
@@ -749,10 +906,10 @@ class TestMCPProtocolIntegration:
         with MockEnvironment.basic_auth_env():
             with (
                 patch(
-                    "mcp_atlassian.jira.config.JiraConfig.from_env"
+                    "mcp_atlassian_with_bitbucket_and_privacy.jira.config.JiraConfig.from_env"
                 ) as mock_jira_config,
                 patch(
-                    "mcp_atlassian.confluence.config.ConfluenceConfig.from_env"
+                    "mcp_atlassian_with_bitbucket_and_privacy.confluence.config.ConfluenceConfig.from_env"
                 ) as mock_conf_config,
             ):
                 # Configure mocks
@@ -784,10 +941,10 @@ class TestMCPProtocolIntegration:
         with patch.dict(os.environ, env_vars, clear=False):
             with (
                 patch(
-                    "mcp_atlassian.jira.config.JiraConfig.from_env"
+                    "mcp_atlassian_with_bitbucket_and_privacy.jira.config.JiraConfig.from_env"
                 ) as mock_jira_config,
                 patch(
-                    "mcp_atlassian.confluence.config.ConfluenceConfig.from_env"
+                    "mcp_atlassian_with_bitbucket_and_privacy.confluence.config.ConfluenceConfig.from_env"
                 ) as mock_conf_config,
             ):
                 # Configure mocks
@@ -810,7 +967,7 @@ class TestMCPProtocolIntegration:
         with MockEnvironment.basic_auth_env():
             with patch.dict(os.environ, {"READ_ONLY_MODE": "true"}):
                 with patch(
-                    "mcp_atlassian.jira.config.JiraConfig.from_env"
+                    "mcp_atlassian_with_bitbucket_and_privacy.jira.config.JiraConfig.from_env"
                 ) as mock_jira_config:
                     # Configure mock
                     jira_config = MagicMock()
@@ -833,7 +990,7 @@ class TestMCPProtocolIntegration:
                 },
             ):
                 with patch(
-                    "mcp_atlassian.jira.config.JiraConfig.from_env"
+                    "mcp_atlassian_with_bitbucket_and_privacy.jira.config.JiraConfig.from_env"
                 ) as mock_jira_config:
                     # Configure mock
                     jira_config = MagicMock()
@@ -867,7 +1024,35 @@ class TestMCPProtocolIntegration:
             response = client.get("/healthz")
 
         assert response.status_code == 200
-        assert response.json() == {"status": "ok"}
+        assert response.json()["status"] == "ok"
+        assert response.json()["identity_privacy"] == "off"
+
+    @pytest.mark.security_regression
+    async def test_malformed_host_cannot_bypass_url_path_gate(
+        self, atlassian_mcp_server
+    ):
+        """Malformed Host headers must not rewrite the path used by middleware."""
+
+        class PathGateMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                if request.url.path not in {"", "/"}:
+                    return PlainTextResponse("Forbidden", status_code=403)
+                return await call_next(request)
+
+        async def admin(_request):
+            return PlainTextResponse("secret")
+
+        app = Starlette(
+            routes=[Route("/admin", admin)],
+            middleware=[Middleware(PathGateMiddleware)],
+        )
+
+        with TestClient(app) as client:
+            response = client.get(
+                "/admin", headers={"host": "example.com/allowed?query="}
+            )
+
+        assert response.status_code == 403
 
     async def test_combined_filtering_scenarios(
         self, atlassian_mcp_server, mock_jira_config
@@ -896,9 +1081,9 @@ class TestMCPProtocolIntegration:
             atlassian_mcp_server._mcp_server = MagicMock()
             atlassian_mcp_server._mcp_server.request_context = request_context
 
-            # Mock get_tools
-            async def mock_get_tools():
-                tools = {}
+            # Mock list_tools
+            async def mock_list_tools():
+                tools = []
                 tool_configs = [
                     ("jira_get_issue", {"jira", "read"}),  # Should be included
                     ("jira_create_issue", {"jira", "write"}),  # Excluded by read-only
@@ -914,17 +1099,18 @@ class TestMCPProtocolIntegration:
 
                 for tool_name, tags in tool_configs:
                     tool = MagicMock(spec=FastMCPTool)
+                    tool.name = tool_name
                     tool.tags = tags
                     tool.to_mcp_tool.return_value = MCPTool(
                         name=tool_name,
                         description=f"Tool {tool_name}",
                         inputSchema={"type": "object", "properties": {}},
                     )
-                    tools[tool_name] = tool
+                    tools.append(tool)
 
                 return tools
 
-            atlassian_mcp_server.get_tools = mock_get_tools
+            atlassian_mcp_server.list_tools = mock_list_tools
 
             # Get filtered tools
             tools = await atlassian_mcp_server._list_tools_mcp()
@@ -939,11 +1125,11 @@ class TestMCPProtocolIntegration:
         atlassian_mcp_server._mcp_server = MagicMock()
         atlassian_mcp_server._mcp_server.request_context = None
 
-        # Mock get_tools (shouldn't be called)
-        async def mock_get_tools():
-            pytest.fail("get_tools should not be called when context is missing")
+        # Mock list_tools (shouldn't be called)
+        async def mock_list_tools():
+            pytest.fail("list_tools should not be called when context is missing")
 
-        atlassian_mcp_server.get_tools = mock_get_tools
+        atlassian_mcp_server.list_tools = mock_list_tools
 
         # Get filtered tools
         tools = await atlassian_mcp_server._list_tools_mcp()
@@ -992,8 +1178,8 @@ class TestMCPProtocolIntegration:
             atlassian_mcp_server._mcp_server = MagicMock()
             atlassian_mcp_server._mcp_server.request_context = request_context
 
-            async def mock_get_tools():
-                tools = {}
+            async def mock_list_tools():
+                tools = []
                 tool_configs = [
                     ("jira_get_issue", {"jira", "read", "toolset:jira_issues"}),
                     ("jira_search_issues", {"jira", "read", "toolset:jira_issues"}),
@@ -1005,16 +1191,17 @@ class TestMCPProtocolIntegration:
                 ]
                 for tool_name, tags in tool_configs:
                     tool = MagicMock(spec=FastMCPTool)
+                    tool.name = tool_name
                     tool.tags = tags
                     tool.to_mcp_tool.return_value = MCPTool(
                         name=tool_name,
                         description=f"Tool {tool_name}",
                         inputSchema={"type": "object", "properties": {}},
                     )
-                    tools[tool_name] = tool
+                    tools.append(tool)
                 return tools
 
-            atlassian_mcp_server.get_tools = mock_get_tools
+            atlassian_mcp_server.list_tools = mock_list_tools
 
             tools = await atlassian_mcp_server._list_tools_mcp()
 
@@ -1044,8 +1231,8 @@ class TestMCPProtocolIntegration:
             atlassian_mcp_server._mcp_server = MagicMock()
             atlassian_mcp_server._mcp_server.request_context = request_context
 
-            async def mock_get_tools():
-                tools = {}
+            async def mock_list_tools():
+                tools = []
                 tool_configs = [
                     ("jira_get_issue", {"jira", "read", "toolset:jira_issues"}),
                     ("jira_search_issues", {"jira", "read", "toolset:jira_issues"}),
@@ -1053,16 +1240,17 @@ class TestMCPProtocolIntegration:
                 ]
                 for tool_name, tags in tool_configs:
                     tool = MagicMock(spec=FastMCPTool)
+                    tool.name = tool_name
                     tool.tags = tags
                     tool.to_mcp_tool.return_value = MCPTool(
                         name=tool_name,
                         description=f"Tool {tool_name}",
                         inputSchema={"type": "object", "properties": {}},
                     )
-                    tools[tool_name] = tool
+                    tools.append(tool)
                 return tools
 
-            atlassian_mcp_server.get_tools = mock_get_tools
+            atlassian_mcp_server.list_tools = mock_list_tools
 
             tools = await atlassian_mcp_server._list_tools_mcp()
 
@@ -1093,8 +1281,8 @@ class TestMCPProtocolIntegration:
             atlassian_mcp_server._mcp_server = MagicMock()
             atlassian_mcp_server._mcp_server.request_context = request_context
 
-            async def mock_get_tools():
-                tools = {}
+            async def mock_list_tools():
+                tools = []
                 tool_configs = [
                     ("jira_get_issue", {"jira", "read", "toolset:jira_issues"}),
                     ("jira_create_issue", {"jira", "write", "toolset:jira_issues"}),
@@ -1102,16 +1290,17 @@ class TestMCPProtocolIntegration:
                 ]
                 for tool_name, tags in tool_configs:
                     tool = MagicMock(spec=FastMCPTool)
+                    tool.name = tool_name
                     tool.tags = tags
                     tool.to_mcp_tool.return_value = MCPTool(
                         name=tool_name,
                         description=f"Tool {tool_name}",
                         inputSchema={"type": "object", "properties": {}},
                     )
-                    tools[tool_name] = tool
+                    tools.append(tool)
                 return tools
 
-            atlassian_mcp_server.get_tools = mock_get_tools
+            atlassian_mcp_server.list_tools = mock_list_tools
 
             tools = await atlassian_mcp_server._list_tools_mcp()
 
@@ -1125,7 +1314,9 @@ class TestMCPProtocolIntegration:
         self, atlassian_mcp_server, mock_jira_config, mock_confluence_config
     ):
         """Test default toolsets only include default-tagged tools."""
-        from mcp_atlassian.utils.toolsets import DEFAULT_TOOLSETS
+        from mcp_atlassian_with_bitbucket_and_privacy.utils.toolsets import (
+            DEFAULT_TOOLSETS,
+        )
 
         with MockEnvironment.basic_auth_env():
             app_context = MainAppContext(
@@ -1142,8 +1333,8 @@ class TestMCPProtocolIntegration:
             atlassian_mcp_server._mcp_server = MagicMock()
             atlassian_mcp_server._mcp_server.request_context = request_context
 
-            async def mock_get_tools():
-                tools = {}
+            async def mock_list_tools():
+                tools = []
                 tool_configs = [
                     ("jira_get_issue", {"jira", "read", "toolset:jira_issues"}),
                     ("jira_get_agile_boards", {"jira", "read", "toolset:jira_agile"}),
@@ -1154,16 +1345,17 @@ class TestMCPProtocolIntegration:
                 ]
                 for tool_name, tags in tool_configs:
                     tool = MagicMock(spec=FastMCPTool)
+                    tool.name = tool_name
                     tool.tags = tags
                     tool.to_mcp_tool.return_value = MCPTool(
                         name=tool_name,
                         description=f"Tool {tool_name}",
                         inputSchema={"type": "object", "properties": {}},
                     )
-                    tools[tool_name] = tool
+                    tools.append(tool)
                 return tools
 
-            atlassian_mcp_server.get_tools = mock_get_tools
+            atlassian_mcp_server.list_tools = mock_list_tools
 
             tools = await atlassian_mcp_server._list_tools_mcp()
 
@@ -1176,14 +1368,14 @@ class TestMCPProtocolIntegration:
 
     async def test_lifespan_toolsets_unset_uses_all(self):
         """Test lifespan uses all toolsets when TOOLSETS env var is absent."""
-        from mcp_atlassian.utils.toolsets import ALL_TOOLSETS
+        from mcp_atlassian_with_bitbucket_and_privacy.utils.toolsets import ALL_TOOLSETS
 
         with MockEnvironment.basic_auth_env():
             with patch.dict(os.environ, {}, clear=False):
                 # Ensure TOOLSETS is not set
                 os.environ.pop("TOOLSETS", None)
                 with patch(
-                    "mcp_atlassian.jira.config.JiraConfig.from_env"
+                    "mcp_atlassian_with_bitbucket_and_privacy.jira.config.JiraConfig.from_env"
                 ) as mock_jira_config:
                     jira_config = MagicMock()
                     jira_config.is_auth_configured.return_value = True
@@ -1202,7 +1394,7 @@ class TestMCPProtocolIntegration:
                 {"TOOLSETS": "default,jira_agile"},
             ):
                 with patch(
-                    "mcp_atlassian.jira.config.JiraConfig.from_env"
+                    "mcp_atlassian_with_bitbucket_and_privacy.jira.config.JiraConfig.from_env"
                 ) as mock_jira_config:
                     jira_config = MagicMock()
                     jira_config.is_auth_configured.return_value = True
@@ -1218,7 +1410,9 @@ class TestMCPProtocolIntegration:
 
     async def test_tool_execution_with_authentication_error(self, atlassian_mcp_server):
         """Test tool execution when authentication fails."""
-        from mcp_atlassian.exceptions import MCPAtlassianAuthenticationError
+        from mcp_atlassian_with_bitbucket_and_privacy.exceptions import (
+            MCPAtlassianAuthenticationError,
+        )
 
         # Mock a tool that raises authentication error
         async def mock_failing_tool(ctx: Context):

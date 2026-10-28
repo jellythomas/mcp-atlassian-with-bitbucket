@@ -1,6 +1,6 @@
-# MCP Atlassian Test Fixtures Documentation
+# MCP Atlassian with Bitbucket and Privacy Test Fixtures Documentation
 
-This document describes the enhanced test fixture system implemented for the MCP Atlassian project.
+This document describes the enhanced test fixture system implemented for the MCP Atlassian with Bitbucket and Privacy project.
 
 ## Overview
 
@@ -290,7 +290,7 @@ def test_real_api_integration(
 
 ## Conclusion
 
-The enhanced fixture system provides a powerful, flexible, and efficient foundation for testing the MCP Atlassian project. It maintains backward compatibility while offering significant improvements in performance, reusability, and developer experience.
+The enhanced fixture system provides a powerful, flexible, and efficient foundation for testing the MCP Atlassian with Bitbucket and Privacy project. It maintains backward compatibility while offering significant improvements in performance, reusability, and developer experience.
 
 Key benefits:
 

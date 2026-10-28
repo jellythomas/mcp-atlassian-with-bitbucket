@@ -6,7 +6,9 @@ import pickle
 
 import pytest
 
-from src.mcp_atlassian.exceptions import MCPAtlassianAuthenticationError
+from src.mcp_atlassian_with_bitbucket_and_privacy.exceptions import (
+    MCPAtlassianAuthenticationError,
+)
 
 
 class TestMCPAtlassianAuthenticationError:

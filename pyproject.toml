@@ -1,25 +1,28 @@
 [project]
-name = "mcp-atlassian-with-bitbucket"
+name = "mcp-atlassian-with-bitbucket-and-privacy"
 dynamic = ["version"]
 description = "MCP server integrating Jira, Confluence, and Bitbucket (Cloud + Server/DC) with AI language models following Anthropic's MCP specification."
 readme = "README.md"
 requires-python = ">=3.10"
+
 dependencies = [
-    "atlassian-python-api>=4.0.0",
+    "anyio>=4.0.0",
+    "atlassian-python-api>=4.0.0,<5.0.0",
     "requests[socks]>=2.31.0",
     "beautifulsoup4>=4.12.3",
     "httpx>=0.28.0",
-    "mcp>=1.8.0,<2.0.0",
-    "fastmcp>=2.13.0,<2.15.0",
+    "mcp>=1.27.0,<2.0.0",
+    "fastmcp>=3.4.4,<4.0.0",
+    "fakeredis>=2.32.1,<2.35.0",
     "python-dotenv>=1.0.1",
     "markdownify>=0.11.6",
     "markdown>=3.7.0",
-    "markdown-to-confluence>=0.3.4,<0.4.0",
+    "markdown-to-confluence>=0.6.0,<0.7.0",
     "pydantic>=2.10.6,<3.0",
     "trio>=0.29.0",
     "click>=8.1.7",
     "uvicorn>=0.27.1",
-    "starlette>=0.49.1",
+    "starlette>=1.0.1",
     "urllib3>=2.6.3",
     "thefuzz>=0.22.1",
     "python-dateutil>=2.9.0.post0",
@@ -28,20 +31,30 @@ dependencies = [
     "cachetools>=5.0.0",
     "types-cachetools>=5.5.0.20240820",
     "unidecode>=1.3.0",
+    "cryptography>=46.0.7,<47",
     "truststore>=0.10.0",
     "tzdata>=2024.1; platform_system=='Windows'",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ulikoenig/mcp-atlassian-with-bitbucket"
+Repository = "https://github.com/ulikoenig/mcp-atlassian-with-bitbucket"
+Issues = "https://github.com/ulikoenig/mcp-atlassian-with-bitbucket/issues"
+Changelog = "https://github.com/ulikoenig/mcp-atlassian-with-bitbucket/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+wpad = ["pypac>=0.17.2"]
+
 [[project.authors]]
-name = "Jelly Thomas"
-email = "jellythom2107@gmail.com"
+name = "Uli König"
+email = "mcp_atlassian@ulikoenig.de"
 
 [build-system]
 requires = ["hatchling", "uv-dynamic-versioning>=0.7.0"]
 build-backend = "hatchling.build"
 
 [project.scripts]
-mcp-atlassian-with-bitbucket = "mcp_atlassian:main"
-mcp-atlassian = "mcp_atlassian:main"
+mcp-atlassian-with-bitbucket-and-privacy = "mcp_atlassian_with_bitbucket_and_privacy:main"
 
 [dependency-groups]
 dev = [
@@ -50,6 +63,7 @@ dev = [
     "pytest-cov>=4.1.0",
     "pytest-asyncio>=0.23.0",
     "pytest-anyio>=0.0.0",
+    "cryptography>=42.0.0",
     "pre-commit>=3.6.0",
     "ruff>=0.3.0",
     "black>=24.2.0",
@@ -57,7 +71,8 @@ dev = [
     "mcp[cli]>=1.3.0",
     "jinja2>=3.1.0",
     "pyyaml>=6.0",
-    "types-pyyaml>=6.0"
+    "types-pyyaml>=6.0",
+    "pypac>=0.17.2",
 ]
 
 [tool.pytest.ini_options]
@@ -65,6 +80,7 @@ markers = [
     "integration: mark test as requiring integration with real services",
     "dc_e2e: mark test as requiring DC instances (Jira DC + Confluence DC)",
     "cloud_e2e: mark test as requiring Cloud instances (Jira Cloud + Confluence Cloud)",
+    "security_regression: SP5 security regression test (xfail-strict until the Phase B root fix lands; see plan)",
 ]
 
 [tool.ruff]
@@ -105,7 +121,7 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S", "ANN", "B017"]
 "tests/fixtures/*.py" = ["E501"]
-"src/mcp_atlassian/server.py" = ["E501"]
+"src/mcp_atlassian_with_bitbucket_and_privacy/server.py" = ["E501"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -147,11 +163,15 @@ module = "markdownify.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "src.mcp_atlassian.*"
+module = "src.mcp_atlassian_with_bitbucket_and_privacy.*"
 disallow_untyped_defs = false
 
+[[tool.mypy.overrides]]
+module = "pypac.*"
+ignore_missing_imports = true
+
 [tool.hatch.build.targets.wheel]
-packages = ["src/mcp_atlassian"]
+packages = ["src/mcp_atlassian_with_bitbucket_and_privacy"]
 
 [tool.hatch.version]
 source = "uv-dynamic-versioning"

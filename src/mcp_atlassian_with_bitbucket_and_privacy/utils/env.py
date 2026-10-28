@@ -1,0 +1,212 @@
+"""Environment variable utility functions for MCP Atlassian with Bitbucket and Privacy."""
+
+import logging
+import os
+from typing import Annotated
+
+from pydantic import Field, TypeAdapter
+from pydantic_core import SchemaError
+
+logger = logging.getLogger("mcp-atlassian-with-bitbucket-and-privacy.env")
+
+
+def is_env_truthy(env_var_name: str, default: str = "") -> bool:
+    """Check if environment variable is set to a standard truthy value.
+
+    Considers 'true', '1', 'yes' as truthy values (case-insensitive).
+    Used for most MCP environment variables.
+
+    Args:
+        env_var_name: Name of the environment variable to check
+        default: Default value if environment variable is not set
+
+    Returns:
+        True if the environment variable is set to a truthy value, False otherwise
+    """
+    return os.getenv(env_var_name, default).lower() in ("true", "1", "yes")
+
+
+def is_env_extended_truthy(env_var_name: str, default: str = "") -> bool:
+    """Check if environment variable is set to an extended truthy value.
+
+    Considers 'true', '1', 'yes', 'y', 'on' as truthy values (case-insensitive).
+    Used for READ_ONLY_MODE and similar flags.
+
+    Args:
+        env_var_name: Name of the environment variable to check
+        default: Default value if environment variable is not set
+
+    Returns:
+        True if the environment variable is set to a truthy value, False otherwise
+    """
+    return os.getenv(env_var_name, default).lower() in ("true", "1", "yes", "y", "on")
+
+
+def is_env_ssl_verify(env_var_name: str, default: str = "true") -> bool:
+    """Check SSL verification setting with secure defaults.
+
+    Defaults to true unless explicitly set to false values.
+    Used for SSL_VERIFY environment variables.
+
+    Args:
+        env_var_name: Name of the environment variable to check
+        default: Default value if environment variable is not set
+
+    Returns:
+        True unless explicitly set to false values
+    """
+    return os.getenv(env_var_name, default).lower() not in ("false", "0", "no")
+
+
+def get_int_env(env_var_name: str, default: int) -> int:
+    """Read an environment variable as an integer, falling back to `default`.
+
+    Logs a warning and falls back to `default` if the variable is set to a
+    non-integer value.
+
+    Args:
+        env_var_name: Name of the environment variable to read
+        default: Value to return when the variable is unset or unparseable
+
+    Returns:
+        Parsed integer value, or `default`
+    """
+    raw = os.getenv(env_var_name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid int for %s=%r; using default %d", env_var_name, raw, default
+        )
+        return default
+
+
+def get_float_env(env_var_name: str, default: float) -> float:
+    """Read an environment variable as a float, falling back to `default`.
+
+    Logs a warning and falls back to `default` if the variable is set to a
+    non-float value.
+
+    Args:
+        env_var_name: Name of the environment variable to read
+        default: Value to return when the variable is unset or unparseable
+
+    Returns:
+        Parsed float value, or `default`
+    """
+    raw = os.getenv(env_var_name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid float for %s=%r; using default %s", env_var_name, raw, default
+        )
+        return default
+
+
+def get_regex_env(env_var_name: str, default: str) -> str:
+    """Read an environment variable as a regex pattern, falling back to `default`.
+
+    Logs a warning and falls back to `default` if the variable is set to a
+    pattern that does not compile. Patterns read this way are consumed at import
+    time by Pydantic field validators, so an uncompilable value would otherwise
+    take the whole server down over a typo in one setting.
+
+    Args:
+        env_var_name: Name of the environment variable to read
+        default: Value to return when the variable is unset or uncompilable
+
+    Returns:
+        The configured pattern, or `default`
+    """
+    raw = os.getenv(env_var_name)
+    if not raw:
+        return default
+    try:
+        TypeAdapter(Annotated[str, Field(pattern=raw)])
+    except SchemaError as exc:
+        logger.warning(
+            "Invalid regex for %s=%r (%s); using default %r",
+            env_var_name,
+            raw,
+            exc,
+            default,
+        )
+        return default
+    return raw
+
+
+def get_custom_headers(env_var_name: str) -> dict[str, str]:
+    """Parse custom headers from environment variable containing comma-separated key=value pairs.
+
+    Args:
+        env_var_name: Name of the environment variable to read
+
+    Returns:
+        Dictionary of parsed headers
+
+    Examples:
+        >>> # With CUSTOM_HEADERS="X-Custom=value1,X-Other=value2"
+        >>> parse_custom_headers("CUSTOM_HEADERS")
+        {'X-Custom': 'value1', 'X-Other': 'value2'}
+        >>> # With unset environment variable
+        >>> parse_custom_headers("UNSET_VAR")
+        {}
+    """
+    header_string = os.getenv(env_var_name)
+    if not header_string or not header_string.strip():
+        return {}
+
+    headers = {}
+    pairs = header_string.split(",")
+
+    for pair in pairs:
+        pair = pair.strip()
+        if not pair:
+            continue
+
+        if "=" not in pair:
+            continue
+
+        key, value = pair.split("=", 1)  # Split on first = only
+        key = key.strip()
+        value = value.strip()
+
+        if key:  # Only add if key is not empty
+            headers[key] = value
+
+    return headers
+
+
+def get_header_names(env_var_name: str) -> list[str]:
+    """Parse comma-separated HTTP header names from an environment variable.
+
+    Args:
+        env_var_name: Name of the environment variable to read.
+
+    Returns:
+        List of parsed header names, preserving the first configured casing.
+    """
+    header_string = os.getenv(env_var_name)
+    if not header_string or not header_string.strip():
+        return []
+
+    header_names: list[str] = []
+    seen_names: set[str] = set()
+    for raw_name in header_string.split(","):
+        header_name = raw_name.strip()
+        if not header_name:
+            continue
+
+        normalized_name = header_name.lower()
+        if normalized_name in seen_names:
+            continue
+
+        seen_names.add(normalized_name)
+        header_names.append(header_name)
+
+    return header_names

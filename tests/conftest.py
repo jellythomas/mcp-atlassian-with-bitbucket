@@ -1,5 +1,5 @@
 """
-Root pytest configuration file for MCP Atlassian tests.
+Root pytest configuration file for MCP Atlassian with Bitbucket and Privacy tests.
 
 This module provides session-scoped fixtures and utilities that are shared
 across all test modules. It integrates with the new test utilities framework
@@ -357,9 +357,11 @@ def validate_test_environment():
         pytest.fail(f"Failed to import test utilities: {e}")
 
     # Log session start
-    print("\n🧪 Starting MCP Atlassian test session with enhanced fixtures")
+    print(
+        "\n🧪 Starting MCP Atlassian with Bitbucket and Privacy test session with enhanced fixtures"
+    )
 
     yield
 
     # Log session end
-    print("\n✅ Completed MCP Atlassian test session")
+    print("\n✅ Completed MCP Atlassian with Bitbucket and Privacy test session")

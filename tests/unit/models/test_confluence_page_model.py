@@ -2,7 +2,7 @@
 Tests for the ConfluencePage Pydantic model.
 """
 
-from mcp_atlassian.models import (
+from mcp_atlassian_with_bitbucket_and_privacy.models import (
     ConfluencePage,
 )
 
@@ -35,6 +35,41 @@ class TestConfluencePage:
 
         # Check timestamps
         assert page.version.when == "2024-01-01T09:00:00.000Z"
+
+    def test_from_api_response_uses_history_created_by_as_author(self):
+        """Test author fallback from history.createdBy when author is absent."""
+        page = ConfluencePage.from_api_response(
+            {
+                "id": "123456",
+                "title": "History Author Page",
+                "history": {
+                    "createdBy": {
+                        "accountId": "abc-123",
+                        "displayName": "History Author",
+                    }
+                },
+            }
+        )
+
+        assert page.author is not None
+        assert page.author.account_id == "abc-123"
+        assert page.author.display_name == "History Author"
+
+    def test_from_api_response_uses_version_date_without_history(self):
+        """Test updated falls back to version.when when history is absent."""
+        page = ConfluencePage.from_api_response(
+            {
+                "id": "123456",
+                "title": "Version-only Page",
+                "version": {
+                    "number": 2,
+                    "when": "2026-08-17T13:19:17.000+0200",
+                },
+            }
+        )
+
+        assert page.created == ""
+        assert page.updated == "2026-08-17T13:19:17.000+0200"
 
     def test_from_api_response_with_empty_data(self):
         """Test creating a ConfluencePage from empty data."""
@@ -103,6 +138,44 @@ class TestConfluencePage:
 
         # URL should be included
         assert "url" in simplified
+
+    def test_to_simplified_dict_includes_version_author_and_date(
+        self, confluence_page_data
+    ):
+        """Test that version author and ISO 8601 timestamp are surfaced."""
+        page = ConfluencePage.from_api_response(confluence_page_data)
+
+        simplified = page.to_simplified_dict()
+
+        assert simplified["version"] == 1
+        assert simplified["version_author"] == "Example User (Unlicensed)"
+        assert simplified["version_date"] == "2024-01-01T09:00:00.000Z"
+
+    def test_to_simplified_dict_omits_version_details_when_absent(self):
+        """Test that version author and date are omitted when unavailable."""
+        page = ConfluencePage.from_api_response(
+            {"id": "123456", "title": "No Version Details", "version": {"number": 3}}
+        )
+
+        simplified = page.to_simplified_dict()
+
+        assert simplified["version"] == 3
+        assert "version_author" not in simplified
+        assert "version_date" not in simplified
+
+    def test_subtype_is_preserved_in_simplified_dict(self):
+        """Test that Cloud page subtypes survive model conversion."""
+        page = ConfluencePage.from_api_response(
+            {
+                "id": "live-123",
+                "title": "Live Doc",
+                "type": "page",
+                "subtype": "live",
+            }
+        )
+
+        assert page.subtype == "live"
+        assert page.to_simplified_dict()["subtype"] == "live"
 
     def test_from_api_response_with_expandable_space(self):
         """Test creating a ConfluencePage from data with space info in _expandable."""

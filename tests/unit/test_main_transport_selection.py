@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_atlassian import _run_stdio_with_stdin_guard, main
+from mcp_atlassian_with_bitbucket_and_privacy import _run_stdio_with_stdin_guard, main
 
 
 class TestMainTransportSelection:
@@ -34,9 +34,12 @@ class TestMainTransportSelection:
 
         This is a regression test for issues #519 and #524.
         """
-        with patch("mcp_atlassian.servers.main.AtlassianMCP", return_value=mock_server):
+        with patch(
+            "mcp_atlassian_with_bitbucket_and_privacy.servers.main.AtlassianMCP",
+            return_value=mock_server,
+        ):
             with patch.dict("os.environ", {"TRANSPORT": transport}):
-                with patch("sys.argv", ["mcp-atlassian"]):
+                with patch("sys.argv", ["mcp-atlassian-with-bitbucket-and-privacy"]):
                     try:
                         main()
                     except SystemExit:
@@ -53,9 +56,12 @@ class TestMainTransportSelection:
                     assert "run_async" in coro_repr or hasattr(called_coro, "cr_code")
 
     def test_stdio_transport_uses_stdin_guard(self, mock_server, mock_asyncio_run):
-        with patch("mcp_atlassian.servers.main.AtlassianMCP", return_value=mock_server):
+        with patch(
+            "mcp_atlassian_with_bitbucket_and_privacy.servers.main.AtlassianMCP",
+            return_value=mock_server,
+        ):
             with patch.dict("os.environ", {"TRANSPORT": "stdio"}):
-                with patch("sys.argv", ["mcp-atlassian"]):
+                with patch("sys.argv", ["mcp-atlassian-with-bitbucket-and-privacy"]):
                     try:
                         main()
                     except SystemExit:
@@ -69,7 +75,7 @@ class TestMainTransportSelection:
     @pytest.mark.parametrize("stateless", ["False", "True"])
     def test_stateless_set(self, mock_asyncio_run, stateless):
         """Verify that stateless_http is passed to run_async via run_kwargs."""
-        from mcp_atlassian.servers import main_mcp
+        from mcp_atlassian_with_bitbucket_and_privacy.servers import main_mcp
 
         with patch.object(
             main_mcp, "run_async", new_callable=AsyncMock
@@ -78,7 +84,7 @@ class TestMainTransportSelection:
                 "os.environ",
                 {"STATELESS": stateless, "TRANSPORT": "streamable-http"},
             ):
-                with patch("sys.argv", ["mcp-atlassian"]):
+                with patch("sys.argv", ["mcp-atlassian-with-bitbucket-and-privacy"]):
                     try:
                         main()
                     except SystemExit:
@@ -96,7 +102,7 @@ class TestMainTransportSelection:
     def test_stateless_rejects_non_streamable_http(self, mock_asyncio_run, transport):
         """Verify that --stateless flag errors when used with non-streamable-http transport."""
         with patch.dict("os.environ", {"STATELESS": "true", "TRANSPORT": transport}):
-            with patch("sys.argv", ["mcp-atlassian"]):
+            with patch("sys.argv", ["mcp-atlassian-with-bitbucket-and-privacy"]):
                 with pytest.raises(SystemExit) as exc_info:
                     main()
 
@@ -105,10 +111,20 @@ class TestMainTransportSelection:
 
     def test_cli_overrides_env_transport(self, mock_server, mock_asyncio_run):
         """Test that CLI transport argument overrides environment variable."""
-        with patch("mcp_atlassian.servers.main.AtlassianMCP", return_value=mock_server):
+        with patch(
+            "mcp_atlassian_with_bitbucket_and_privacy.servers.main.AtlassianMCP",
+            return_value=mock_server,
+        ):
             with patch.dict("os.environ", {"TRANSPORT": "sse"}):
                 # Simulate CLI args with --transport stdio
-                with patch("sys.argv", ["mcp-atlassian", "--transport", "stdio"]):
+                with patch(
+                    "sys.argv",
+                    [
+                        "mcp-atlassian-with-bitbucket-and-privacy",
+                        "--transport",
+                        "stdio",
+                    ],
+                ):
                     try:
                         main()
                     except SystemExit:
@@ -136,10 +152,12 @@ class TestMainTransportSelection:
             await server_started.wait()
 
         with patch(
-            "mcp_atlassian.servers.main_mcp.run_async", side_effect=fake_run_async
+            "mcp_atlassian_with_bitbucket_and_privacy.servers.main_mcp.run_async",
+            side_effect=fake_run_async,
         ):
             with patch(
-                "mcp_atlassian._watch_parent_exit", side_effect=fake_watch_parent
+                "mcp_atlassian_with_bitbucket_and_privacy._watch_parent_exit",
+                side_effect=fake_watch_parent,
             ):
                 await _run_stdio_with_stdin_guard({"transport": "stdio"})
 
@@ -147,12 +165,19 @@ class TestMainTransportSelection:
 
     def test_signal_handlers_always_setup(self, mock_server):
         """Test that signal handlers are set up regardless of transport."""
-        with patch("mcp_atlassian.servers.main.AtlassianMCP", return_value=mock_server):
+        with patch(
+            "mcp_atlassian_with_bitbucket_and_privacy.servers.main.AtlassianMCP",
+            return_value=mock_server,
+        ):
             with patch("asyncio.run"):
                 # Patch where it's imported in the main module
-                with patch("mcp_atlassian.setup_signal_handlers") as mock_setup:
+                with patch(
+                    "mcp_atlassian_with_bitbucket_and_privacy.setup_signal_handlers"
+                ) as mock_setup:
                     with patch.dict("os.environ", {"TRANSPORT": "stdio"}):
-                        with patch("sys.argv", ["mcp-atlassian"]):
+                        with patch(
+                            "sys.argv", ["mcp-atlassian-with-bitbucket-and-privacy"]
+                        ):
                             try:
                                 main()
                             except SystemExit:
@@ -171,13 +196,18 @@ class TestMainTransportSelection:
 
         mock_server.run_async = failing_run_async
 
-        with patch("mcp_atlassian.servers.main.AtlassianMCP", return_value=mock_server):
+        with patch(
+            "mcp_atlassian_with_bitbucket_and_privacy.servers.main.AtlassianMCP",
+            return_value=mock_server,
+        ):
             with patch("asyncio.run") as mock_run:
                 # Simulate the exception propagating through asyncio.run
                 mock_run.side_effect = error
 
                 with patch.dict("os.environ", {"TRANSPORT": "stdio"}):
-                    with patch("sys.argv", ["mcp-atlassian"]):
+                    with patch(
+                        "sys.argv", ["mcp-atlassian-with-bitbucket-and-privacy"]
+                    ):
                         # The main function logs the error and exits with code 1
                         with patch("sys.exit") as mock_exit:
                             main()

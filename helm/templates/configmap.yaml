@@ -1,14 +1,17 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "mcp-atlassian.fullname" . }}
+  name: {{ include "mcp-atlassian-with-bitbucket-and-privacy.fullname" . }}
   labels:
-    {{- include "mcp-atlassian.labels" . | nindent 4 }}
+    {{- include "mcp-atlassian-with-bitbucket-and-privacy.labels" . | nindent 4 }}
 data:
   {{- if .Values.confluence.enabled }}
   confluence-url: {{ .Values.confluence.url | quote }}
   {{- if .Values.confluence.spacesFilter }}
   confluence-spaces-filter: {{ .Values.confluence.spacesFilter | quote }}
+  {{- end }}
+  {{- if .Values.confluence.passthroughHeaders }}
+  confluence-passthrough-headers: {{ .Values.confluence.passthroughHeaders | quote }}
   {{- end }}
   {{- end }}
 
@@ -16,6 +19,9 @@ data:
   jira-url: {{ .Values.jira.url | quote }}
   {{- if .Values.jira.projectsFilter }}
   jira-projects-filter: {{ .Values.jira.projectsFilter | quote }}
+  {{- end }}
+  {{- if .Values.jira.passthroughHeaders }}
+  jira-passthrough-headers: {{ .Values.jira.passthroughHeaders | quote }}
   {{- end }}
   {{- end }}
 

@@ -4,9 +4,9 @@ from datetime import datetime, timezone
 
 import pytest
 
-from mcp_atlassian.jira import JiraFetcher
-from mcp_atlassian.jira.metrics import MetricsMixin
-from mcp_atlassian.models.jira.metrics import (
+from mcp_atlassian_with_bitbucket_and_privacy.jira import JiraFetcher
+from mcp_atlassian_with_bitbucket_and_privacy.jira.metrics import MetricsMixin
+from mcp_atlassian_with_bitbucket_and_privacy.models.jira.metrics import (
     IssueDatesBatchResponse,
     IssueDatesResponse,
     StatusChangeEntry,

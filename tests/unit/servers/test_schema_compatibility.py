@@ -14,7 +14,10 @@ import json
 import pytest
 from mcp.types import Tool as MCPTool
 
-from mcp_atlassian.servers.main import _sanitize_schema_for_compatibility, main_mcp
+from mcp_atlassian_with_bitbucket_and_privacy.servers.main import (
+    _sanitize_schema_for_compatibility,
+    main_mcp,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -25,7 +28,7 @@ from mcp_atlassian.servers.main import _sanitize_schema_for_compatibility, main_
 def all_tool_schemas() -> dict[str, dict]:
     """Load and sanitize all tool schemas from both Jira and Confluence servers.
 
-    Uses ``main_mcp.get_tools()`` to get prefixed tool names (e.g.,
+    Uses ``main_mcp.list_tools()`` to get prefixed tool names (e.g.,
     ``jira_get_issue``, ``confluence_get_page``) and applies the same
     ``_sanitize_schema_for_compatibility`` transform that the production
     ``_list_tools_mcp`` method uses.  No Atlassian credentials are needed
@@ -34,9 +37,10 @@ def all_tool_schemas() -> dict[str, dict]:
     import asyncio
 
     async def _load() -> dict[str, dict]:
-        tools = await main_mcp.get_tools()
+        tools = await main_mcp.list_tools()
         schemas: dict[str, dict] = {}
-        for name, tool_obj in tools.items():
+        for tool_obj in tools:
+            name = tool_obj.name
             mcp_tool = tool_obj.to_mcp_tool(name=name)
             _sanitize_schema_for_compatibility(mcp_tool)
             schemas[name] = mcp_tool.inputSchema
@@ -63,8 +67,8 @@ def _get_tool_names() -> list[str]:
     import asyncio
 
     async def _load() -> list[str]:
-        tools = await main_mcp.get_tools()
-        return sorted(tools.keys())
+        tools = await main_mcp.list_tools()
+        return sorted(tool.name for tool in tools)
 
     # Use asyncio.run() which creates a fresh event loop
     # This is safe at collection time (before any test event loop exists)
@@ -213,6 +217,34 @@ class TestSanitizeSchemaForCompatibility:
         assert prop["type"] == "boolean"
         assert "anyOf" not in prop
 
+    def test_flattens_nested_nullable_string(self) -> None:
+        """FastMCP 3 can emit nested nullable unions on Python 3.10."""
+        tool = self._make_tool(
+            {
+                "project_key": {
+                    "anyOf": [
+                        {
+                            "anyOf": [
+                                {"type": "string", "pattern": "^[A-Z][A-Z0-9_]+$"},
+                                {"type": "null"},
+                            ],
+                            "description": "Inner description",
+                        },
+                        {"type": "null"},
+                    ],
+                    "default": None,
+                    "description": "Outer description",
+                }
+            }
+        )
+        _sanitize_schema_for_compatibility(tool)
+        prop = tool.inputSchema["properties"]["project_key"]
+        assert prop["type"] == "string"
+        assert prop["pattern"] == "^[A-Z][A-Z0-9_]+$"
+        assert "anyOf" not in prop
+        assert prop["default"] is None
+        assert prop["description"] == "Outer description"
+
     def test_preserves_non_nullable_property(self) -> None:
         """Properties without ``anyOf`` are untouched."""
         tool = self._make_tool(
@@ -283,35 +315,45 @@ class TestNarrowedParameterRegression:
 
     def test_parse_additional_fields_accepts_dict(self) -> None:
         """Backward compat: ``_parse_additional_fields`` still handles dict."""
-        from mcp_atlassian.servers.jira import _parse_additional_fields
+        from mcp_atlassian_with_bitbucket_and_privacy.servers.jira import (
+            _parse_additional_fields,
+        )
 
         result = _parse_additional_fields({"priority": {"name": "High"}})
         assert result == {"priority": {"name": "High"}}
 
     def test_parse_additional_fields_accepts_string(self) -> None:
         """New path: ``_parse_additional_fields`` handles JSON string."""
-        from mcp_atlassian.servers.jira import _parse_additional_fields
+        from mcp_atlassian_with_bitbucket_and_privacy.servers.jira import (
+            _parse_additional_fields,
+        )
 
         result = _parse_additional_fields('{"labels": ["ai", "test"]}')
         assert result == {"labels": ["ai", "test"]}
 
     def test_parse_additional_fields_accepts_none(self) -> None:
         """``None`` returns empty dict."""
-        from mcp_atlassian.servers.jira import _parse_additional_fields
+        from mcp_atlassian_with_bitbucket_and_privacy.servers.jira import (
+            _parse_additional_fields,
+        )
 
         result = _parse_additional_fields(None)
         assert result == {}
 
     def test_parse_additional_fields_rejects_invalid_json(self) -> None:
         """Invalid JSON string raises ``ValueError``."""
-        from mcp_atlassian.servers.jira import _parse_additional_fields
+        from mcp_atlassian_with_bitbucket_and_privacy.servers.jira import (
+            _parse_additional_fields,
+        )
 
         with pytest.raises(ValueError, match="not valid JSON"):
             _parse_additional_fields("{invalid")
 
     def test_parse_additional_fields_rejects_non_dict_json(self) -> None:
         """JSON array raises ``ValueError``."""
-        from mcp_atlassian.servers.jira import _parse_additional_fields
+        from mcp_atlassian_with_bitbucket_and_privacy.servers.jira import (
+            _parse_additional_fields,
+        )
 
         with pytest.raises(ValueError, match="not a JSON object"):
             _parse_additional_fields('["a", "b"]')
@@ -354,3 +396,53 @@ class TestNarrowedParameterRegression:
         csv = "./file1.pdf, ./file2.png"
         result = [p.strip() for p in csv.split(",") if p.strip()]
         assert result == ["./file1.pdf", "./file2.png"]
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for set_page_restrictions array-parameter schema (issue #1455)
+# ---------------------------------------------------------------------------
+
+
+class TestSetPageRestrictionsArraySchema:
+    """Regression: VS Code Agent mode rejects tools whose array-typed parameters
+    lack an ``items`` definition in the JSON schema (issue #1455).
+
+    These tests guard the fix in
+    ``src.mcp_atlassian_with_bitbucket_and_privacy.servers.confluence.set_page_restrictions`` which
+    adds ``json_schema_extra={"items": {"type": "string"}}`` to each of the
+    four list parameters (read_users, read_groups, edit_users, edit_groups).
+    """
+
+    TOOL_NAME = "confluence_set_page_restrictions"
+    LIST_PARAM_NAMES = ("read_users", "read_groups", "edit_users", "edit_groups")
+
+    def test_tool_present(self, all_tool_schemas: dict[str, dict]) -> None:
+        """The tool must be discoverable in the main MCP server."""
+        assert self.TOOL_NAME in all_tool_schemas, (
+            f"Tool {self.TOOL_NAME!r} is missing from the registered tools"
+        )
+
+    @pytest.mark.parametrize("param_name", LIST_PARAM_NAMES)
+    def test_list_param_has_items_definition(
+        self, param_name: str, all_tool_schemas: dict[str, dict]
+    ) -> None:
+        """Each list-typed parameter must declare an ``items`` schema.
+
+        VS Code's MCP tool validator refuses to register a tool whose array
+        parameter is missing ``items`` (``tool parameters array type must
+        have items``).  Without this, the entire ``confluence_set_page_restrictions``
+        tool is rejected and VS Code cannot enter Agent mode.
+        """
+        schema = all_tool_schemas[self.TOOL_NAME]
+        properties = schema.get("properties", {})
+        assert param_name in properties, (
+            f"Parameter {param_name!r} is missing from the tool schema"
+        )
+        prop = properties[param_name]
+        assert "items" in prop, (
+            f"Parameter {param_name!r} is missing required 'items' field "
+            f"(regression of issue #1455: VS Code Agent mode cannot start)"
+        )
+        assert prop["items"] == {"type": "string"}, (
+            f"Parameter {param_name!r} has unexpected 'items' schema: {prop['items']!r}"
+        )
