@@ -4387,6 +4387,24 @@ async def test_get_issue_include_worklogs(jira_client, mock_jira_fetcher):
 
 
 @pytest.mark.anyio
+async def test_get_issue_include_worklogs_blocked_without_worklog_toolset(
+    jira_client, mock_jira_fetcher, monkeypatch
+):
+    """include=worklogs must not bypass a disabled jira_worklog toolset."""
+    monkeypatch.setenv("TOOLSETS", "jira_issues")
+    mock_jira_fetcher.get_worklogs.return_value = [{"id": "10001"}]
+
+    response = await jira_client.call_tool(
+        "jira_get_issue",
+        {"issue_key": "TEST-123", "include": "worklogs"},
+    )
+    content = json.loads(response.content[0].text)
+    assert content["worklogs"] == []
+    assert "jira_worklog" in content["worklogs_unavailable"]
+    mock_jira_fetcher.get_worklogs.assert_not_called()
+
+
+@pytest.mark.anyio
 async def test_get_issue_include_epic_summary_on_epic(jira_client, mock_jira_fetcher):
     """include=epic_summary aggregates children when the issue is an Epic."""
     mock_jira_fetcher._is_epic_issue_type.return_value = True
