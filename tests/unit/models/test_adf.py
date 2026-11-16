@@ -6,11 +6,17 @@ including handling of various inline and block node types,
 and the reverse conversion from Markdown to ADF.
 """
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.mcp_atlassian.models.jira.adf import adf_to_text, markdown_to_adf
+from src.mcp_atlassian_with_bitbucket_and_privacy.models.jira.adf import (
+    adf_to_text,
+    extract_top_level_media_nodes,
+    markdown_to_adf,
+    merge_adf_with_preserved_media,
+)
 
 
 class TestAdfToText:
@@ -137,7 +143,10 @@ class TestAdfToText:
         mock_dt.fromtimestamp.side_effect = OverflowError(
             "timestamp too large to convert to C _PyTime_t"
         )
-        with patch("src.mcp_atlassian.models.jira.adf.datetime", mock_dt):
+        with patch(
+            "src.mcp_atlassian_with_bitbucket_and_privacy.models.jira.adf.datetime",
+            mock_dt,
+        ):
             result = adf_to_text(node)
             assert result == "253402300799000"
 
@@ -433,6 +442,135 @@ class TestMarkdownToAdf:
         link_mark = next(m for m in link_nodes[0]["marks"] if m["type"] == "link")
         assert link_mark["attrs"]["href"] == "https://example.com"
 
+    # -- Mentions -----------------------------------------------------------
+
+    def test_mention_modern_account_id(self):
+        """[~accountid:712020:UUID] emits an ADF mention node with id attr."""
+        account_id = "712020:1cfc6d16-950f-4096-8e57-f2c6c60d8ffa"
+        result = markdown_to_adf(f"[~accountid:{account_id}]")
+        para = result["content"][0]
+        mentions = [n for n in para["content"] if n["type"] == "mention"]
+        assert len(mentions) == 1
+        assert mentions[0]["attrs"]["id"] == account_id
+
+    def test_mention_legacy_account_id(self):
+        """[~accountid:24-hex] (no 712020: prefix) is also accepted."""
+        account_id = "6315cc7b3310c2492b5b1513"
+        result = markdown_to_adf(f"[~accountid:{account_id}]")
+        para = result["content"][0]
+        mentions = [n for n in para["content"] if n["type"] == "mention"]
+        assert len(mentions) == 1
+        assert mentions[0]["attrs"]["id"] == account_id
+
+    def test_mention_display_name_account_id(self) -> None:
+        """@[Name](accountid:...) emits an ADF mention node with text attr."""
+        account_id = "712020:abc-123-def-456"
+        result = markdown_to_adf(f"@[John Doe](accountid:{account_id})")
+        para = result["content"][0]
+        mentions = [n for n in para["content"] if n["type"] == "mention"]
+        assert len(mentions) == 1
+        assert mentions[0]["attrs"] == {
+            "id": account_id,
+            "text": "@John Doe",
+        }
+
+    def test_mention_display_name_inline_with_link(self) -> None:
+        """Display-name mentions coexist with normal Markdown links."""
+        account_id = "712020:abc-def"
+        result = markdown_to_adf(
+            f"Ask @[Jane Doe](accountid:{account_id}) via "
+            "[the runbook](https://example.com)."
+        )
+        para = result["content"][0]
+        mentions = [n for n in para["content"] if n["type"] == "mention"]
+        links = [
+            n
+            for n in para["content"]
+            if n["type"] == "text"
+            and any(m["type"] == "link" for m in n.get("marks", []))
+        ]
+
+        assert len(mentions) == 1
+        assert mentions[0]["attrs"]["id"] == account_id
+        assert mentions[0]["attrs"]["text"] == "@Jane Doe"
+        assert len(links) == 1
+        assert links[0]["text"] == "the runbook"
+
+    def test_mixed_mention_syntaxes_in_one_paragraph(self) -> None:
+        """Both supported mention syntaxes can appear in the same paragraph."""
+        first = "712020:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        second = "712020:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        result = markdown_to_adf(f"@[Ada](accountid:{first}) and [~accountid:{second}]")
+        para = result["content"][0]
+        mentions = [n for n in para["content"] if n["type"] == "mention"]
+
+        assert [n["attrs"]["id"] for n in mentions] == [first, second]
+        assert mentions[0]["attrs"]["text"] == "@Ada"
+        assert "text" not in mentions[1]["attrs"]
+
+    def test_mention_inline_with_surrounding_text(self):
+        """Mention preserves surrounding text nodes in the same paragraph."""
+        account_id = "712020:abc-def"
+        result = markdown_to_adf(f"hi [~accountid:{account_id}] please review")
+        para = result["content"][0]
+        types_in_order = [n["type"] for n in para["content"]]
+        assert types_in_order == ["text", "mention", "text"]
+        assert para["content"][0]["text"] == "hi "
+        assert para["content"][1]["attrs"]["id"] == account_id
+        assert para["content"][2]["text"] == " please review"
+
+    def test_mention_does_not_swallow_regular_link(self):
+        """[text](url) without the ~accountid: marker stays a link, not a mention."""
+        result = markdown_to_adf("[click](https://example.com)")
+        para = result["content"][0]
+        mentions = [n for n in para["content"] if n["type"] == "mention"]
+        links = [
+            n
+            for n in para["content"]
+            if n["type"] == "text"
+            and any(m["type"] == "link" for m in n.get("marks", []))
+        ]
+        assert mentions == []
+        assert len(links) == 1
+
+    def test_multiple_mentions_in_one_paragraph(self):
+        """Several mentions in one line each get their own mention node."""
+        a = "712020:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        b = "712020:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        result = markdown_to_adf(f"[~accountid:{a}] and [~accountid:{b}]")
+        para = result["content"][0]
+        mention_ids = [
+            n["attrs"]["id"] for n in para["content"] if n["type"] == "mention"
+        ]
+        assert mention_ids == [a, b]
+
+    @pytest.mark.parametrize(
+        ("issue_key", "should_link"),
+        [
+            ("PROJ-123", True),
+            ("B7-214-68901", True),
+            ("B7-214--68901", False),
+            ("B7-214-68901A", False),
+        ],
+    )
+    def test_jira_issue_key_links_to_browse_url(
+        self, issue_key: str, should_link: bool
+    ) -> None:
+        """Valid Jira issue keys become links without matching malformed keys."""
+        result = markdown_to_adf(
+            f"Blocked by {issue_key}.",
+            jira_base_url="https://jira.example.com/",
+        )
+        para = result["content"][0]
+        issue_node = next(n for n in para["content"] if issue_key in n.get("text", ""))
+        link_marks = [m for m in issue_node.get("marks", []) if m["type"] == "link"]
+        if should_link:
+            assert link_marks[0]["attrs"]["href"] == (
+                f"https://jira.example.com/browse/{issue_key}"
+            )
+        else:
+            assert not link_marks
+
     # -- Code blocks --------------------------------------------------------
 
     def test_code_block_with_lang(self):
@@ -478,6 +616,59 @@ class TestMarkdownToAdf:
             assert item["type"] == "listItem"
             assert item["content"][0]["type"] == "paragraph"
 
+    @pytest.mark.parametrize(
+        "md",
+        [
+            "1. first\n\n2. second\n\n3. third",
+            "1. first\n\n1. second\n\n1. third",
+        ],
+    )
+    def test_ordered_list_with_blank_lines(self, md: str) -> None:
+        """Blank lines between items keep one loose ordered list."""
+        result = markdown_to_adf(md)
+        ordered_lists = [
+            node for node in result["content"] if node["type"] == "orderedList"
+        ]
+
+        assert len(ordered_lists) == 1
+        assert len(ordered_lists[0]["content"]) == 3
+
+    def test_task_list_checked(self):
+        """- [x] items produce a taskList with taskItem state=DONE."""
+        md = "- [x] done task"
+        result = markdown_to_adf(md)
+        tl = next(n for n in result["content"] if n["type"] == "taskList")
+        assert len(tl["content"]) == 1
+        item = tl["content"][0]
+        assert item["type"] == "taskItem"
+        assert item["attrs"]["state"] == "DONE"
+        assert item["content"][0]["text"] == "done task"
+
+    def test_task_list_unchecked(self):
+        """- [ ] items produce a taskList with taskItem state=TODO."""
+        md = "- [ ] pending task"
+        result = markdown_to_adf(md)
+        tl = next(n for n in result["content"] if n["type"] == "taskList")
+        item = tl["content"][0]
+        assert item["attrs"]["state"] == "TODO"
+
+    def test_task_list_mixed(self):
+        """Mixed checked/unchecked items in one taskList."""
+        md = "- [x] done\n- [ ] todo\n- [X] also done"
+        result = markdown_to_adf(md)
+        tl = next(n for n in result["content"] if n["type"] == "taskList")
+        assert len(tl["content"]) == 3
+        assert tl["content"][0]["attrs"]["state"] == "DONE"
+        assert tl["content"][1]["attrs"]["state"] == "TODO"
+        assert tl["content"][2]["attrs"]["state"] == "DONE"
+
+    def test_task_list_not_confused_with_bullet_list(self):
+        """Regular - items without [ ] are still bulletList, not taskList."""
+        md = "- regular item"
+        result = markdown_to_adf(md)
+        assert any(n["type"] == "bulletList" for n in result["content"])
+        assert not any(n["type"] == "taskList" for n in result["content"])
+
     # -- Blockquote ---------------------------------------------------------
 
     def test_blockquote(self):
@@ -496,6 +687,40 @@ class TestMarkdownToAdf:
         result = markdown_to_adf(md)
         rule_nodes = [n for n in result["content"] if n["type"] == "rule"]
         assert len(rule_nodes) >= 1
+
+    # -- Expand/collapse block ----------------------------------------------
+
+    def test_expand_with_title(self) -> None:
+        """Expand block with title produces an expand node."""
+        md = "{expand:Details}\n* bullet one\n* bullet two\n{expand}"
+        result = markdown_to_adf(md)
+        expand = next(n for n in result["content"] if n["type"] == "expand")
+        assert expand["attrs"]["title"] == "Details"
+        assert any(n["type"] == "bulletList" for n in expand["content"])
+
+    def test_expand_without_title(self) -> None:
+        """Expand block without a title uses an empty string."""
+        md = "{expand}\nSome content\n{expand}"
+        result = markdown_to_adf(md)
+        expand = next(n for n in result["content"] if n["type"] == "expand")
+        assert expand["attrs"]["title"] == ""
+        assert any(n["type"] == "paragraph" for n in expand["content"])
+
+    def test_expand_with_nested_formatting(self) -> None:
+        """Expand block recursively parses inner markdown."""
+        md = "{expand:Steps}\n## Heading\n1. First\n1. Second\n{expand}"
+        result = markdown_to_adf(md)
+        expand = next(n for n in result["content"] if n["type"] == "expand")
+        inner_types = [n["type"] for n in expand["content"]]
+        assert "heading" in inner_types
+        assert "orderedList" in inner_types
+
+    def test_expand_preserves_surrounding_content(self) -> None:
+        """Content before and after expand block is preserved."""
+        md = "Before\n{expand:Title}\nInside\n{expand}\nAfter"
+        result = markdown_to_adf(md)
+        types = [n["type"] for n in result["content"]]
+        assert types == ["paragraph", "expand", "paragraph"]
 
     # -- Mixed formatting ---------------------------------------------------
 
@@ -551,6 +776,55 @@ class TestMarkdownToAdf:
         data_texts = [c["content"][0]["content"][0]["text"] for c in rows[1]["content"]]
         assert data_texts == ["Alice", "30"]
 
+    def test_keeps_dash_only_row(self):
+        """A later dash-only row is data, not a second delimiter.
+
+        A single "-" is a common way to write "not applicable", and dropping it
+        removes a row of real content with nothing logged.
+        """
+        md = (
+            "| Environment | Owner | Notes |\n"
+            "|---|---|---|\n"
+            "| prod | alice | migrated |\n"
+            "| - | - | - |\n"
+            "| dev | bob | migrated |"
+        )
+        rows = next(n for n in markdown_to_adf(md)["content"] if n["type"] == "table")[
+            "content"
+        ]
+        assert len(rows) == 4  # header + 3 data rows
+        texts = [
+            [c["content"][0]["content"][0]["text"] for c in row["content"]]
+            for row in rows
+        ]
+        assert texts[2] == ["-", "-", "-"]
+
+    def test_keeps_empty_row(self):
+        """An empty row after the delimiter is data, not another delimiter."""
+        md = "| A | B |\n|---|---|\n| 1 | 2 |\n|  |  |\n| 3 | 4 |"
+        rows = next(n for n in markdown_to_adf(md)["content"] if n["type"] == "table")[
+            "content"
+        ]
+        texts = [
+            [c["content"][0]["content"][0]["text"] for c in row["content"]]
+            for row in rows
+        ]
+        assert texts == [["A", "B"], ["1", "2"], ["", ""], ["3", "4"]]
+
+    def test_drops_delimiter_row(self):
+        """Every delimiter spelling stays recognised at its own position."""
+        for separator in ("|---|---|", "|:---|---:|", "|-|-|", "|:-:|:-:|"):
+            md = f"| A | B |\n{separator}\n| 1 | 2 |"
+            rows = next(
+                n for n in markdown_to_adf(md)["content"] if n["type"] == "table"
+            )["content"]
+            assert len(rows) == 2, f"{separator} was not treated as a delimiter"
+            texts = [
+                [c["content"][0]["content"][0]["text"] for c in row["content"]]
+                for row in rows
+            ]
+            assert texts == [["A", "B"], ["1", "2"]]
+
     def test_table_with_inline_formatting(self):
         """Table cells preserve inline formatting (bold, code)."""
         md = "| Feature | Status |\n|---|---|\n| **Auth** | `done` |"
@@ -605,6 +879,239 @@ class TestMarkdownToAdf:
             assert word in text_back
 
 
+class TestAdfMediaPreservation:
+    """Tests for preserving existing media nodes during description rewrites."""
+
+    def test_extract_top_level_media_nodes(self):
+        """Media blocks are extracted from the document root."""
+        media_single = {
+            "type": "mediaSingle",
+            "attrs": {"layout": "center"},
+            "content": [
+                {
+                    "type": "media",
+                    "attrs": {
+                        "id": "video-123",
+                        "type": "file",
+                        "collection": "",
+                    },
+                }
+            ],
+        }
+        adf = {
+            "version": 1,
+            "type": "doc",
+            "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "Intro"}]},
+                media_single,
+            ],
+        }
+
+        extracted = extract_top_level_media_nodes(adf)
+
+        assert extracted == [media_single]
+
+    def test_merge_adf_with_preserved_media_appends_media_blocks(self):
+        """Existing media blocks are preserved in the outgoing ADF document."""
+        media_single = {
+            "type": "mediaSingle",
+            "attrs": {"layout": "center"},
+            "content": [
+                {
+                    "type": "media",
+                    "attrs": {
+                        "id": "video-123",
+                        "type": "file",
+                        "collection": "",
+                    },
+                }
+            ],
+        }
+        source_adf = {
+            "version": 1,
+            "type": "doc",
+            "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "Old"}]},
+                media_single,
+            ],
+        }
+        target_adf = markdown_to_adf("Updated text")
+
+        merged = merge_adf_with_preserved_media(target_adf, source_adf)
+
+        assert merged["content"][-1] == media_single
+        assert merged["content"][0]["type"] == "paragraph"
+
+    def test_merge_adf_with_preserved_media_skips_duplicates(self):
+        """Media nodes already present in the target are not duplicated."""
+        media_single = {
+            "type": "mediaSingle",
+            "attrs": {"layout": "center"},
+            "content": [
+                {
+                    "type": "media",
+                    "attrs": {
+                        "id": "video-123",
+                        "type": "file",
+                        "collection": "",
+                    },
+                }
+            ],
+        }
+        target_adf = {
+            "version": 1,
+            "type": "doc",
+            "content": [media_single],
+        }
+        source_adf = {
+            "version": 1,
+            "type": "doc",
+            "content": [media_single],
+        }
+
+        merged = merge_adf_with_preserved_media(target_adf, source_adf)
+
+        assert merged["content"] == [media_single]
+
+
+class TestMarkdownToAdfPanels:
+    """Tests for panel node support in markdown_to_adf."""
+
+    def _assert_valid_adf(self, result: dict[str, Any]) -> None:
+        """Helper: assert the result is a valid ADF document."""
+        assert result["version"] == 1
+        assert result["type"] == "doc"
+        assert isinstance(result["content"], list)
+
+    @pytest.mark.parametrize(
+        "panel_type",
+        ["note", "info", "warning", "success", "error"],
+        ids=["note", "info", "warning", "success", "error"],
+    )
+    def test_all_valid_panel_types(self, panel_type: str) -> None:
+        """All five valid panel types produce a panel node."""
+        result = markdown_to_adf(f":::{panel_type}\ntext\n:::")
+        self._assert_valid_adf(result)
+        assert result["content"][0]["type"] == "panel"
+        assert result["content"][0]["attrs"]["panelType"] == panel_type
+
+    def test_panel_content_is_paragraph(self) -> None:
+        """Panel body text becomes a paragraph node inside the panel."""
+        result = markdown_to_adf(":::note\nThis is a note.\n:::")
+        panel = result["content"][0]
+        assert panel["type"] == "panel"
+        assert panel["content"][0]["type"] == "paragraph"
+
+    def test_panel_with_nested_heading_and_list(self) -> None:
+        """Panel content supports nested headings and bullet lists."""
+        result = markdown_to_adf(":::info\n## Title\n- item 1\n- item 2\n:::")
+        panel = result["content"][0]
+        assert panel["type"] == "panel"
+        assert panel["attrs"]["panelType"] == "info"
+        inner_types = [n["type"] for n in panel["content"]]
+        assert "heading" in inner_types
+        assert "bulletList" in inner_types
+
+    def test_invalid_panel_type_falls_through_as_paragraph(self) -> None:
+        """Unknown panel type (:::custom) is not converted to a panel node."""
+        result = markdown_to_adf(":::custom\nsome text\n:::")
+        types = [n["type"] for n in result["content"]]
+        assert "panel" not in types
+
+    def test_panel_mixed_with_other_content(self) -> None:
+        """Panel can appear alongside headings and lists in a document."""
+        result = markdown_to_adf("## Heading\n\n:::note\nA note.\n:::\n\n- list item")
+        types = [n["type"] for n in result["content"]]
+        assert types == ["heading", "panel", "bulletList"]
+
+
+class TestMarkdownToAdfStatus:
+    """Tests for inline status lozenge support in markdown_to_adf."""
+
+    def _inline_nodes(self, markdown: str) -> list[dict[str, Any]]:
+        """Helper: return the inline nodes of the first paragraph."""
+        result = markdown_to_adf(markdown)
+        return result["content"][0]["content"]
+
+    @pytest.mark.parametrize(
+        "color",
+        ["neutral", "purple", "blue", "red", "yellow", "green"],
+    )
+    def test_all_valid_colors(self, color: str) -> None:
+        """Every supported color is passed through to the status node."""
+        nodes = self._inline_nodes(f"{{status:color={color}|title=Done}}")
+        assert nodes[0]["type"] == "status"
+        assert nodes[0]["attrs"] == {"text": "Done", "color": color, "style": ""}
+
+    def test_color_is_optional(self) -> None:
+        """Omitting color defaults to neutral."""
+        nodes = self._inline_nodes("{status:title=In Progress}")
+        assert nodes[0]["type"] == "status"
+        assert nodes[0]["attrs"]["color"] == "neutral"
+        assert nodes[0]["attrs"]["text"] == "In Progress"
+
+    def test_unknown_color_becomes_neutral(self) -> None:
+        """An unrecognized color does not produce an invalid ADF node."""
+        nodes = self._inline_nodes("{status:color=chartreuse|title=Blocked}")
+        assert nodes[0]["attrs"]["color"] == "neutral"
+        assert nodes[0]["attrs"]["text"] == "Blocked"
+
+    def test_color_is_case_insensitive(self) -> None:
+        """Color matching is not case sensitive."""
+        nodes = self._inline_nodes("{status:color=GREEN|title=Done}")
+        assert nodes[0]["attrs"]["color"] == "green"
+
+    def test_status_alongside_surrounding_text(self) -> None:
+        """Text before and after a lozenge is preserved."""
+        nodes = self._inline_nodes("Ticket is {status:color=green|title=Done} now")
+        assert [n["type"] for n in nodes] == ["text", "status", "text"]
+        assert nodes[0]["text"] == "Ticket is "
+        assert nodes[2]["text"] == " now"
+
+    def test_multiple_statuses_in_one_line(self) -> None:
+        """Several lozenges can appear in the same paragraph."""
+        nodes = self._inline_nodes(
+            "{status:color=red|title=Blocked} then {status:color=green|title=Done}"
+        )
+        statuses = [n for n in nodes if n["type"] == "status"]
+        assert [s["attrs"]["text"] for s in statuses] == ["Blocked", "Done"]
+        assert [s["attrs"]["color"] for s in statuses] == ["red", "green"]
+
+    def test_status_with_inline_formatting(self) -> None:
+        """Lozenges coexist with bold and inline code."""
+        nodes = self._inline_nodes("**bold** {status:color=blue|title=Review} `code`")
+        types = [n["type"] for n in nodes]
+        assert "status" in types
+        assert any(n.get("marks") == [{"type": "strong"}] for n in nodes)
+        assert any(n.get("marks") == [{"type": "code"}] for n in nodes)
+
+    def test_backticked_status_stays_literal(self) -> None:
+        """A lozenge inside inline code is not converted."""
+        nodes = self._inline_nodes("`{status:color=red|title=Blocked}`")
+        assert [n["type"] for n in nodes] == ["text"]
+        assert nodes[0]["marks"] == [{"type": "code"}]
+        assert nodes[0]["text"] == "{status:color=red|title=Blocked}"
+
+    def test_malformed_status_is_left_as_text(self) -> None:
+        """A lozenge missing its title is not converted."""
+        nodes = self._inline_nodes("{status:color=red}")
+        assert all(n["type"] != "status" for n in nodes)
+
+    def test_status_in_list_item(self) -> None:
+        """Lozenges work inside list items, not just paragraphs."""
+        result = markdown_to_adf("- item {status:color=yellow|title=WIP}")
+        item = result["content"][0]["content"][0]
+        inline = item["content"][0]["content"]
+        assert any(n["type"] == "status" for n in inline)
+
+    def test_round_trip_through_adf_to_text(self) -> None:
+        """A written lozenge is readable again via the ADF read path."""
+        adf = markdown_to_adf("Rollout is {status:color=green|title=Done} today")
+        text = adf_to_text(adf)
+        assert "[Done]" in text
+        assert "Rollout is" in text
+
+
 class TestMarkdownToJiraDispatch:
     """Tests for _markdown_to_jira Cloud/Server dispatch."""
 
@@ -612,13 +1119,17 @@ class TestMarkdownToJiraDispatch:
     def cloud_client(self):
         """Create a mock JiraClient configured for Cloud."""
         with patch("atlassian.Jira"):
-            from mcp_atlassian.jira.client import JiraClient
+            from mcp_atlassian_with_bitbucket_and_privacy.jira.client import JiraClient
 
             client = MagicMock(spec=JiraClient)
             client.config = MagicMock()
             client.config.is_cloud = True
             client.preprocessor = MagicMock()
-            # Bind the real method to the mock
+            # Bind the real method and its class-level regex to the mock — a
+            # spec'd MagicMock does not forward non-method class attributes,
+            # so an unbound _MD_IMAGE_RE would resolve to a truthy Mock and
+            # make every image-detection check spuriously match.
+            client._MD_IMAGE_RE = JiraClient._MD_IMAGE_RE
             client._markdown_to_jira = JiraClient._markdown_to_jira.__get__(
                 client, JiraClient
             )
@@ -628,7 +1139,7 @@ class TestMarkdownToJiraDispatch:
     def server_client(self):
         """Create a mock JiraClient configured for Server/DC."""
         with patch("atlassian.Jira"):
-            from mcp_atlassian.jira.client import JiraClient
+            from mcp_atlassian_with_bitbucket_and_privacy.jira.client import JiraClient
 
             client = MagicMock(spec=JiraClient)
             client.config = MagicMock()

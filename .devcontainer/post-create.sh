@@ -8,7 +8,7 @@ set -xe
 sudo uv pip install --system -e . --group dev
 
 # Fix git safe.directory for Windows mounts
-git config --global --add safe.directory /workspaces/mcp-atlassian
+git config --global --add safe.directory /workspaces/mcp-atlassian-with-bitbucket
 
 # Install GitHub CLI
 echo "Installing GitHub CLI..."

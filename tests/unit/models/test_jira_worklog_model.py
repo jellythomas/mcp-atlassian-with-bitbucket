@@ -4,11 +4,11 @@ Tests for Jira worklog and timetracking Pydantic models.
 Tests for JiraWorklog and JiraTimetracking models.
 """
 
-from mcp_atlassian.models.constants import (
+from mcp_atlassian_with_bitbucket_and_privacy.models.constants import (
     EMPTY_STRING,
     JIRA_DEFAULT_ID,
 )
-from mcp_atlassian.models.jira import (
+from mcp_atlassian_with_bitbucket_and_privacy.models.jira import (
     JiraTimetracking,
     JiraWorklog,
 )

@@ -5,10 +5,15 @@ from unittest.mock import PropertyMock, patch
 
 import pytest
 
-from mcp_atlassian.confluence.client import ConfluenceClient
-from mcp_atlassian.confluence.config import ConfluenceConfig
-from mcp_atlassian.exceptions import MCPAtlassianAuthenticationError
-from mcp_atlassian.utils.oauth import BYOAccessTokenOAuthConfig, OAuthConfig
+from mcp_atlassian_with_bitbucket_and_privacy.confluence.client import ConfluenceClient
+from mcp_atlassian_with_bitbucket_and_privacy.confluence.config import ConfluenceConfig
+from mcp_atlassian_with_bitbucket_and_privacy.exceptions import (
+    MCPAtlassianAuthenticationError,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.utils.oauth import (
+    BYOAccessTokenOAuthConfig,
+    OAuthConfig,
+)
 
 
 class TestConfluenceClientOAuth:
@@ -37,15 +42,17 @@ class TestConfluenceClientOAuth:
 
         # Mock dependencies
         with (
-            patch("mcp_atlassian.confluence.client.Confluence") as mock_confluence,
             patch(
-                "mcp_atlassian.confluence.client.configure_oauth_session"
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.Confluence"
+            ) as mock_confluence,
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_oauth_session"
             ) as mock_configure_oauth,
             patch(
-                "mcp_atlassian.confluence.client.configure_ssl_verification"
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_ssl_verification"
             ) as mock_configure_ssl,
             patch(
-                "mcp_atlassian.preprocessing.confluence.ConfluencePreprocessor"
+                "mcp_atlassian_with_bitbucket_and_privacy.preprocessing.confluence.ConfluencePreprocessor"
             ) as mock_preprocessor,
             patch.object(
                 OAuthConfig,
@@ -78,6 +85,10 @@ class TestConfluenceClientOAuth:
 
             # Verify SSL verification was configured
             mock_configure_ssl.assert_called_once()
+            assert (
+                mock_configure_ssl.call_args.kwargs["url"]
+                == f"https://api.atlassian.com/ex/confluence/{oauth_config.cloud_id}"
+            )
 
             # Verify preprocessor was initialized
             assert client.preprocessor == mock_preprocessor.return_value
@@ -99,15 +110,17 @@ class TestConfluenceClientOAuth:
 
         # Mock dependencies
         with (
-            patch("mcp_atlassian.confluence.client.Confluence") as mock_confluence,
             patch(
-                "mcp_atlassian.confluence.client.configure_oauth_session"
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.Confluence"
+            ) as mock_confluence,
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_oauth_session"
             ) as mock_configure_oauth,
             patch(
-                "mcp_atlassian.confluence.client.configure_ssl_verification"
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_ssl_verification"
             ) as mock_configure_ssl,
             patch(
-                "mcp_atlassian.preprocessing.confluence.ConfluencePreprocessor"
+                "mcp_atlassian_with_bitbucket_and_privacy.preprocessing.confluence.ConfluencePreprocessor"
             ) as mock_preprocessor,
         ):
             # Configure the mock to return success for OAuth configuration
@@ -131,6 +144,10 @@ class TestConfluenceClientOAuth:
 
             # Verify SSL verification was configured
             mock_configure_ssl.assert_called_once()
+            assert (
+                mock_configure_ssl.call_args.kwargs["url"]
+                == f"https://api.atlassian.com/ex/confluence/{byo_oauth_config.cloud_id}"
+            )
 
             # Verify preprocessor was initialized
             assert client.preprocessor == mock_preprocessor.return_value
@@ -173,7 +190,7 @@ class TestConfluenceClientOAuth:
 
         # Mock dependencies with OAuth configuration failure
         with patch(
-            "mcp_atlassian.confluence.client.configure_oauth_session"
+            "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_oauth_session"
         ) as mock_configure_oauth:
             # Configure the mock to return failure for OAuth configuration
             mock_configure_oauth.return_value = False
@@ -207,7 +224,7 @@ class TestConfluenceClientOAuth:
         # or session setup fails because token is invalid.
         # The ConfluenceClient itself should raise error due to invalid oauth_config
         with patch(
-            "mcp_atlassian.confluence.client.configure_oauth_session"
+            "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_oauth_session"
         ) as mock_configure_oauth:
             mock_configure_oauth.return_value = False  # Assume it's called and fails
             with pytest.raises(
@@ -265,7 +282,7 @@ class TestConfluenceClientOAuth:
         # Mock dependencies with OAuth configuration failure
         with (
             patch(
-                "mcp_atlassian.confluence.client.configure_oauth_session"
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_oauth_session"
             ) as mock_configure_oauth,
             # Patch the methods directly on the instance, not the class
             patch.object(
@@ -318,7 +335,7 @@ class TestConfluenceClientOAuth:
         with (
             patch.dict(os.environ, env_vars, clear=True),  # Clear other env vars
             patch(
-                "mcp_atlassian.confluence.config.get_oauth_config_from_env",  # Patch the correct utility
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.config.get_oauth_config_from_env",  # Patch the correct utility
                 return_value=mock_standard_oauth_config,
             ),
             patch.object(
@@ -330,13 +347,15 @@ class TestConfluenceClientOAuth:
             patch.object(
                 mock_standard_oauth_config, "ensure_valid_token", return_value=True
             ) as mock_ensure_valid_env,
-            patch("mcp_atlassian.confluence.client.Confluence") as mock_confluence,
             patch(
-                "mcp_atlassian.confluence.client.configure_oauth_session",
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.Confluence"
+            ) as mock_confluence,
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_oauth_session",
                 return_value=True,
             ) as mock_configure_oauth,
             patch(
-                "mcp_atlassian.confluence.client.configure_ssl_verification"
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_ssl_verification"
             ) as mock_configure_ssl,
         ):
             # Initialize client from environment
@@ -358,6 +377,10 @@ class TestConfluenceClientOAuth:
 
             # Verify OAuth session was configured
             mock_configure_oauth.assert_called_once()
+            assert (
+                mock_configure_ssl.call_args.kwargs["url"]
+                == f"https://api.atlassian.com/ex/confluence/{mock_standard_oauth_config.cloud_id}"
+            )
 
     def test_from_env_with_byo_token_oauth(self):
         """Test creating client from env vars with BYO token OAuth config."""
@@ -375,16 +398,18 @@ class TestConfluenceClientOAuth:
         with (
             patch.dict(os.environ, env_vars, clear=True),
             patch(
-                "mcp_atlassian.confluence.config.get_oauth_config_from_env",
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.config.get_oauth_config_from_env",
                 return_value=mock_byo_oauth_config,
             ),
-            patch("mcp_atlassian.confluence.client.Confluence") as mock_confluence,
             patch(
-                "mcp_atlassian.confluence.client.configure_oauth_session",
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.Confluence"
+            ) as mock_confluence,
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_oauth_session",
                 return_value=True,
             ) as mock_configure_oauth,
             patch(
-                "mcp_atlassian.confluence.client.configure_ssl_verification"
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_ssl_verification"
             ) as mock_configure_ssl,
         ):
             client = ConfluenceClient()
@@ -398,6 +423,104 @@ class TestConfluenceClientOAuth:
                 == f"https://api.atlassian.com/ex/confluence/{mock_byo_oauth_config.cloud_id}"
             )
             mock_configure_oauth.assert_called_once()
+            assert (
+                mock_configure_ssl.call_args.kwargs["url"]
+                == f"https://api.atlassian.com/ex/confluence/{mock_byo_oauth_config.cloud_id}"
+            )
+
+    def test_cloud_oauth_uses_api_url_for_proxy_target(self):
+        """Test PAC/WPAD resolution uses Atlassian's Cloud API host for OAuth."""
+        oauth_config = OAuthConfig(
+            client_id="test-client-id",
+            client_secret="test-client-secret",
+            redirect_uri="https://example.com/callback",
+            scope="read:confluence-space.summary write:confluence-content",
+            cloud_id="test-cloud-id",
+            access_token="test-access-token",
+        )
+        config = ConfluenceConfig(
+            url="https://test.atlassian.net/wiki",
+            auth_type="oauth",
+            oauth_config=oauth_config,
+        )
+
+        with (
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.Confluence"
+            ) as mock_confluence,
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_oauth_session",
+                return_value=True,
+            ),
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_ssl_verification"
+            ),
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.apply_proxy_configuration"
+            ) as mock_apply_proxy,
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.preprocessing.confluence.ConfluencePreprocessor"
+            ),
+        ):
+            mock_apply_proxy.side_effect = lambda **kwargs: kwargs["session"]
+
+            ConfluenceClient(config=config)
+
+            assert (
+                mock_apply_proxy.call_args.kwargs["target_url"]
+                == "https://api.atlassian.com/ex/confluence/test-cloud-id"
+            )
+            assert (
+                mock_apply_proxy.call_args.kwargs["session"]
+                is mock_confluence.return_value._session
+            )
+
+    def test_dc_oauth_uses_instance_url_for_proxy_target(self):
+        """Test PAC/WPAD resolution keeps the DC instance URL for OAuth."""
+        dc_oauth_config = OAuthConfig(
+            client_id="dc-client",
+            client_secret="dc-secret",
+            redirect_uri="http://localhost:8080/callback",
+            scope="WRITE",
+            base_url="https://confluence.corp.example.com",
+            access_token="dc-access-token",
+        )
+        config = ConfluenceConfig(
+            url="https://confluence.corp.example.com",
+            auth_type="oauth",
+            oauth_config=dc_oauth_config,
+        )
+
+        with (
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.Confluence"
+            ) as mock_confluence,
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_oauth_session",
+                return_value=True,
+            ),
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.configure_ssl_verification"
+            ),
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.client.apply_proxy_configuration"
+            ) as mock_apply_proxy,
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.preprocessing.confluence.ConfluencePreprocessor"
+            ),
+        ):
+            mock_apply_proxy.side_effect = lambda **kwargs: kwargs["session"]
+
+            ConfluenceClient(config=config)
+
+            assert (
+                mock_apply_proxy.call_args.kwargs["target_url"]
+                == "https://confluence.corp.example.com"
+            )
+            assert (
+                mock_apply_proxy.call_args.kwargs["session"]
+                is mock_confluence.return_value._session
+            )
 
     def test_from_env_with_no_oauth_config_found(self):
         """Test client creation from env when no OAuth config is found by the utility."""
@@ -409,7 +532,7 @@ class TestConfluenceClientOAuth:
         with (
             patch.dict(os.environ, env_vars, clear=True),
             patch(
-                "mcp_atlassian.confluence.config.get_oauth_config_from_env",
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.config.get_oauth_config_from_env",
                 return_value=None,  # Simulate no OAuth config found by the utility
             ),
         ):

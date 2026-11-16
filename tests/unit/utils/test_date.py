@@ -2,7 +2,7 @@
 
 import pytest
 
-from mcp_atlassian.utils import parse_date
+from mcp_atlassian_with_bitbucket_and_privacy.utils import parse_date
 
 
 def test_parse_date_invalid_input():
@@ -89,7 +89,7 @@ def test_parse_date_iso_overflow_returns_none(input_val: str) -> None:
 
     # Simulate the Windows OverflowError that dateutil raises for year 9999
     with patch(
-        "mcp_atlassian.utils.date.dateutil.parser.parse",
+        "mcp_atlassian_with_bitbucket_and_privacy.utils.date.dateutil.parser.parse",
         side_effect=OverflowError("timestamp too large to convert to C _PyTime_t"),
     ):
         result = parse_date(input_val)
@@ -105,7 +105,7 @@ def test_parse_date_iso_oserror_returns_none() -> None:
     from unittest.mock import patch
 
     with patch(
-        "mcp_atlassian.utils.date.dateutil.parser.parse",
+        "mcp_atlassian_with_bitbucket_and_privacy.utils.date.dateutil.parser.parse",
         side_effect=OSError("timestamp out of range for platform time_t"),
     ):
         result = parse_date("9999-12-31T23:59:59.000+0000")

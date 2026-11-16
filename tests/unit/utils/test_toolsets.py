@@ -2,7 +2,7 @@
 
 import pytest
 
-from mcp_atlassian.utils.toolsets import (
+from mcp_atlassian_with_bitbucket_and_privacy.utils.toolsets import (
     ALL_TOOLSETS,
     DEFAULT_TOOLSETS,
     TOOLSET_TAG_PREFIX,
@@ -34,12 +34,12 @@ class TestGetEnabledToolsets:
         assert result == expected
 
     def test_all_keyword(self, monkeypatch):
-        """Test 'all' keyword returns all 32 toolset names."""
+        """Test 'all' keyword returns all 37 toolset names."""
         monkeypatch.setenv("TOOLSETS", "all")
         result = get_enabled_toolsets()
         assert result is not None
         assert result == set(ALL_TOOLSETS.keys())
-        assert len(result) == 33
+        assert len(result) == 37
 
     def test_all_keyword_case_insensitive(self, monkeypatch):
         """Test 'ALL' keyword is case-insensitive."""
@@ -47,7 +47,7 @@ class TestGetEnabledToolsets:
         result = get_enabled_toolsets()
         assert result is not None
         assert result == set(ALL_TOOLSETS.keys())
-        assert len(result) == 33
+        assert len(result) == 37
 
     def test_default_keyword(self, monkeypatch):
         """Test 'default' keyword returns 11 default toolset names."""
@@ -64,6 +64,13 @@ class TestGetEnabledToolsets:
         result = get_enabled_toolsets()
         assert result is not None
         assert result == DEFAULT_TOOLSETS | {"jira_agile"}
+
+    def test_legacy_only_excludes_default_toolsets(self, monkeypatch):
+        """Test 'legacy' enables only deprecated tools, not defaults."""
+        monkeypatch.setenv("TOOLSETS", "legacy")
+        result = get_enabled_toolsets()
+        assert result == {"legacy"}
+        assert result.isdisjoint(DEFAULT_TOOLSETS)
 
     def test_mixed_valid_and_unknown(self, monkeypatch):
         """Test 'default,typo_name' returns defaults only (typo ignored)."""
@@ -96,16 +103,16 @@ class TestGetEnabledToolsets:
         assert DEFAULT_TOOLSETS == expected_defaults
 
     def test_all_toolsets_count(self):
-        """Verify ALL_TOOLSETS has exactly 32 entries (15 Jira + 6 Confluence + 11 Bitbucket)."""
-        assert len(ALL_TOOLSETS) == 33
+        """37 total: 16 Jira + 8 Confluence + 12 Bitbucket + legacy."""
+        assert len(ALL_TOOLSETS) == 37
 
     def test_all_toolsets_contains_all_services(self):
         """Verify ALL_TOOLSETS has Jira, Confluence, and Bitbucket toolsets."""
         jira_toolsets = {k for k in ALL_TOOLSETS if k.startswith("jira_")}
         confluence_toolsets = {k for k in ALL_TOOLSETS if k.startswith("confluence_")}
         bitbucket_toolsets = {k for k in ALL_TOOLSETS if k.startswith("bitbucket_")}
-        assert len(jira_toolsets) == 15
-        assert len(confluence_toolsets) == 6
+        assert len(jira_toolsets) == 16
+        assert len(confluence_toolsets) == 8
         assert len(bitbucket_toolsets) == 12
 
 
@@ -188,27 +195,35 @@ class TestToolsetTagCompleteness:
 
     @pytest.fixture()
     def jira_tools(self):
-        """Get all registered Jira tools."""
+        """Get all registered Jira tools as a name-indexed dict."""
         import asyncio
 
-        from mcp_atlassian.servers.jira import jira_mcp
+        from mcp_atlassian_with_bitbucket_and_privacy.servers.jira import jira_mcp
+
+        async def _load() -> dict:
+            return {tool.name: tool for tool in await jira_mcp.list_tools()}
 
         loop = asyncio.new_event_loop()
         try:
-            return loop.run_until_complete(jira_mcp.get_tools())
+            return loop.run_until_complete(_load())
         finally:
             loop.close()
 
     @pytest.fixture()
     def confluence_tools(self):
-        """Get all registered Confluence tools."""
+        """Get all registered Confluence tools as a name-indexed dict."""
         import asyncio
 
-        from mcp_atlassian.servers.confluence import confluence_mcp
+        from mcp_atlassian_with_bitbucket_and_privacy.servers.confluence import (
+            confluence_mcp,
+        )
+
+        async def _load() -> dict:
+            return {tool.name: tool for tool in await confluence_mcp.list_tools()}
 
         loop = asyncio.new_event_loop()
         try:
-            return loop.run_until_complete(confluence_mcp.get_tools())
+            return loop.run_until_complete(_load())
         finally:
             loop.close()
 
@@ -256,10 +271,10 @@ class TestToolsetTagCompleteness:
 
     def test_jira_tool_count(self, jira_tools):
         """Verify expected number of Jira tools."""
-        assert len(jira_tools) == 49, f"Expected 49 Jira tools, got {len(jira_tools)}"
+        assert len(jira_tools) == 63, f"Expected 63 Jira tools, got {len(jira_tools)}"
 
     def test_confluence_tool_count(self, confluence_tools):
         """Verify expected number of Confluence tools."""
-        assert len(confluence_tools) == 23, (
-            f"Expected 23 Confluence tools, got {len(confluence_tools)}"
+        assert len(confluence_tools) == 35, (
+            f"Expected 35 Confluence tools, got {len(confluence_tools)}"
         )

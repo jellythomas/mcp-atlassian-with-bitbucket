@@ -4,9 +4,9 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from mcp_atlassian.jira import JiraFetcher
-from mcp_atlassian.jira.epics import EpicsMixin
-from mcp_atlassian.models.jira import JiraIssue
+from mcp_atlassian_with_bitbucket_and_privacy.jira import JiraFetcher
+from mcp_atlassian_with_bitbucket_and_privacy.jira.epics import EpicsMixin
+from mcp_atlassian_with_bitbucket_and_privacy.models.jira import JiraIssue
 
 
 class TestEpicsMixin:
@@ -233,6 +233,7 @@ class TestEpicsMixin:
 
     def test_prepare_epic_fields_with_required_epic_name(self, epics_mixin: EpicsMixin):
         """Test Epic field preparation when Epic Name is a required field."""
+        epics_mixin._find_epic_issue_type_id = MagicMock(return_value="10001")
         # Mock get_field_ids_to_epic to return field IDs
         epics_mixin.get_field_ids_to_epic = MagicMock(
             return_value={
@@ -266,7 +267,7 @@ class TestEpicsMixin:
         assert kwargs["__epic_color_value"] == "blue"
 
         # Verify get_required_fields was called with correct parameters
-        epics_mixin.get_required_fields.assert_called_once_with("Epic", "TEST")
+        epics_mixin.get_required_fields.assert_called_once_with("10001", "TEST")
 
     def test_prepare_epic_fields_with_optional_epic_name(self, epics_mixin: EpicsMixin):
         """Test Epic field preparation when Epic Name is not a required field."""
@@ -580,6 +581,28 @@ class TestEpicsMixin:
         ):
             epics_mixin.link_issue_to_epic("TEST-123", "TEST-456")
 
+    def test_link_issue_to_localized_epic_by_issue_type_id(
+        self, epics_mixin: EpicsMixin
+    ):
+        """Accept a localized Epic when its stable issue type ID matches."""
+        epics_mixin.jira.get_issue.side_effect = [
+            {"key": "TEST-123"},
+            {
+                "key": "EPIC-456",
+                "fields": {
+                    "project": {"key": "TEST"},
+                    "issuetype": {"id": "10001", "name": "Эпик"},
+                },
+            },
+        ]
+        epics_mixin._find_epic_issue_type_id = MagicMock(return_value="10001")
+        epics_mixin.get_field_ids_to_epic = MagicMock(return_value={})
+
+        result = epics_mixin.link_issue_to_epic("TEST-123", "EPIC-456")
+
+        assert result == epics_mixin.get_issue.return_value
+        epics_mixin._find_epic_issue_type_id.assert_called_once_with("TEST")
+
     def test_link_issue_to_epic_all_methods_fail(self, epics_mixin: EpicsMixin):
         """Test link_issue_to_epic when all linking methods fail."""
         # Setup mocks
@@ -677,9 +700,50 @@ class TestEpicsMixin:
         ):
             epics_mixin.get_epic_issues("TEST-123")
 
+    def test_get_epic_issues_accepts_localized_epic_by_issue_type_id(
+        self, epics_mixin: EpicsMixin
+    ):
+        """Accept a localized Epic when project metadata identifies its type ID."""
+        from mcp_atlassian_with_bitbucket_and_privacy.models.jira import (
+            JiraSearchResult,
+        )
+
+        epics_mixin.jira.get_issue.return_value = {
+            "key": "EPIC-123",
+            "fields": {
+                "project": {"key": "TEST"},
+                "issuetype": {"id": "10001", "name": "Эпик"},
+            },
+        }
+        epics_mixin._find_epic_issue_type_id = MagicMock(return_value="10001")
+        epics_mixin.get_field_ids_to_epic = MagicMock(
+            return_value={"epic_link": "customfield_10014"}
+        )
+        epics_mixin.search_issues = MagicMock(
+            return_value=JiraSearchResult(
+                issues=[JiraIssue(key="TEST-456", summary="Issue 1")],
+                total=1,
+                start_at=0,
+            )
+        )
+
+        result = epics_mixin.get_epic_issues("EPIC-123")
+
+        assert [issue.key for issue in result] == ["TEST-456"]
+        epics_mixin._find_epic_issue_type_id.assert_called_once_with("TEST")
+
     def test_get_epic_issues_no_results(self, epics_mixin):
-        """Test get_epic_issues when no results are found."""
-        # Setup mocks
+        """Every strategy runs cleanly but finds nothing -> empty list.
+
+        A genuinely childless epic must return ``[]`` (not raise): the
+        searches succeeded, they just matched no issues. This is the
+        counterpart to ``test_get_epic_issues_all_strategies_error_raises``,
+        which covers the case where the searches *fail*.
+        """
+        from mcp_atlassian_with_bitbucket_and_privacy.models.jira import (
+            JiraSearchResult,
+        )
+
         epics_mixin.jira.get_issue.return_value = {
             "key": "EPIC-123",
             "fields": {"issuetype": {"name": "Epic"}},
@@ -689,15 +753,140 @@ class TestEpicsMixin:
             return_value={"epic_link": "customfield_10014"}
         )
 
-        # Make search_issues return empty results
-        epics_mixin.search_issues = MagicMock(return_value=[])
+        # Real (empty) search results for every strategy: clean completion,
+        # zero issues.
+        epics_mixin.search_issues = MagicMock(
+            return_value=JiraSearchResult(issues=[], total=0, start_at=0)
+        )
 
-        # Call the method
         result = epics_mixin.get_epic_issues("EPIC-123")
 
-        # Verify the result is an empty list
         assert isinstance(result, list)
         assert not result
+
+    def test_get_epic_issues_empty_issuefunction_falls_through_real_model(
+        self, epics_mixin
+    ):
+        """An empty issueFunction result must not short-circuit the fallback.
+
+        Regression: ``JiraSearchResult`` is a populated Pydantic model and is
+        therefore always truthy, so a bare ``if search_result:`` accepted an
+        empty METHOD 1 result and returned ``[]`` without ever trying the
+        parent / Epic Link strategies. This uses the REAL model (not a mock
+        with ``__bool__``) to prove the empty result falls through.
+        """
+        from mcp_atlassian_with_bitbucket_and_privacy.models.jira import (
+            JiraSearchResult,
+        )
+
+        epics_mixin.jira.get_issue.return_value = {
+            "key": "EPIC-123",
+            "fields": {"issuetype": {"name": "Epic"}},
+        }
+        epics_mixin.get_field_ids_to_epic = MagicMock(
+            return_value={"epic_link": "customfield_10014", "parent": "parent"}
+        )
+
+        def search_side_effect(jql, **kwargs):
+            if "issueFunction" in jql:
+                # Real model, empty issues -> truthy but must be treated as
+                # "no results" and fall through.
+                return JiraSearchResult(issues=[], total=0, start_at=0)
+            if "parent" in jql:
+                return JiraSearchResult(
+                    issues=[
+                        JiraIssue(key="CHILD-1", summary="Child 1"),
+                        JiraIssue(key="CHILD-2", summary="Child 2"),
+                    ],
+                    total=2,
+                    start_at=0,
+                )
+            return JiraSearchResult(issues=[], total=0, start_at=0)
+
+        epics_mixin.search_issues = MagicMock(side_effect=search_side_effect)
+
+        result = epics_mixin.get_epic_issues("EPIC-123")
+
+        # Fell through to the parent strategy instead of returning [].
+        assert [i.key for i in result] == ["CHILD-1", "CHILD-2"]
+        assert epics_mixin.search_issues.call_count >= 2
+
+    def test_get_epic_issues_all_strategies_error_raises(self, epics_mixin):
+        """BLOCKER 1: all child-search strategies erroring is a fetch failure.
+
+        When every strategy's underlying search raises, ``get_epic_issues``
+        must raise rather than swallow the failure into ``[]`` — otherwise a
+        child-search outage is indistinguishable from a childless epic. This
+        drives the failure through the real ``search_issues`` calls, not by
+        mocking ``get_epic_issues`` itself.
+        """
+        epics_mixin.jira.get_issue.return_value = {
+            "key": "EPIC-123",
+            "fields": {"issuetype": {"name": "Epic"}},
+        }
+        epics_mixin.get_field_ids_to_epic = MagicMock(
+            return_value={"epic_link": "customfield_10014", "parent": "parent"}
+        )
+        # Every strategy's search errors (a real outage, not empty results).
+        epics_mixin.search_issues = MagicMock(
+            side_effect=Exception("Jira search API 503")
+        )
+
+        with pytest.raises(Exception, match="Error getting epic issues") as exc_info:
+            epics_mixin.get_epic_issues("EPIC-123")
+        # The all-strategies-failed context is preserved in the chain.
+        assert "all child-search strategies failed" in str(exc_info.value)
+
+    def test_get_epic_issues_auth_error_propagates(self, epics_mixin):
+        """BLOCKER 2: an auth failure in the fallback chain propagates.
+
+        ``MCPAtlassianAuthenticationError`` is a subclass of ``Exception`` and
+        would otherwise be swallowed by each strategy's broad ``except`` (and
+        re-wrapped by the top-level handler). It must escape untouched so
+        ``ErrorPreservingFastMCP`` can expose it.
+        """
+        from mcp_atlassian_with_bitbucket_and_privacy.exceptions import (
+            MCPAtlassianAuthenticationError,
+        )
+
+        epics_mixin.jira.get_issue.return_value = {
+            "key": "EPIC-123",
+            "fields": {"issuetype": {"name": "Epic"}},
+        }
+        epics_mixin.get_field_ids_to_epic = MagicMock(
+            return_value={"epic_link": "customfield_10014", "parent": "parent"}
+        )
+        epics_mixin.search_issues = MagicMock(
+            side_effect=MCPAtlassianAuthenticationError("401 Unauthorized")
+        )
+
+        with pytest.raises(MCPAtlassianAuthenticationError, match="401 Unauthorized"):
+            epics_mixin.get_epic_issues("EPIC-123")
+
+    def test_get_epic_issues_auth_error_in_epic_verification_propagates(
+        self, epics_mixin
+    ):
+        """BLOCKER 2: auth failure in the Epic-type *verification* propagates.
+
+        When the issue type name isn't a recognized Epic, the method runs a
+        verification JQL before the strategy chain. An auth failure there must
+        not be masked as "not an Epic" — it must propagate untouched.
+        """
+        from mcp_atlassian_with_bitbucket_and_privacy.exceptions import (
+            MCPAtlassianAuthenticationError,
+        )
+
+        # A non-Epic-looking type forces the verify-JQL branch.
+        epics_mixin.jira.get_issue.return_value = {
+            "key": "MAYBE-1",
+            "fields": {"issuetype": {"name": "Task"}},
+        }
+        epics_mixin.search_issues = MagicMock(
+            side_effect=MCPAtlassianAuthenticationError("401 Unauthorized")
+        )
+
+        with pytest.raises(MCPAtlassianAuthenticationError, match="401 Unauthorized"):
+            epics_mixin.get_epic_issues("MAYBE-1")
 
     def test_get_epic_issues_fallback_jql(self, epics_mixin):
         """Test get_epic_issues with fallback JQL queries."""
@@ -765,3 +954,738 @@ class TestEpicsMixin:
             match="Error getting epic issues: API error",
         ):
             epics_mixin.get_epic_issues("EPIC-123")
+
+    @pytest.mark.parametrize(
+        ("field_ids", "expected"),
+        [
+            ({"epic_name": "customfield_1"}, "customfield_1"),
+            ({"Epic Name": "customfield_2"}, "customfield_2"),
+            ({"other": "customfield_10011"}, "customfield_10011"),
+            ({"Team Epic Name": "customfield_3"}, "customfield_3"),
+            ({"summary": "summary"}, None),
+        ],
+    )
+    def test_get_epic_name_field_id(self, epics_mixin: EpicsMixin, field_ids, expected):
+        """Test Epic Name field lookup strategies."""
+        assert epics_mixin._get_epic_name_field_id(field_ids) == expected
+
+    @pytest.mark.parametrize(
+        ("field_ids", "expected"),
+        [
+            ({"epic_color": "customfield_1"}, "customfield_1"),
+            ({"epic_colour": "customfield_2"}, "customfield_2"),
+            ({"other": "customfield_10012"}, "customfield_10012"),
+            ({"Team Epic Colour": "customfield_3"}, "customfield_3"),
+            ({"summary": "summary"}, None),
+        ],
+    )
+    def test_get_epic_color_field_id(
+        self, epics_mixin: EpicsMixin, field_ids, expected
+    ):
+        """Test Epic Color field lookup strategies."""
+        assert epics_mixin._get_epic_color_field_id(field_ids) == expected
+
+    @pytest.mark.parametrize(
+        ("field_ids", "expected"),
+        [
+            ({"Epic Link": "customfield_1"}, "customfield_1"),
+            ({"Team Epic Link": "customfield_2"}, "customfield_2"),
+            ({"other": "customfield_10014"}, "customfield_10014"),
+            ({"system.epic-link": "customfield_3"}, "customfield_3"),
+        ],
+    )
+    def test_find_epic_link_field_known_strategies(
+        self, epics_mixin: EpicsMixin, field_ids, expected
+    ):
+        """Test Epic Link field lookup uses known names and IDs."""
+        assert epics_mixin._find_epic_link_field(field_ids) == expected
+
+    def test_find_epic_link_field_from_linked_issue(self, epics_mixin: EpicsMixin):
+        """Test Epic Link field inference from an issue linked to a sample Epic."""
+        epics_mixin._find_sample_epic = MagicMock(return_value=[{"key": "EPIC-1"}])
+        epics_mixin._find_issues_linked_to_epic = MagicMock(
+            return_value=[
+                {
+                    "fields": {
+                        "customfield_12345": "EPIC-1",
+                        "summary": "Linked issue",
+                    }
+                }
+            ]
+        )
+
+        result = epics_mixin._find_epic_link_field({})
+
+        assert result == "customfield_12345"
+
+    def test_find_epic_link_field_from_schema(self, epics_mixin: EpicsMixin):
+        """Test Epic Link field lookup falls back to field schema inspection."""
+        epics_mixin._find_sample_epic = MagicMock(return_value=[])
+        epics_mixin.jira.get_all_fields.return_value = [
+            {
+                "id": "customfield_54321",
+                "name": "Relationship",
+                "schema": {"custom": "com.example:epic-relationship"},
+            }
+        ]
+
+        result = epics_mixin._find_epic_link_field({})
+
+        assert result == "customfield_54321"
+
+    def test_find_epic_link_field_returns_none_after_errors(
+        self, epics_mixin: EpicsMixin
+    ):
+        """Test Epic Link lookup returns None when discovery sources fail."""
+        epics_mixin._find_sample_epic = MagicMock(
+            side_effect=RuntimeError("search unavailable")
+        )
+        epics_mixin.jira.get_all_fields.side_effect = RuntimeError("fields unavailable")
+
+        assert epics_mixin._find_epic_link_field({}) is None
+
+    @pytest.mark.parametrize(
+        ("response", "expected"),
+        [
+            ({"issues": [{"key": "EPIC-1"}]}, [{"key": "EPIC-1"}]),
+            ({"issues": []}, []),
+            ([], []),
+        ],
+    )
+    def test_find_sample_epic(self, epics_mixin: EpicsMixin, response, expected):
+        """Test sample Epic discovery handles success, empty, and malformed responses."""
+        epics_mixin.jira.jql.return_value = response
+
+        assert epics_mixin._find_sample_epic() == expected
+
+    def test_find_issues_linked_to_epic_tries_queries(self, epics_mixin: EpicsMixin):
+        """Test linked issue discovery retries alternate JQL forms."""
+        epics_mixin.jira.jql.side_effect = [
+            RuntimeError("unsupported JQL"),
+            {"issues": []},
+            {"issues": [{"key": "TEST-1"}]},
+        ]
+
+        result = epics_mixin._find_issues_linked_to_epic("EPIC-1")
+
+        assert result == [{"key": "TEST-1"}]
+        assert epics_mixin.jira.jql.call_count == 3
+
+    def test_link_issue_to_epic_uses_common_field_fallback(
+        self, epics_mixin: EpicsMixin
+    ):
+        """Test Epic linking caches a successful common custom field."""
+        epics_mixin.jira.get_issue.side_effect = [
+            {"key": "TEST-1"},
+            {"key": "EPIC-1", "fields": {"issuetype": {"name": "Epic"}}},
+        ]
+        epics_mixin.get_field_ids_to_epic = MagicMock(return_value={})
+        epics_mixin.jira.update_issue.side_effect = [
+            RuntimeError("parent unsupported"),
+            None,
+        ]
+        epics_mixin._field_ids_cache = None
+
+        result = epics_mixin.link_issue_to_epic("TEST-1", "EPIC-1")
+
+        assert result == epics_mixin.get_issue.return_value
+        assert epics_mixin.jira.update_issue.call_args_list[-1] == call(
+            issue_key="TEST-1",
+            update={"fields": {"customfield_10014": "EPIC-1"}},
+        )
+        assert epics_mixin._field_ids_cache == [
+            {"id": "customfield_10014", "name": "epic_link"}
+        ]
+
+    def test_update_epic_fields_falls_back_to_individual_updates(
+        self, epics_mixin: EpicsMixin
+    ):
+        """Test Epic field updates retry fields individually after bulk failure."""
+        kwargs = {
+            "__epic_name_field": "customfield_1",
+            "__epic_name_value": "Epic name",
+            "__epic_color_field": "customfield_2",
+            "__epic_color_value": "blue",
+        }
+        epics_mixin.jira.update_issue.side_effect = [
+            RuntimeError("bulk update failed"),
+            None,
+            RuntimeError("color unavailable"),
+        ]
+
+        result = epics_mixin.update_epic_fields("EPIC-1", kwargs)
+
+        assert result == epics_mixin.get_issue.return_value
+        assert epics_mixin.jira.update_issue.call_args_list == [
+            call(
+                "EPIC-1",
+                update={
+                    "fields": {
+                        "customfield_1": "Epic name",
+                        "customfield_2": "blue",
+                    }
+                },
+            ),
+            call(
+                "EPIC-1",
+                update={"fields": {"customfield_1": "Epic name"}},
+            ),
+            call("EPIC-1", update={"fields": {"customfield_2": "blue"}}),
+        ]
+        epics_mixin.get_issue.assert_called_once_with("EPIC-1")
+
+    def test_update_epic_fields_uses_primary_update(self, epics_mixin: EpicsMixin):
+        """Test Epic field updates use one request when the bulk update succeeds."""
+        kwargs = {
+            "__epic_name_field": "customfield_1",
+            "__epic_name_value": "Epic name",
+            "__epic_team_field": "customfield_3",
+            "__epic_team_value": "Platform",
+        }
+
+        result = epics_mixin.update_epic_fields("EPIC-1", kwargs)
+
+        assert result == epics_mixin.get_issue.return_value
+        epics_mixin.jira.update_issue.assert_called_once_with(
+            "EPIC-1",
+            update={
+                "fields": {
+                    "customfield_1": "Epic name",
+                    "customfield_3": "Platform",
+                }
+            },
+        )
+
+    def test_update_epic_fields_without_stored_fields(self, epics_mixin: EpicsMixin):
+        """Test Epic updates without stored fields only refetch the issue."""
+        result = epics_mixin.update_epic_fields("EPIC-1", {})
+
+        assert result == epics_mixin.get_issue.return_value
+        epics_mixin.jira.update_issue.assert_not_called()
+        epics_mixin.get_issue.assert_called_once_with("EPIC-1")
+
+
+class TestEpicFieldDynamicDetection:
+    """Regression tests for dynamic Epic Link field discovery."""
+
+    @pytest.fixture
+    def epics_mixin(self, jira_fetcher: JiraFetcher) -> EpicsMixin:
+        """Create an EpicsMixin instance with mocked dependencies."""
+        return jira_fetcher
+
+    def test_link_issue_to_epic_uses_dynamically_discovered_field(
+        self, epics_mixin: EpicsMixin
+    ):
+        """Use the instance's Epic Link ID instead of a hardcoded fallback."""
+        epics_mixin.jira.get_issue.side_effect = [
+            {"key": "TEST-123"},
+            {
+                "key": "EPIC-456",
+                "fields": {"issuetype": {"name": "Epic"}},
+            },
+        ]
+        epics_mixin.jira.get_all_fields.return_value = [
+            {
+                "id": "customfield_10001",
+                "name": "Epic Link",
+                "schema": {"custom": "com.pyxis.greenhopper.jira:gh-epic-link"},
+            }
+        ]
+        epics_mixin.jira.jql.return_value = {"issues": []}
+        epics_mixin.jira.update_issue.side_effect = [
+            Exception("Parent field is not supported"),
+            None,
+        ]
+        epics_mixin.get_issue = MagicMock(
+            return_value=JiraIssue(key="TEST-123", id="123456")
+        )
+        epics_mixin._field_ids_cache = None
+        epics_mixin._field_name_to_id_map = None
+
+        result = epics_mixin.link_issue_to_epic("TEST-123", "EPIC-456")
+
+        assert epics_mixin.jira.update_issue.call_args_list == [
+            call(
+                issue_key="TEST-123",
+                update={"fields": {"parent": {"key": "EPIC-456"}}},
+            ),
+            call(
+                issue_key="TEST-123",
+                update={"fields": {"customfield_10001": "EPIC-456"}},
+            ),
+        ]
+        epics_mixin.jira.get_all_fields.assert_called_once_with()
+        epics_mixin.get_issue.assert_called_once_with("TEST-123")
+        assert result == JiraIssue(
+            key="TEST-123",
+            id="123456",
+        )
+
+
+class TestGetEpicSummary:
+    """Tests for EpicsMixin.get_epic_summary and _fetch_epic_children."""
+
+    def _child(
+        self,
+        key: str,
+        *,
+        status: str = "Open",
+        done: bool = False,
+        assignee_account: str | None = None,
+        assignee_name: str | None = None,
+        issue_type: str = "Story",
+    ) -> JiraIssue:
+        from mcp_atlassian_with_bitbucket_and_privacy.models.jira.common import (
+            JiraIssueType,
+            JiraStatus,
+            JiraStatusCategory,
+            JiraUser,
+        )
+
+        category = JiraStatusCategory(
+            key="done" if done else "indeterminate",
+            name="Done" if done else "In Progress",
+        )
+        assignee = None
+        if assignee_account or assignee_name:
+            assignee = JiraUser(
+                account_id=assignee_account,
+                display_name=assignee_name or "Unknown",
+            )
+        return JiraIssue(
+            key=key,
+            summary=f"Summary {key}",
+            status=JiraStatus(name=status, category=category),
+            assignee=assignee,
+            issue_type=JiraIssueType(name=issue_type),
+        )
+
+    def _result(
+        self,
+        children: list[JiraIssue],
+        *,
+        total: int | None = None,
+        next_page_token: str | None = None,
+        jql: str = "parent = EPIC-1",
+    ) -> tuple:
+        """Build a ``(JiraSearchResult, jql)`` pair as the chain would return.
+
+        ``get_epic_summary`` reads completeness from the winning search's
+        metadata, so tests stub ``_get_epic_issues_result`` (not the bare
+        ``get_epic_issues`` list) to exercise the real ``has_more`` path.
+        Cloud leaves ``total`` at -1 and signals more via
+        ``next_page_token``; Server/DC reports an authoritative ``total``.
+        The winning ``jql`` is carried so Server/DC paging can re-query it.
+        """
+        from mcp_atlassian_with_bitbucket_and_privacy.models.jira import (
+            JiraSearchResult,
+        )
+
+        result = JiraSearchResult(
+            issues=children,
+            total=len(children) if total is None else total,
+            start_at=0,
+            next_page_token=next_page_token,
+        )
+        return result, jql
+
+    @pytest.fixture
+    def epics_mixin(self, jira_fetcher: JiraFetcher) -> EpicsMixin:
+        mixin = jira_fetcher
+        # is_cloud is a read-only property on the real config; use a mock
+        # so tests can toggle Cloud vs Server/DC pagination behavior.
+        mixin.config = MagicMock()
+        mixin.config.is_cloud = True
+        return mixin
+
+    def test_aggregates_by_status_assignee_type(self, epics_mixin: EpicsMixin):
+        children = [
+            self._child(
+                "C-1",
+                status="Done",
+                done=True,
+                assignee_account="acc-1",
+                assignee_name="Alice",
+            ),
+            self._child(
+                "C-2",
+                status="Done",
+                done=True,
+                assignee_account="acc-1",
+                assignee_name="Alice",
+            ),
+            self._child("C-3", status="Open", issue_type="Bug"),
+        ]
+        epics_mixin._get_epic_issues_result = MagicMock(
+            return_value=self._result(children)
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1")
+
+        assert result["total_children"] == 3
+        assert result["by_status"] == {"Done": 2, "Open": 1}
+        assert result["by_type"] == {"Story": 2, "Bug": 1}
+        # Assignee aggregated by account id, with an explicit unassigned bucket.
+        assert result["by_assignee"] == {"acc-1": 2, "unassigned": 1}
+        assert result["assignee_names"] == {"acc-1": "Alice"}
+        assert result["partial"] is False
+        assert result["truncated"] is False
+        assert "children" not in result
+
+    def test_completion_uses_done_category_not_status_name(
+        self, epics_mixin: EpicsMixin
+    ):
+        # A child whose status NAME isn't "Done" but whose category IS done
+        # must count toward completion; a localized non-English name works too.
+        children = [
+            self._child("C-1", status="完了", done=True),
+            self._child("C-2", status="Open", done=False),
+        ]
+        epics_mixin._get_epic_issues_result = MagicMock(
+            return_value=self._result(children)
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1")
+
+        assert result["completion_percentage"] == 50.0
+
+    def test_server_dc_falls_back_to_display_name_for_assignee(
+        self, epics_mixin: EpicsMixin
+    ):
+        # Server/DC issues carry no account id; the display name is the key.
+        epics_mixin.config.is_cloud = False
+        children = [self._child("C-1", assignee_name="Bob Server")]
+        epics_mixin._get_epic_issues_result = MagicMock(
+            return_value=self._result(children)
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1")
+
+        assert result["by_assignee"] == {"Bob Server": 1}
+        assert result["assignee_names"] == {"Bob Server": "Bob Server"}
+
+    def test_empty_assignee_uses_canonical_unassigned_bucket(
+        self, epics_mixin: EpicsMixin
+    ) -> None:
+        from mcp_atlassian_with_bitbucket_and_privacy.models.jira.common import (
+            JiraStatus,
+            JiraUser,
+        )
+
+        child = self._child("C-1")
+        child.assignee = JiraUser()
+        child.status = JiraStatus(name="Open")
+        epics_mixin._get_epic_issues_result = MagicMock(
+            return_value=self._result([child])
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1")
+
+        assert result["by_assignee"] == {"unassigned": 1}
+        assert result["assignee_names"] == {}
+
+    def test_include_children_emits_compact_rows(self, epics_mixin: EpicsMixin):
+        children = [self._child("C-1", status="Done", done=True, assignee_name="Alice")]
+        epics_mixin._get_epic_issues_result = MagicMock(
+            return_value=self._result(children)
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1", include_children=True)
+
+        assert result["children"] == [
+            {"key": "C-1", "status": "Done", "assignee": "Alice"}
+        ]
+
+    def test_truncated_when_cap_reached(self, epics_mixin: EpicsMixin):
+        # Cloud: the winning search fills the cap and returns a
+        # next_page_token, the server's own "more results exist" signal.
+        children = [self._child(f"C-{i}") for i in range(5)]
+        epics_mixin._get_epic_issues_result = MagicMock(
+            return_value=self._result(children, total=-1, next_page_token="more")
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1", max_children=5)
+
+        assert result["truncated"] is True
+        # Truncated data is partial: no authoritative completion %, and only
+        # the capped prefix is aggregated.
+        assert result["partial"] is True
+        assert result["reason"] == "truncated"
+        assert result["completion_percentage"] is None
+        assert result["total_children"] == 5
+
+    def test_exactly_max_children_is_not_truncated(self, epics_mixin: EpicsMixin):
+        # An epic with EXACTLY the cap of children must not false-positive as
+        # truncated: the winning search returns no next_page_token, so
+        # has_more is False and the result is authoritative.
+        children = [self._child(f"C-{i}", done=(i == 0)) for i in range(5)]
+        epics_mixin._get_epic_issues_result = MagicMock(
+            return_value=self._result(children, total=-1, next_page_token=None)
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1", max_children=5)
+
+        assert result["truncated"] is False
+        assert result["partial"] is False
+        assert result["total_children"] == 5
+        assert result["completion_percentage"] == 20.0
+
+    def test_max_children_hard_capped_in_library(self, epics_mixin: EpicsMixin):
+        # A direct call above the hard ceiling must not fan out unbounded:
+        # the requested limit is clamped to _MAX_EPIC_SUMMARY_CHILDREN.
+        from mcp_atlassian_with_bitbucket_and_privacy.jira.epics import (
+            _MAX_EPIC_SUMMARY_CHILDREN,
+        )
+
+        epics_mixin._get_epic_issues_result = MagicMock(return_value=self._result([]))
+
+        epics_mixin.get_epic_summary("EPIC-1", max_children=1_000_000)
+
+        # The fetch limit is capped at the ceiling, never 1e6.
+        first_call = epics_mixin._get_epic_issues_result.call_args_list[0]
+        assert first_call.kwargs["limit"] == _MAX_EPIC_SUMMARY_CHILDREN
+
+    def test_partial_on_fetch_failure(self, epics_mixin: EpicsMixin):
+        epics_mixin._get_epic_issues_result = MagicMock(
+            side_effect=Exception("Jira outage")
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1")
+
+        assert result["partial"] is True
+        assert result["reason"] == "fetch_failed"
+        # Never assert an authoritative completion % on partial data.
+        assert result["completion_percentage"] is None
+        assert result["total_children"] is None
+
+    def test_no_children_is_distinct_from_fetch_failure(self, epics_mixin: EpicsMixin):
+        # A genuinely childless epic: the chain returns (None, None) (every
+        # strategy ran and matched nothing), which must read as an
+        # authoritative 0.
+        epics_mixin._get_epic_issues_result = MagicMock(return_value=(None, None))
+
+        result = epics_mixin.get_epic_summary("EPIC-1")
+
+        assert result["partial"] is False
+        assert result["total_children"] == 0
+        assert result["completion_percentage"] == 0.0
+        assert "reason" not in result
+
+    def test_partial_when_underlying_searches_fail(self, epics_mixin: EpicsMixin):
+        """BLOCKER 1 end-to-end: drive the failure through the real chain.
+
+        Rather than mocking ``get_epic_issues`` to raise, make the underlying
+        ``search_issues`` calls fail so the failure travels through the real
+        ``get_epic_issues`` fallback chain into the summary. A child-search
+        outage must surface as ``fetch_failed`` — never as an authoritative
+        ``total_children: 0`` / ``completion_percentage: 0.0``.
+        """
+        epics_mixin.jira.get_issue.return_value = {
+            "key": "EPIC-1",
+            "fields": {"issuetype": {"name": "Epic"}},
+        }
+        epics_mixin.get_field_ids_to_epic = MagicMock(
+            return_value={"epic_link": "customfield_10014", "parent": "parent"}
+        )
+        epics_mixin.search_issues = MagicMock(
+            side_effect=Exception("Jira search API 503")
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1")
+
+        assert result["partial"] is True
+        assert result["reason"] == "fetch_failed"
+        assert result["completion_percentage"] is None
+        assert result["total_children"] is None
+
+    def test_auth_error_propagates_through_summary(self, epics_mixin: EpicsMixin):
+        """BLOCKER 2 end-to-end: an auth failure is not a partial payload.
+
+        A 401/403 raised while fetching children must propagate out of
+        ``get_epic_summary`` (for ``ErrorPreservingFastMCP`` to expose),
+        not be caught and returned as ``partial`` data.
+        """
+        from mcp_atlassian_with_bitbucket_and_privacy.exceptions import (
+            MCPAtlassianAuthenticationError,
+        )
+
+        epics_mixin.jira.get_issue.return_value = {
+            "key": "EPIC-1",
+            "fields": {"issuetype": {"name": "Epic"}},
+        }
+        epics_mixin.get_field_ids_to_epic = MagicMock(
+            return_value={"epic_link": "customfield_10014", "parent": "parent"}
+        )
+        epics_mixin.search_issues = MagicMock(
+            side_effect=MCPAtlassianAuthenticationError("403 Forbidden")
+        )
+
+        with pytest.raises(MCPAtlassianAuthenticationError, match="403 Forbidden"):
+            epics_mixin.get_epic_summary("EPIC-1")
+
+    def test_pagination_ceiling_limits_cloud(
+        self, epics_mixin: EpicsMixin, monkeypatch
+    ):
+        """BLOCKER 3 (Cloud): when ATLASSIAN_MAX_PAGINATION_LIMIT is the
+        binding limit and more children exist, report ``pagination_ceiling``.
+
+        The caller asks for max_children=100 but the operator ceiling of 25
+        clamps the fetch to 25. The winning search returns a next_page_token
+        (the 26th child exists), so the result is partial and truncated even
+        though the reason identifies the operator ceiling.
+        """
+        monkeypatch.setenv("ATLASSIAN_MAX_PAGINATION_LIMIT", "25")
+        children = [self._child(f"C-{i}") for i in range(25)]
+        epics_mixin._get_epic_issues_result = MagicMock(
+            return_value=self._result(children, total=-1, next_page_token="more")
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1", max_children=100)
+
+        assert result["partial"] is True
+        assert result["reason"] == "pagination_ceiling"
+        assert result["truncated"] is True
+        assert result["completion_percentage"] is None
+        assert result["total_children"] == 25
+        # The ceiling actually clamps the fetch request to 25 (Cloud passes
+        # max_children straight through as the first-page limit).
+        assert epics_mixin._get_epic_issues_result.call_args.kwargs["limit"] == 25
+
+    def test_pagination_ceiling_limits_server_dc(
+        self, epics_mixin: EpicsMixin, monkeypatch
+    ):
+        """BLOCKER 3 (Server/DC): same ceiling reason on the offset-paging path.
+
+        Server/DC reports an authoritative ``total`` (26) that exceeds the
+        ceiling-limited fetch of 25, so has_more is True and the binding limit
+        is the operator ceiling.
+        """
+        monkeypatch.setenv("ATLASSIAN_MAX_PAGINATION_LIMIT", "25")
+        epics_mixin.config.is_cloud = False
+        children = [self._child(f"C-{i}") for i in range(25)]
+        epics_mixin._get_epic_issues_result = MagicMock(
+            return_value=self._result(children, total=26)
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1", max_children=100)
+
+        assert result["partial"] is True
+        assert result["reason"] == "pagination_ceiling"
+        assert result["truncated"] is True
+        assert result["completion_percentage"] is None
+
+    def test_exactly_ceiling_children_is_authoritative(
+        self, epics_mixin: EpicsMixin, monkeypatch
+    ):
+        """Codex regression: a COMPLETE epic with exactly `ceiling` children
+        must NOT be flagged pagination_ceiling.
+
+        The old heuristic false-positived here (fetch filled the cap under a
+        binding ceiling ⇒ "maybe more"). With a true has_more signal, the
+        winning search returns no next_page_token, so the epic is complete
+        and authoritative even though it exactly fills the ceiling.
+        """
+        monkeypatch.setenv("ATLASSIAN_MAX_PAGINATION_LIMIT", "5")
+        children = [self._child(f"C-{i}", done=(i == 0)) for i in range(5)]
+        epics_mixin._get_epic_issues_result = MagicMock(
+            return_value=self._result(children, total=-1, next_page_token=None)
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1", max_children=10)
+
+        assert result["partial"] is False
+        assert "reason" not in result
+        assert result["total_children"] == 5
+        assert result["completion_percentage"] == 20.0
+
+    def test_exactly_ceiling_children_is_authoritative_server_dc(
+        self, epics_mixin: EpicsMixin, monkeypatch
+    ):
+        """Server/DC counterpart: total == collected means complete.
+
+        The authoritative ``total`` (5) equals what we collected (5), so
+        has_more is False even though the fetch exactly filled the ceiling.
+        """
+        monkeypatch.setenv("ATLASSIAN_MAX_PAGINATION_LIMIT", "5")
+        epics_mixin.config.is_cloud = False
+        children = [self._child(f"C-{i}", done=(i == 0)) for i in range(5)]
+        epics_mixin._get_epic_issues_result = MagicMock(
+            return_value=self._result(children, total=5)
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1", max_children=10)
+
+        assert result["partial"] is False
+        assert "reason" not in result
+        assert result["total_children"] == 5
+        assert result["completion_percentage"] == 20.0
+
+    def test_below_pagination_ceiling_is_authoritative(
+        self, epics_mixin: EpicsMixin, monkeypatch
+    ):
+        """A ceiling that is NOT the binding limit must not false-trigger.
+
+        With the ceiling at 100 but only 3 children (well under both the
+        ceiling and max_children), the result is complete and authoritative.
+        """
+        monkeypatch.setenv("ATLASSIAN_MAX_PAGINATION_LIMIT", "100")
+        children = [
+            self._child("C-0", done=True),
+            self._child("C-1"),
+            self._child("C-2"),
+        ]
+        epics_mixin._get_epic_issues_result = MagicMock(
+            return_value=self._result(children)
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1", max_children=10)
+
+        assert result["partial"] is False
+        assert "reason" not in result
+        assert result["total_children"] == 3
+        assert result["completion_percentage"] == pytest.approx(33.3)
+
+    def test_server_dc_pages_with_start(self, epics_mixin: EpicsMixin):
+        epics_mixin.config.is_cloud = False
+        page1 = [self._child(f"C-{i}") for i in range(50)]
+        page2 = [self._child(f"C-{i}") for i in range(50, 60)]
+        # Page 1 comes from the full chain (returns the winning jql); later
+        # pages re-query THAT jql directly (no chain fall-through).
+        result1, jql = self._result(page1, total=60, jql='parent = "EPIC-1"')
+        epics_mixin._get_epic_issues_result = MagicMock(return_value=(result1, jql))
+        page2_result, _ = self._result(page2, total=60)
+        epics_mixin._get_epic_issues_result_by_jql = MagicMock(
+            return_value=page2_result
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1", max_children=200)
+
+        assert result["total_children"] == 60
+        # Page 1 via the chain once; page 2 via the same-JQL pager once.
+        assert epics_mixin._get_epic_issues_result.call_count == 1
+        assert epics_mixin._get_epic_issues_result_by_jql.call_count == 1
+        page_call = epics_mixin._get_epic_issues_result_by_jql.call_args
+        # Pages with start at the raw row offset (50), not a deduped count,
+        # and against the winning JQL from page 1.
+        assert page_call.args[2] == 50
+        assert page_call.args[1] == 'parent = "EPIC-1"'
+
+    def test_server_dc_dedupes_overlapping_pages(self, epics_mixin: EpicsMixin):
+        # Unstable JQL ordering can repeat a child across pages; it must be
+        # counted once, and paging must advance by the raw offset regardless.
+        epics_mixin.config.is_cloud = False
+        page1 = [self._child(f"C-{i}") for i in range(50)]
+        page2 = [self._child("C-49")] + [self._child(f"C-{i}") for i in range(50, 59)]
+        result1, jql = self._result(page1, total=59)
+        epics_mixin._get_epic_issues_result = MagicMock(return_value=(result1, jql))
+        page2_result, _ = self._result(page2, total=59)
+        epics_mixin._get_epic_issues_result_by_jql = MagicMock(
+            return_value=page2_result
+        )
+
+        result = epics_mixin.get_epic_summary("EPIC-1", max_children=200)
+
+        # 50 + 9 unique (C-49 duplicate dropped), not 60.
+        assert result["total_children"] == 59
+        page_call = epics_mixin._get_epic_issues_result_by_jql.call_args
+        assert page_call.args[2] == 50

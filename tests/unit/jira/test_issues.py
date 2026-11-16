@@ -1,12 +1,21 @@
 """Tests for the Jira Issues mixin."""
 
+from typing import Any
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import HTTPError
 
-from mcp_atlassian.jira import JiraFetcher
-from mcp_atlassian.jira.issues import IssuesMixin, logger
-from mcp_atlassian.models.jira import JiraIssue
+from mcp_atlassian_with_bitbucket_and_privacy.exceptions import (
+    MCPAtlassianAuthenticationError,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.jira import JiraFetcher
+from mcp_atlassian_with_bitbucket_and_privacy.jira.constants import (
+    DEFAULT_READ_JIRA_FIELDS,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.jira.issues import IssuesMixin, logger
+from mcp_atlassian_with_bitbucket_and_privacy.models.jira import JiraIssue
 from tests.utils.mocks import setup_api3_passthrough_mocks
 
 
@@ -100,6 +109,50 @@ class TestIssuesMixin:
         assert len(issue.comments) == 1
         assert issue.comments[0].body == "This is a comment"
 
+    def test_get_issue_with_comment_limit_returns_newest_comments(
+        self, issues_mixin: IssuesMixin, make_issue_data: Any
+    ) -> None:
+        """Test that comment_limit keeps the newest comments from Jira."""
+        comments_data = {
+            "comments": [
+                {
+                    "id": "1",
+                    "body": "Oldest comment",
+                    "author": {"displayName": "John Doe"},
+                    "created": "2023-01-01T00:00:00.000+0000",
+                    "updated": "2023-01-01T00:00:00.000+0000",
+                },
+                {
+                    "id": "2",
+                    "body": "Middle comment",
+                    "author": {"displayName": "Jane Doe"},
+                    "created": "2023-01-02T00:00:00.000+0000",
+                    "updated": "2023-01-02T00:00:00.000+0000",
+                },
+                {
+                    "id": "3",
+                    "body": "Newest comment",
+                    "author": {"displayName": "Bob Doe"},
+                    "created": "2023-01-03T00:00:00.000+0000",
+                    "updated": "2023-01-03T00:00:00.000+0000",
+                },
+            ]
+        }
+
+        issue_data = make_issue_data(comment={"comments": []})
+
+        issues_mixin.jira.get_issue.return_value = issue_data
+        issues_mixin.jira.issue_get_comments.return_value = comments_data
+
+        issue = issues_mixin.get_issue("TEST-123", comment_limit=2)
+
+        issues_mixin.jira.issue_get_comments.assert_called_once_with("TEST-123")
+        assert [comment.id for comment in issue.comments] == ["2", "3"]
+        assert [comment.body for comment in issue.comments] == [
+            "Middle comment",
+            "Newest comment",
+        ]
+
     def test_get_issue_includes_comment_field_when_comment_limit_positive(
         self, issues_mixin: IssuesMixin
     ):
@@ -167,6 +220,7 @@ class TestIssuesMixin:
 
         call_args = issues_mixin.jira.get_issue.call_args
         fields_param = call_args[1]["fields"]
+        assert fields_param == ",".join(sorted(DEFAULT_READ_JIRA_FIELDS))
         assert "comment" not in fields_param
 
         issues_mixin.jira.issue_get_comments.assert_not_called()
@@ -288,6 +342,37 @@ class TestIssuesMixin:
         # Verify issue
         assert issue.key == "TEST-123"
         assert issue.summary == "Test Issue"
+
+    def test_create_issue_textarea_custom_field_uses_cloud_v3(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Cloud custom textarea values use the v3 create endpoint for ADF."""
+        create_response = {"id": "12345", "key": "TEST-123"}
+        issues_mixin._post_api3 = MagicMock(return_value=create_response)
+        issues_mixin.get_field_by_id = MagicMock(
+            return_value={
+                "name": "Resolution Summary",
+                "schema": {
+                    "type": "string",
+                    "custom": (
+                        "com.atlassian.jira.plugin.system.customfieldtypes:textarea"
+                    ),
+                },
+            }
+        )
+        issues_mixin.jira.get_issue.return_value = make_issue_data()
+
+        issues_mixin.create_issue(
+            project_key="TEST",
+            summary="Test Issue",
+            issue_type="Bug",
+            customfield_10078="## Summary",
+        )
+
+        issues_mixin._post_api3.assert_called_once()
+        sent_fields = issues_mixin._post_api3.call_args.args[1]["fields"]
+        assert sent_fields["customfield_10078"]["type"] == "doc"
+        assert sent_fields["customfield_10078"]["version"] == 1
 
     def test_create_issue_no_components(
         self, issues_mixin: IssuesMixin, make_issue_data
@@ -559,7 +644,8 @@ class TestIssuesMixin:
 
         # Mock the prepare_epic_fields method from EpicsMixin
         with patch(
-            "mcp_atlassian.jira.epics.EpicsMixin.prepare_epic_fields", autospec=True
+            "mcp_atlassian_with_bitbucket_and_privacy.jira.epics.EpicsMixin.prepare_epic_fields",
+            autospec=True,
         ) as mock_prepare_epic:
             # Set up the mock to store epic values in kwargs
             # Note: First argument is self because EpicsMixin.prepare_epic_fields is called as a class method
@@ -601,6 +687,42 @@ class TestIssuesMixin:
                 assert issues_mixin.get_issue.called
                 assert result.key == "EPIC-123"
 
+    def test_update_issue_handles_string_response_as_json(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Test update_issue handles Server/DC JSON string get_issue responses."""
+        import json
+
+        issue_dict = make_issue_data(summary="Updated Summary", status="In Progress")
+        # Simulate atlassian-python-api returning a JSON string instead of dict
+        issues_mixin.jira.get_issue.return_value = json.dumps(issue_dict)
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+
+        document = issues_mixin.update_issue(
+            issue_key="TEST-123", fields={"summary": "Updated Summary"}
+        )
+
+        assert document.key == "TEST-123"
+        assert document.summary == "Updated Summary"
+
+    def test_update_issue_handles_string_response_with_refetch(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Test update_issue re-fetches when a string response is not JSON."""
+        issue_dict = make_issue_data(summary="Refetched", status="Open")
+        # First call returns non-JSON string, direct GET returns dict
+        issues_mixin.jira.get_issue.return_value = "<html>WAF login page</html>"
+        issues_mixin.jira.get.return_value = issue_dict
+        issues_mixin.jira.resource_url.return_value = "/rest/api/2/issue/TEST-123"
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+
+        document = issues_mixin.update_issue(
+            issue_key="TEST-123", fields={"summary": "Refetched"}
+        )
+
+        issues_mixin.jira.get.assert_called_once_with("/rest/api/2/issue/TEST-123")
+        assert document.key == "TEST-123"
+
     def test_update_issue_basic(self, issues_mixin: IssuesMixin, make_issue_data):
         """Test updating an issue with basic fields."""
         issues_mixin.jira.get_issue.return_value = make_issue_data(
@@ -625,6 +747,263 @@ class TestIssuesMixin:
         assert document.id == "12345"
         assert document.key == "TEST-123"
         assert document.summary == "Updated Summary"
+
+    def test_update_issue_merges_path_and_inline_attachment_results(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Path and in-memory attachment uploads share one result report."""
+        issues_mixin.jira.get_issue.return_value = make_issue_data()
+        path_result = {
+            "success": True,
+            "issue_key": "TEST-123",
+            "total": 1,
+            "uploaded": [{"filename": "path.txt", "size": 4, "id": "1"}],
+            "failed": [],
+        }
+        inline_result = {
+            "success": False,
+            "issue_key": "TEST-123",
+            "total": 1,
+            "uploaded": [],
+            "failed": [{"filename": "inline.txt", "error": "upload failed"}],
+        }
+        inline_attachments = [{"filename": "inline.txt", "content": b"data"}]
+
+        with (
+            patch.object(
+                issues_mixin, "upload_attachments", return_value=path_result
+            ) as upload_paths,
+            patch.object(
+                issues_mixin,
+                "upload_attachments_from_content",
+                return_value=inline_result,
+            ) as upload_content,
+        ):
+            document = issues_mixin.update_issue(
+                issue_key="TEST-123",
+                attachments=["path.txt"],
+                attachments_base64=inline_attachments,
+            )
+
+        upload_paths.assert_called_once_with("TEST-123", ["path.txt"])
+        upload_content.assert_called_once_with("TEST-123", inline_attachments)
+        assert document.custom_fields["attachment_results"] == {
+            "success": True,
+            "issue_key": "TEST-123",
+            "total": 2,
+            "uploaded": [{"filename": "path.txt", "size": 4, "id": "1"}],
+            "failed": [{"filename": "inline.txt", "error": "upload failed"}],
+        }
+
+    def test_update_issue_preserves_existing_cloud_media_nodes(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Cloud markdown updates preserve existing top-level media blocks."""
+        media_single = {
+            "type": "mediaSingle",
+            "attrs": {"layout": "center"},
+            "content": [
+                {
+                    "type": "media",
+                    "attrs": {
+                        "id": "video-123",
+                        "type": "file",
+                        "collection": "",
+                    },
+                }
+            ],
+        }
+        current_description = {
+            "version": 1,
+            "type": "doc",
+            "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "Old"}]},
+                media_single,
+            ],
+        }
+        updated_description = {
+            "version": 1,
+            "type": "doc",
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": "Updated text"}],
+                },
+                media_single,
+            ],
+        }
+        issues_mixin._put_api3 = MagicMock(return_value={})
+        issues_mixin.jira.get.side_effect = [
+            {"key": "TEST-123", "fields": {"description": current_description}},
+        ]
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            description=updated_description
+        )
+
+        document = issues_mixin.update_issue(
+            issue_key="TEST-123",
+            fields={"description": "Updated text"},
+        )
+
+        issues_mixin._put_api3.assert_called_once()
+        call_args = issues_mixin._put_api3.call_args
+        assert call_args[0][0] == "issue/TEST-123"
+        sent_description = call_args[0][1]["fields"]["description"]
+        assert sent_description["content"][-1] == media_single
+        issues_mixin.jira.get.assert_called_once_with(
+            "rest/api/3/issue/TEST-123",
+            params={"fields": "description", "updateHistory": "false"},
+        )
+        issues_mixin.jira.get_issue.assert_called_once_with("TEST-123", fields=None)
+        assert document.key == "TEST-123"
+
+    def test_update_issue_with_explicit_adf_does_not_fetch_current_description(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Explicit ADF updates keep replace semantics and skip media prefetch."""
+        explicit_adf = {
+            "version": 1,
+            "type": "doc",
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": "Explicit ADF"}],
+                }
+            ],
+        }
+        issues_mixin._put_api3 = MagicMock(return_value={})
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            description=explicit_adf
+        )
+
+        issues_mixin.update_issue(
+            issue_key="TEST-123",
+            fields={"description": explicit_adf},
+        )
+
+        issues_mixin._put_api3.assert_called_once_with(
+            "issue/TEST-123",
+            {"fields": {"description": explicit_adf}},
+        )
+        issues_mixin.jira.get_issue.assert_called_once_with("TEST-123", fields=None)
+
+    def test_update_issue_textarea_custom_field_uses_cloud_v3(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Cloud custom textarea values use the v3 update endpoint for ADF."""
+        issues_mixin._put_api3 = MagicMock(return_value={})
+        issues_mixin.get_field_by_id = MagicMock(
+            return_value={
+                "name": "Resolution Summary",
+                "schema": {
+                    "type": "string",
+                    "custom": (
+                        "com.atlassian.jira.plugin.system.customfieldtypes:textarea"
+                    ),
+                },
+            }
+        )
+        issues_mixin.jira.get_issue.return_value = make_issue_data()
+
+        issues_mixin.update_issue(
+            issue_key="TEST-123",
+            customfield_10078="## Summary",
+        )
+
+        issues_mixin._put_api3.assert_called_once()
+        sent_fields = issues_mixin._put_api3.call_args.args[1]["fields"]
+        assert sent_fields["customfield_10078"]["type"] == "doc"
+        assert sent_fields["customfield_10078"]["version"] == 1
+
+    def test_update_issue_return_fields_forwarded(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """return_fields is normalized and forwarded to the post-update re-fetch."""
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            summary="Updated Summary"
+        )
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+
+        issues_mixin.update_issue(
+            issue_key="TEST-123",
+            fields={"summary": "Updated Summary"},
+            return_fields=["summary", "duedate"],
+        )
+
+        assert issues_mixin.jira.get_issue.call_args[1]["fields"] == ("summary,duedate")
+
+    def test_update_issue_return_fields_filter_standard_field_serialization(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """The requested standard field remains in the simplified response."""
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            summary="Updated Summary"
+        )
+
+        issue = issues_mixin.update_issue(
+            issue_key="TEST-123",
+            fields={"summary": "Updated Summary"},
+            return_fields=["summary"],
+        )
+
+        assert issue.to_simplified_dict() == {
+            "id": "12345",
+            "key": "TEST-123",
+            "summary": "Updated Summary",
+        }
+
+    def test_update_issue_return_fields_filter_custom_field_serialization(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """The requested custom field remains in the simplified response."""
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            customfield_10049="Custom value"
+        )
+
+        issue = issues_mixin.update_issue(
+            issue_key="TEST-123",
+            fields={"summary": "Updated Summary"},
+            return_fields=["customfield_10049"],
+        )
+
+        assert issue.to_simplified_dict() == {
+            "id": "12345",
+            "key": "TEST-123",
+            "customfield_10049": {"value": "Custom value"},
+        }
+
+    def test_update_issue_return_fields_none_by_default(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Omitting return_fields uses the API default field set."""
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            summary="Updated Summary"
+        )
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+
+        issues_mixin.update_issue(
+            issue_key="TEST-123", fields={"summary": "Updated Summary"}
+        )
+
+        assert issues_mixin.jira.get_issue.call_args[1]["fields"] is None
+
+    def test_update_issue_with_status_forwards_return_fields(
+        self, issues_mixin: IssuesMixin
+    ):
+        """return_fields is forwarded through the status-change re-fetch."""
+        issues_mixin.get_available_transitions = MagicMock(
+            return_value=[
+                {"id": "21", "name": "In Progress", "to_status": "In Progress"}
+            ]
+        )
+
+        issues_mixin.update_issue(
+            issue_key="TEST-123",
+            status="In Progress",
+            return_fields="summary",
+        )
+
+        assert issues_mixin.jira.get_issue.call_args[1]["fields"] == "summary"
 
     def test_update_issue_with_status(self, issues_mixin: IssuesMixin):
         """Test updating an issue with a status change."""
@@ -668,6 +1047,69 @@ class TestIssuesMixin:
             issue_key="TEST-123", update={"fields": {"summary": "Updated"}}
         )
 
+    def test_update_issue_assignee_dict_passthrough_name(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Dict-shaped assignee (Server/DC name form) is forwarded as-is.
+
+        _get_account_id must NOT be called — caller already has the canonical
+        shape (typically from search_assignable_users / get_user_profile) and
+        we must not require global "Browse Users" permission just to relay it.
+        """
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            description="This is a test"
+        )
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+        issues_mixin._get_account_id = MagicMock()
+
+        issues_mixin.update_issue(
+            issue_key="TEST-123", assignee={"name": "jdoe@example.com"}
+        )
+
+        issues_mixin._get_account_id.assert_not_called()
+        issues_mixin.jira.update_issue.assert_called_once_with(
+            issue_key="TEST-123",
+            update={"fields": {"assignee": {"name": "jdoe@example.com"}}},
+        )
+
+    def test_update_issue_assignee_dict_passthrough_accountid(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Cloud-shape assignee dict ({"accountId": ...}) is forwarded as-is too."""
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            description="This is a test"
+        )
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+        issues_mixin._get_account_id = MagicMock()
+
+        issues_mixin.update_issue(
+            issue_key="TEST-123",
+            assignee={"accountId": "5b10ac8d82e05b22cc7d4ef5"},
+        )
+
+        issues_mixin._get_account_id.assert_not_called()
+        issues_mixin.jira.update_issue.assert_called_once_with(
+            issue_key="TEST-123",
+            update={"fields": {"assignee": {"accountId": "5b10ac8d82e05b22cc7d4ef5"}}},
+        )
+
+    def test_update_issue_assignee_unresolvable_does_not_update(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """An unresolvable assignee must not silently turn into a no-op update."""
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            description="This is a test"
+        )
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+        issues_mixin._get_account_id = MagicMock(side_effect=ValueError("not found"))
+
+        with pytest.raises(ValueError, match="Could not update assignee"):
+            issues_mixin.update_issue(
+                issue_key="TEST-123", assignee="ghost@example.com"
+            )
+
+        issues_mixin.jira.update_issue.assert_not_called()
+
     def test_update_issue_unassign(self, issues_mixin: IssuesMixin, make_issue_data):
         """Test unassigning an issue."""
         issues_mixin.jira.get_issue.return_value = make_issue_data(
@@ -683,6 +1125,116 @@ class TestIssuesMixin:
         )
         assert not issues_mixin._get_account_id.called
         assert document.key == "TEST-123"
+
+    def test_update_issue_assignee_unresolvable_raises(self, issues_mixin: IssuesMixin):
+        """Test that update_issue raises when assignee cannot be resolved."""
+        issues_mixin._get_account_id = MagicMock(
+            side_effect=ValueError("Could not find account ID for user: ghost")
+        )
+
+        with pytest.raises(ValueError, match="Could not update assignee"):
+            issues_mixin.update_issue(issue_key="TEST-123", assignee="ghost")
+
+        issues_mixin.jira.update_issue.assert_not_called()
+
+    def test_assign_issue(self, issues_mixin: IssuesMixin, make_issue_data):
+        """Test assigning an issue to a user via dedicated endpoint."""
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            description="This is a test"
+        )
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+        issues_mixin._get_account_id = MagicMock(return_value="account-123")
+
+        document = issues_mixin.assign_issue(
+            issue_key="TEST-123", assignee="user@example.com"
+        )
+
+        issues_mixin._get_account_id.assert_called_once_with(
+            "user@example.com", issue_key="TEST-123"
+        )
+        issues_mixin.jira.assign_issue.assert_called_once_with(
+            "TEST-123", "account-123"
+        )
+        assert document.key == "TEST-123"
+
+    def test_assign_issue_unassign(self, issues_mixin: IssuesMixin, make_issue_data):
+        """Test unassigning an issue (passing None)."""
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            description="This is a test"
+        )
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+        issues_mixin._get_account_id = MagicMock()
+
+        document = issues_mixin.assign_issue(issue_key="TEST-123", assignee=None)
+
+        issues_mixin.jira.assign_issue.assert_called_once_with("TEST-123", None)
+        assert not issues_mixin._get_account_id.called
+        assert document.key == "TEST-123"
+
+    def test_assign_issue_empty_string(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Test unassigning an issue (passing empty string)."""
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            description="This is a test"
+        )
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+        issues_mixin._get_account_id = MagicMock()
+
+        document = issues_mixin.assign_issue(issue_key="TEST-123", assignee="")
+
+        issues_mixin.jira.assign_issue.assert_called_once_with("TEST-123", None)
+        assert not issues_mixin._get_account_id.called
+        assert document.key == "TEST-123"
+
+    def test_assign_issue_assignee_dict_passthrough_account_id(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Cloud-shaped assignee dict is unwrapped without user lookup."""
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            description="This is a test"
+        )
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+        issues_mixin._get_account_id = MagicMock()
+
+        document = issues_mixin.assign_issue(
+            issue_key="TEST-123",
+            assignee={"account_id": "5b10ac8d82e05b22cc7d4ef5"},
+        )
+
+        issues_mixin._get_account_id.assert_not_called()
+        issues_mixin.jira.assign_issue.assert_called_once_with(
+            "TEST-123", "5b10ac8d82e05b22cc7d4ef5"
+        )
+        assert document.key == "TEST-123"
+
+    def test_assign_issue_assignee_dict_passthrough_name(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Server/DC-shaped assignee dict is unwrapped without user lookup."""
+        issues_mixin.config.url = "https://jira.example.com"
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            description="This is a test"
+        )
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+        issues_mixin._get_account_id = MagicMock()
+
+        document = issues_mixin.assign_issue(
+            issue_key="TEST-123",
+            assignee={"name": "jdoe"},
+        )
+
+        issues_mixin._get_account_id.assert_not_called()
+        issues_mixin.jira.assign_issue.assert_called_once_with("TEST-123", "jdoe")
+        assert document.key == "TEST-123"
+
+    def test_assign_issue_error(self, issues_mixin: IssuesMixin):
+        """Test error handling when assignment fails."""
+        issues_mixin.jira.assign_issue.side_effect = Exception("Permission denied")
+        issues_mixin._get_account_id = MagicMock(return_value="account-123")
+
+        with pytest.raises(ValueError, match="Failed to assign issue TEST-123"):
+            issues_mixin.assign_issue(issue_key="TEST-123", assignee="user@example.com")
 
     def test_update_issue_components(self, issues_mixin: IssuesMixin):
         """Test updating an issue's components field."""
@@ -779,6 +1331,172 @@ class TestIssuesMixin:
         )
         assert document.key == "TEST-123"
 
+    def test_update_issue_clears_field_with_none(self, issues_mixin: IssuesMixin):
+        """Test update_issue passes None through kwargs to clear a field."""
+        issue_data = {
+            "id": "12345",
+            "key": "TEST-123",
+            "fields": {
+                "summary": "Test Issue",
+                "description": "This is a test",
+                "status": {"name": "Open"},
+                "issuetype": {"name": "Bug"},
+            },
+        }
+        issues_mixin.jira.get_issue.return_value = issue_data
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+
+        issues_mixin.update_issue(issue_key="TEST-123", priority=None)
+
+        issues_mixin.jira.update_issue.assert_called_once()
+        call_kwargs = issues_mixin.jira.update_issue.call_args
+        fields = call_kwargs[1]["update"]["fields"]
+        assert "priority" in fields
+        assert fields["priority"] is None
+
+    def test_update_issue_set_parent_with_string_key(self, issues_mixin: IssuesMixin):
+        """Test setting a parent via a plain issue key string."""
+        issue_data = {
+            "id": "12345",
+            "key": "TEST-123",
+            "fields": {
+                "summary": "Test Issue",
+                "description": "This is a test",
+                "status": {"name": "Open"},
+                "issuetype": {"name": "Task"},
+            },
+        }
+        issues_mixin.jira.get_issue.return_value = issue_data
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+
+        issues_mixin.update_issue(issue_key="TEST-123", parent="EPIC-1")
+
+        issues_mixin.jira.update_issue.assert_called_once_with(
+            issue_key="TEST-123", update={"fields": {"parent": {"key": "EPIC-1"}}}
+        )
+
+    def test_update_issue_set_parent_with_dict(self, issues_mixin: IssuesMixin):
+        """Test setting a parent via an already-shaped {"key": ...} dict."""
+        issue_data = {
+            "id": "12345",
+            "key": "TEST-123",
+            "fields": {
+                "summary": "Test Issue",
+                "description": "This is a test",
+                "status": {"name": "Open"},
+                "issuetype": {"name": "Task"},
+            },
+        }
+        issues_mixin.jira.get_issue.return_value = issue_data
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+
+        issues_mixin.update_issue(issue_key="TEST-123", parent={"key": "EPIC-2"})
+
+        issues_mixin.jira.update_issue.assert_called_once_with(
+            issue_key="TEST-123", update={"fields": {"parent": {"key": "EPIC-2"}}}
+        )
+
+    @pytest.mark.parametrize("parent_value", [None, ""])
+    @pytest.mark.parametrize("input_style", ["keyword", "fields"])
+    def test_update_issue_clear_parent_on_cloud(
+        self,
+        issues_mixin: IssuesMixin,
+        parent_value: None | str,
+        input_style: str,
+    ):
+        """Cloud sends an explicit null when clearing an issue parent."""
+        issue_data = {
+            "id": "12345",
+            "key": "TEST-123",
+            "fields": {
+                "summary": "Test Issue",
+                "description": "This is a test",
+                "status": {"name": "Open"},
+                "issuetype": {"name": "Task"},
+            },
+        }
+        issues_mixin.jira.get_issue.return_value = issue_data
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+
+        if input_style == "keyword":
+            document = issues_mixin.update_issue(
+                issue_key="TEST-123", parent=parent_value
+            )
+        else:
+            document = issues_mixin.update_issue(
+                issue_key="TEST-123", fields={"parent": parent_value}
+            )
+
+        issues_mixin.jira.update_issue.assert_called_once_with(
+            issue_key="TEST-123", update={"fields": {"parent": None}}
+        )
+        assert document.key == "TEST-123"
+
+    @pytest.mark.parametrize("parent_value", [None, ""])
+    def test_update_issue_clear_parent_on_server_dc(
+        self, issues_mixin: IssuesMixin, parent_value: None | str
+    ):
+        """Server/DC rejects parent clearing before making an update request."""
+        issues_mixin.config.url = "https://jira.example.com"
+        issue_data = {
+            "id": "12345",
+            "key": "TEST-123",
+            "fields": {
+                "summary": "Test Issue",
+                "description": "This is a test",
+                "status": {"name": "Open"},
+                "issuetype": {"name": "Task"},
+            },
+        }
+        issues_mixin.jira.get_issue.return_value = issue_data
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+
+        with pytest.raises(ValueError, match="supported only on Jira Cloud"):
+            issues_mixin.update_issue(issue_key="TEST-123", parent=parent_value)
+
+        issues_mixin.jira.update_issue.assert_not_called()
+        issues_mixin.jira.get_issue.assert_not_called()
+
+    @pytest.mark.parametrize("parent_value", [None, ""])
+    def test_update_issue_clear_parent_in_fields_on_server_dc(
+        self, issues_mixin: IssuesMixin, parent_value: None | str
+    ):
+        """Server/DC rejects a JSON ``{"parent": null}`` field update early."""
+        issues_mixin.config.url = "https://jira.example.com"
+
+        with pytest.raises(ValueError, match="customfield_10014"):
+            issues_mixin.update_issue(
+                issue_key="TEST-123", fields={"parent": parent_value}
+            )
+
+        issues_mixin.jira.update_issue.assert_not_called()
+        issues_mixin.jira.get_issue.assert_not_called()
+
+    def test_update_issue_invalid_parent_value_is_skipped(
+        self, issues_mixin: IssuesMixin, caplog
+    ):
+        """A genuinely invalid parent value (not a dict-with-key, string, or
+        None/"") is still warned about and skipped rather than sent to Jira.
+        """
+        issue_data = {
+            "id": "12345",
+            "key": "TEST-123",
+            "fields": {
+                "summary": "Test Issue",
+                "description": "This is a test",
+                "status": {"name": "Open"},
+                "issuetype": {"name": "Task"},
+            },
+        }
+        issues_mixin.jira.get_issue.return_value = issue_data
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+
+        issues_mixin.update_issue(issue_key="TEST-123", parent=123)
+
+        # No fields to update, so the PUT is skipped entirely.
+        issues_mixin.jira.update_issue.assert_not_called()
+        assert "Invalid parent value for issue TEST-123" in caplog.text
+
     def test_delete_issue(self, issues_mixin: IssuesMixin):
         """Test deleting an issue."""
         # Call the method
@@ -813,6 +1531,44 @@ class TestIssuesMixin:
         # Verify fixVersions was added correctly to fields
         assert "fixVersions" in fields
         assert fields["fixVersions"] == [{"name": "TestRelease"}]
+
+    def test_process_additional_fields_none_clears_field(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Test _process_additional_fields passes None through to clear fields."""
+        fields = {}
+        kwargs = {"customfield_10013": None}  # Sprint field, set to null
+
+        issues_mixin._process_additional_fields(fields, kwargs)
+
+        # None must be preserved — it tells Jira API to clear the field
+        assert "customfield_10013" in fields
+        assert fields["customfield_10013"] is None
+
+    def test_process_additional_fields_none_clears_named_field(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Test _process_additional_fields passes None through for named fields."""
+        fields = {}
+        kwargs = {"priority": None}
+
+        issues_mixin._process_additional_fields(fields, kwargs)
+
+        # priority=None should clear the priority field
+        assert "priority" in fields
+        assert fields["priority"] is None
+
+    def test_process_additional_fields_invalid_value_still_skipped(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Test _process_additional_fields still skips fields with invalid format."""
+        fields = {}
+        kwargs = {"priority": 12345}  # Invalid: priority expects string or dict
+
+        issues_mixin._process_additional_fields(fields, kwargs)
+
+        # Invalid value should NOT be added to fields
+        assert "priority" not in fields
 
     def test_create_issue_with_parent_for_task(
         self, issues_mixin: IssuesMixin, make_issue_data
@@ -978,6 +1734,14 @@ class TestIssuesMixin:
         # Test with "*all" parameter
         issue = issues_mixin.get_issue("TEST-123", fields="*all")
 
+        issues_mixin.jira.get_issue.assert_called_once_with(
+            "TEST-123",
+            expand=None,
+            fields="*all",
+            properties=None,
+            update_history=True,
+        )
+
         # Check that all fields are included
         simplified = issue.to_simplified_dict()
         assert "summary" in simplified
@@ -1090,6 +1854,48 @@ class TestIssuesMixin:
         assert len(call_args) == 2
         assert call_args[0]["fields"]["summary"] == "Test Issue 1"
         assert call_args[1]["fields"]["summary"] == "Test Issue 2"
+
+    def test_batch_create_issues_textarea_custom_field_uses_cloud_v3(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Cloud batch creation uses v3 when a custom textarea produces ADF."""
+        bulk_response = {
+            "issues": [{"id": "1", "key": "TEST-1"}],
+            "errors": [],
+        }
+        issues_mixin._post_api3 = MagicMock(return_value=bulk_response)
+        issues_mixin.get_field_by_id = MagicMock(
+            return_value={
+                "name": "Resolution Summary",
+                "schema": {
+                    "type": "string",
+                    "custom": (
+                        "com.atlassian.jira.plugin.system.customfieldtypes:textarea"
+                    ),
+                },
+            }
+        )
+        issues_mixin.jira.get_issue.return_value = {
+            "id": "1",
+            "key": "TEST-1",
+            "fields": {"summary": "Test Issue"},
+        }
+
+        issues_mixin.batch_create_issues(
+            [
+                {
+                    "project_key": "TEST",
+                    "summary": "Test Issue",
+                    "issue_type": "Task",
+                    "customfield_10078": "## Summary",
+                }
+            ]
+        )
+
+        issues_mixin._post_api3.assert_called_once()
+        payload = issues_mixin._post_api3.call_args.args[1]
+        sent_fields = payload["issueUpdates"][0]["fields"]
+        assert sent_fields["customfield_10078"]["type"] == "doc"
 
     def test_batch_create_issues_validate_only(self, issues_mixin: IssuesMixin):
         """Test batch_create_issues with validate_only=True."""
@@ -1386,6 +2192,7 @@ class TestIssuesMixin:
                 "changelogs": [
                     {
                         "author": {
+                            "account_id": "user123",
                             "avatar_url": None,
                             "display_name": "Test User 1",
                             "email": None,
@@ -1411,6 +2218,7 @@ class TestIssuesMixin:
                 "changelogs": [
                     {
                         "author": {
+                            "account_id": "user456",
                             "avatar_url": None,
                             "display_name": "Test User 2",
                             "email": None,
@@ -1428,6 +2236,7 @@ class TestIssuesMixin:
                     },
                     {
                         "author": {
+                            "account_id": "user789",
                             "avatar_url": None,
                             "display_name": "Test User 3",
                             "email": None,
@@ -1447,6 +2256,7 @@ class TestIssuesMixin:
                     },
                     {
                         "author": {
+                            "account_id": "user123",
                             "avatar_url": None,
                             "display_name": "Test User 1",
                             "email": None,
@@ -1737,3 +2547,736 @@ class TestIssuesMixin:
         assert isinstance(result, JiraIssue)
         assert result.key == "DEV-123"
         assert result.summary == "Development issue"
+
+    @pytest.mark.parametrize(
+        "issue_response",
+        [None, [], {"fields": None}, {"fields": {"description": []}}],
+    )
+    def test_preserve_cloud_description_media_returns_target_for_invalid_response(
+        self, issues_mixin: IssuesMixin, issue_response
+    ):
+        """Test media preservation ignores invalid issue responses."""
+        target_adf = {"type": "doc", "version": 1, "content": []}
+        issues_mixin.jira.get.return_value = issue_response
+
+        result = issues_mixin._preserve_cloud_description_media("TEST-123", target_adf)
+
+        assert result is target_adf
+
+    def test_preserve_cloud_description_media_merges_existing_media(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Test media preservation delegates to the ADF merge helper."""
+        target_adf = {"type": "doc", "version": 1, "content": []}
+        source_adf = {"type": "doc", "version": 1, "content": [{"type": "media"}]}
+        merged_adf = {"type": "doc", "version": 1, "content": ["merged"]}
+        issues_mixin.jira.get.return_value = {"fields": {"description": source_adf}}
+
+        with patch(
+            "mcp_atlassian_with_bitbucket_and_privacy.jira.issues.merge_adf_with_preserved_media",
+            return_value=merged_adf,
+        ) as merge_media:
+            result = issues_mixin._preserve_cloud_description_media(
+                "TEST-123", target_adf
+            )
+
+        assert result == merged_adf
+        merge_media.assert_called_once_with(
+            target_adf=target_adf,
+            source_adf=source_adf,
+        )
+
+    def test_extract_epic_information_for_linked_issue(self, issues_mixin: IssuesMixin):
+        """Test linked Epic metadata is extracted from the referenced Epic."""
+        issues_mixin.get_field_ids_to_epic = MagicMock(
+            return_value={
+                "epic_link": "customfield_10014",
+                "epic_name": "customfield_10011",
+            }
+        )
+        issues_mixin.jira.get_issue.return_value = {
+            "fields": {
+                "summary": "Epic summary",
+                "customfield_10011": "Epic name",
+            }
+        }
+
+        result = issues_mixin._extract_epic_information(
+            {
+                "fields": {
+                    "issuetype": {"name": "Task"},
+                    "customfield_10014": "EPIC-1",
+                }
+            }
+        )
+
+        assert result == {
+            "epic_key": "EPIC-1",
+            "epic_name": "Epic name",
+            "epic_summary": "Epic summary",
+            "is_epic": False,
+        }
+
+    def test_extract_epic_information_handles_field_discovery_error(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Test Epic extraction returns defaults when field discovery fails."""
+        issues_mixin.get_field_ids_to_epic = MagicMock(
+            side_effect=RuntimeError("fields unavailable")
+        )
+
+        result = issues_mixin._extract_epic_information(
+            {"fields": {"issuetype": {"name": "Task"}}}
+        )
+
+        assert result["epic_key"] is None
+        assert result["is_epic"] is False
+
+    def test_format_issue_content_includes_people_epic_and_comments(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Test formatted issue content includes optional display sections."""
+        issues_mixin._clean_text = MagicMock(return_value="Clean comment")
+        issue = {
+            "fields": {
+                "summary": "Test issue",
+                "status": {"name": "Open"},
+                "issuetype": {"name": "Task"},
+                "reporter": {"displayName": "Reporter"},
+                "assignee": {"name": "Assignee"},
+            }
+        }
+
+        result = issues_mixin._format_issue_content(
+            issue_key="TEST-123",
+            issue=issue,
+            description="Description",
+            comments=[
+                {
+                    "author": {"displayName": "Commenter"},
+                    "body": "Comment body",
+                    "created": "2024-01-01T00:00:00.000+0000",
+                }
+            ],
+            created_date="2024-01-01",
+            epic_info={
+                "is_epic": False,
+                "epic_key": "EPIC-1",
+                "epic_name": "Epic",
+                "epic_summary": "Epic summary",
+            },
+        )
+
+        assert "# TEST-123: Test issue" in result
+        assert "**Reporter**: Reporter" in result
+        assert "**Assignee**: Assignee" in result
+        assert "**Epic**: [EPIC-1] Epic summary" in result
+        assert "## Description" in result
+        assert "**Commenter**" in result
+        assert "Clean comment" in result
+
+    @pytest.mark.parametrize(
+        ("epic_info", "expected"),
+        [
+            (
+                {
+                    "is_epic": True,
+                    "epic_key": None,
+                    "epic_name": "Epic name",
+                    "epic_summary": None,
+                },
+                {"is_epic": True, "epic_name": "Epic name"},
+            ),
+            (
+                {
+                    "is_epic": False,
+                    "epic_key": "EPIC-1",
+                    "epic_name": "Epic name",
+                    "epic_summary": "Epic summary",
+                },
+                {
+                    "epic_key": "EPIC-1",
+                    "epic_name": "Epic name",
+                    "epic_summary": "Epic summary",
+                },
+            ),
+        ],
+    )
+    def test_create_issue_metadata_includes_epic_data(
+        self, issues_mixin: IssuesMixin, epic_info, expected
+    ):
+        """Test issue metadata includes the relevant Epic fields."""
+        metadata = issues_mixin._create_issue_metadata(
+            issue_key="TEST-123",
+            issue={
+                "fields": {
+                    "summary": "Test issue",
+                    "status": {"name": "Open"},
+                    "issuetype": {"name": "Task"},
+                    "assignee": {"displayName": "Assignee"},
+                }
+            },
+            comments=[{"id": "1"}],
+            created_date="2024-01-01",
+            epic_info=epic_info,
+        )
+
+        assert metadata["assignee"] == "Assignee"
+        assert metadata["comment_count"] == 1
+        for key, value in expected.items():
+            assert metadata[key] == value
+
+    @pytest.mark.parametrize(
+        ("issue_types", "expected"),
+        [
+            ([{"id": "100", "name": "Epic"}], "100"),
+            ([{"id": "101", "name": "Team Epic"}], "101"),
+            ([{"id": "102", "name": "Task"}], None),
+        ],
+    )
+    def test_find_epic_issue_type_id(
+        self, issues_mixin: IssuesMixin, issue_types, expected
+    ):
+        """Test Epic issue type lookup prefers exact and localized matches."""
+        issues_mixin.get_project_issue_types = MagicMock(return_value=issue_types)
+
+        assert issues_mixin._find_epic_issue_type_id("TEST") == expected
+
+    @pytest.mark.parametrize(
+        ("issue_types", "expected"),
+        [
+            (
+                [
+                    {"id": "1", "name": "Child", "subtask": True},
+                    {"id": "2", "name": "Sub-Task", "subtask": True},
+                ],
+                "2",
+            ),
+            ([{"id": "1", "name": "Child", "subtask": True}], "1"),
+            ([{"id": "3", "name": "Task", "subtask": False}], None),
+        ],
+    )
+    def test_find_subtask_issue_type_id(
+        self, issues_mixin: IssuesMixin, issue_types, expected
+    ):
+        """Test subtask issue type lookup prefers normalized Sub-Task names."""
+        issues_mixin.get_project_issue_types = MagicMock(return_value=issue_types)
+
+        assert issues_mixin._find_subtask_issue_type_id("TEST") == expected
+
+    def test_prepare_epic_link_fields_uses_cloud_parent_fallback(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Test Cloud Epic aliases fall back to the parent field."""
+        issues_mixin.config.url = "https://test.atlassian.net"
+        issues_mixin.get_field_ids_to_epic = MagicMock(return_value={})
+        fields = {}
+        kwargs = {"epicKey": "EPIC-1"}
+
+        issues_mixin._prepare_epic_link_fields(fields, kwargs)
+
+        assert fields == {"parent": {"key": "EPIC-1"}}
+        assert kwargs == {}
+
+    def test_get_target_issue_type_id_matches_normalized_name(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Test move issue type lookup falls back to normalized names."""
+        issues_mixin.jira.get_issue.return_value = {
+            "fields": {"issuetype": {"id": "100", "name": "Sub-Task", "subtask": True}}
+        }
+        issues_mixin.get_project_issue_types = MagicMock(
+            return_value=[
+                {"id": "200", "name": "Sub Task", "subtask": True},
+            ]
+        )
+
+        result = issues_mixin._get_target_issue_type_id("TEST-1", "NEXT")
+
+        assert result == "200"
+
+    @pytest.mark.parametrize(
+        ("field", "expected"),
+        [
+            ({"id": "summary", "name": "Epic Link"}, {}),
+            (
+                {"id": "customfield_10014", "name": "Epic Link"},
+                {
+                    "epic_link": "customfield_10014",
+                    "Epic Link": "customfield_10014",
+                },
+            ),
+            (
+                {"id": "customfield_10011", "name": "Epic Name"},
+                {
+                    "epic_name": "customfield_10011",
+                    "Epic Name": "customfield_10011",
+                },
+            ),
+        ],
+    )
+    def test_process_field_for_epic_data(
+        self, issues_mixin: IssuesMixin, field, expected
+    ):
+        """Test only supported custom Epic fields update the field map."""
+        field_ids = {}
+
+        issues_mixin._process_field_for_epic_data(field, field_ids)
+
+        assert field_ids == expected
+
+    def test_get_raw_transitions_wraps_errors(self, issues_mixin: IssuesMixin):
+        """Test raw transition errors include the issue key."""
+        issues_mixin.jira.get_issue_transitions.side_effect = RuntimeError(
+            "transitions unavailable"
+        )
+
+        with pytest.raises(Exception, match="TEST-123"):
+            issues_mixin._get_raw_transitions("TEST-123")
+
+    def test_extract_epic_information_for_epic(self, issues_mixin: IssuesMixin):
+        """Test an Epic issue reports its discovered Epic Name."""
+        issues_mixin.get_field_ids_to_epic = MagicMock(
+            return_value={"epic_name": "customfield_10011"}
+        )
+
+        result = issues_mixin._extract_epic_information(
+            {
+                "fields": {
+                    "issuetype": {"name": "Epic"},
+                    "customfield_10011": "Platform Epic",
+                }
+            }
+        )
+
+        assert result["is_epic"] is True
+        assert result["epic_name"] == "Platform Epic"
+
+    def test_extract_epic_information_handles_invalid_epic_response(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Test invalid linked Epic responses do not fail issue retrieval."""
+        issues_mixin.get_field_ids_to_epic = MagicMock(
+            return_value={"epic_link": "customfield_10014"}
+        )
+        issues_mixin.jira.get_issue.return_value = []
+
+        result = issues_mixin._extract_epic_information(
+            {
+                "fields": {
+                    "issuetype": {"name": "Task"},
+                    "customfield_10014": "EPIC-1",
+                }
+            }
+        )
+
+        assert result["epic_key"] == "EPIC-1"
+        assert result["epic_summary"] is None
+
+    def test_format_issue_content_for_epic_without_optional_sections(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Test Epic content omits absent people, description, and comments."""
+        result = issues_mixin._format_issue_content(
+            issue_key="EPIC-1",
+            issue={
+                "fields": {
+                    "summary": "Platform Epic",
+                    "status": {"name": "Open"},
+                    "issuetype": {"name": "Epic"},
+                }
+            },
+            description="",
+            comments=[],
+            created_date="2024-01-01",
+            epic_info={
+                "is_epic": True,
+                "epic_key": None,
+                "epic_name": "Platform Epic",
+                "epic_summary": None,
+            },
+        )
+
+        assert "**Epic Name**: Platform Epic" in result
+        assert "## Description" not in result
+        assert "## Comments" not in result
+
+    @pytest.mark.parametrize(
+        ("fields", "kwargs", "expected_fields", "error"),
+        [
+            (
+                {"issuetype": {"name": "Task"}},
+                {"parent": "TEST-1"},
+                {
+                    "issuetype": {"name": "Task"},
+                    "parent": {"key": "TEST-1"},
+                },
+                None,
+            ),
+            (
+                {"issuetype": {"name": "Sub-Task"}},
+                {},
+                {"issuetype": {"name": "Sub-Task"}},
+                ValueError,
+            ),
+        ],
+    )
+    def test_prepare_parent_fields(
+        self, issues_mixin: IssuesMixin, fields, kwargs, expected_fields, error
+    ):
+        """Test parent preparation handles explicit parents and missing subtasks."""
+        if error:
+            with pytest.raises(error):
+                issues_mixin._prepare_parent_fields(fields, kwargs)
+        else:
+            issues_mixin._prepare_parent_fields(fields, kwargs)
+            assert fields == expected_fields
+            assert "parent" not in kwargs
+
+    def test_prepare_epic_link_fields_uses_discovered_field(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Test Epic aliases use the discovered custom field when available."""
+        issues_mixin.get_field_ids_to_epic = MagicMock(
+            return_value={"epic_link": "customfield_10014"}
+        )
+        fields = {}
+        kwargs = {"epic_link": "EPIC-1"}
+
+        issues_mixin._prepare_epic_link_fields(fields, kwargs)
+
+        assert fields == {"customfield_10014": "EPIC-1"}
+        assert kwargs == {}
+
+    @pytest.mark.parametrize(
+        "exception",
+        [
+            RuntimeError("Epic Name is required"),
+            RuntimeError("customfield_12345 is required"),
+            RuntimeError("permission denied"),
+        ],
+    )
+    def test_handle_create_issue_error(
+        self, issues_mixin: IssuesMixin, exception, caplog
+    ):
+        """Test create issue errors are logged with actionable context."""
+        with caplog.at_level("ERROR", logger=logger.name):
+            issues_mixin._handle_create_issue_error(exception, "Epic")
+
+        assert str(exception) in caplog.text
+
+    def test_transition_issue_success(self, issues_mixin: IssuesMixin):
+        """Test transitioning an issue delegates and refetches it."""
+        issues_mixin.get_issue = MagicMock(
+            return_value=JiraIssue(id="1", key="TEST-1", summary="Test")
+        )
+
+        result = IssuesMixin.transition_issue(issues_mixin, "TEST-1", "Done")
+
+        issues_mixin.jira.set_issue_status.assert_called_once_with(
+            issue_key="TEST-1",
+            status_name="Done",
+            fields=None,
+            update=None,
+        )
+        assert result.key == "TEST-1"
+
+    def test_transition_issue_propagates_errors(self, issues_mixin: IssuesMixin):
+        """Test transition failures are propagated unchanged."""
+        issues_mixin.jira.set_issue_status.side_effect = RuntimeError(
+            "transition failed"
+        )
+
+        with pytest.raises(RuntimeError, match="transition failed"):
+            IssuesMixin.transition_issue(issues_mixin, "TEST-1", "Done")
+
+    def test_preserve_cloud_description_media_handles_request_error(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Test media preservation falls back when Jira cannot be queried."""
+        target_adf = {"type": "doc", "version": 1, "content": []}
+        issues_mixin.jira.get.side_effect = OSError("connection failed")
+
+        result = issues_mixin._preserve_cloud_description_media("TEST-123", target_adf)
+
+        assert result is target_adf
+
+    @pytest.mark.parametrize(
+        ("status_code", "expected_error"),
+        [
+            (401, MCPAtlassianAuthenticationError),
+            (404, ValueError),
+        ],
+    )
+    def test_get_issue_maps_http_errors(
+        self, issues_mixin: IssuesMixin, status_code, expected_error
+    ):
+        """Test common Jira HTTP failures map to actionable exceptions."""
+        response = MagicMock()
+        response.status_code = status_code
+        issues_mixin.jira.get_issue.side_effect = HTTPError(response=response)
+
+        with pytest.raises(expected_error):
+            issues_mixin.get_issue("TEST-404")
+
+    def test_get_issue_maps_connection_error(self, issues_mixin: IssuesMixin):
+        """Test Jira connection failures include the configured instance URL."""
+        issues_mixin.jira.get_issue.side_effect = RequestsConnectionError(
+            "connection refused"
+        )
+
+        with pytest.raises(Exception, match="Could not connect to Jira"):
+            issues_mixin.get_issue("TEST-123")
+
+    def test_get_issue_reports_missing_issue(self, issues_mixin: IssuesMixin):
+        """Test empty Jira responses report that the issue was not found."""
+        issues_mixin.jira.get_issue.return_value = None
+
+        with pytest.raises(Exception, match="Issue TEST-404 not found"):
+            issues_mixin.get_issue("TEST-404")
+
+    def test_get_issue_comments_if_needed_handles_invalid_response(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Test invalid comment responses produce an empty comment list."""
+        issues_mixin.jira.issue_get_comments.return_value = []
+
+        result = issues_mixin._get_issue_comments_if_needed("TEST-123", 10)
+
+        assert result == []
+
+    def test_get_issue_comments_if_needed_skips_zero_limit(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Test a zero comment limit avoids the Jira comments endpoint."""
+        result = issues_mixin._get_issue_comments_if_needed("TEST-123", 0)
+
+        assert result == []
+        issues_mixin.jira.issue_get_comments.assert_not_called()
+
+
+class TestMoveIssue:
+    """Tests for IssuesMixin.move_issue."""
+
+    @pytest.fixture
+    def cloud_mixin(self, jira_fetcher: JiraFetcher) -> IssuesMixin:
+        """IssuesMixin wired to a Cloud instance."""
+        mixin = jira_fetcher
+        mixin.config.url = "https://test.atlassian.net"
+        return mixin
+
+    @pytest.fixture
+    def server_mixin(self, jira_fetcher: JiraFetcher) -> IssuesMixin:
+        """IssuesMixin wired to a Server/DC instance."""
+        mixin = jira_fetcher
+        mixin.config.url = "https://jira.example.com"
+        return mixin
+
+    def _task_response(
+        self,
+        status: str,
+        processed_issues: list[str] | None = None,
+        invalid_count: int = 0,
+    ) -> dict[str, Any]:
+        return {
+            "status": status,
+            "processedAccessibleIssues": processed_issues or [],
+            "invalidOrInaccessibleIssueCount": invalid_count,
+        }
+
+    def _source_issue_response(
+        self,
+        issue_type_id: str = "10000",
+        issue_type_name: str = "Task",
+        *,
+        subtask: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "fields": {
+                "issuetype": {
+                    "id": issue_type_id,
+                    "name": issue_type_name,
+                    "subtask": subtask,
+                }
+            }
+        }
+
+    def _configure_target_issue_types(
+        self,
+        cloud_mixin: IssuesMixin,
+        issue_types: list[dict[str, Any]] | None = None,
+    ) -> None:
+        cloud_mixin.jira.issue_createmeta_issuetypes = MagicMock(
+            return_value={
+                "values": issue_types
+                or [{"id": "10000", "name": "Task", "subtask": False}]
+            }
+        )
+
+    def test_move_issue_success(self, cloud_mixin: IssuesMixin, make_issue_data):
+        """Successful move returns JiraIssue with new key."""
+        self._configure_target_issue_types(
+            cloud_mixin,
+            [{"id": "10002", "name": "Task", "subtask": False}],
+        )
+        cloud_mixin._post_api3 = MagicMock(return_value={"taskId": "task-1"})
+        cloud_mixin.jira.resource_url = MagicMock(
+            return_value="https://api/bulk/queue/task-1"
+        )
+        cloud_mixin.jira.get = MagicMock(
+            return_value=self._task_response("COMPLETE", ["10050"])
+        )
+        cloud_mixin.jira.get_issue = MagicMock(
+            side_effect=[
+                self._source_issue_response(issue_type_id="10000"),
+                make_issue_data(key="DST-99", summary="Moved"),
+            ]
+        )
+
+        result = cloud_mixin.move_issue("SRC-1", "DST")
+
+        assert result.key == "DST-99"
+        cloud_mixin._post_api3.assert_called_once_with(
+            "bulk/issues/move",
+            {
+                "sendBulkNotification": False,
+                "targetToSourcesMapping": {
+                    "DST,10002": {
+                        "inferClassificationDefaults": True,
+                        "inferFieldDefaults": True,
+                        "inferStatusDefaults": True,
+                        "inferSubtaskTypeDefault": True,
+                        "issueIdsOrKeys": ["SRC-1"],
+                    }
+                },
+            },
+        )
+        cloud_mixin.jira.resource_url.assert_called_once_with(
+            "bulk/queue/task-1", api_version="3"
+        )
+        assert cloud_mixin.jira.get_issue.call_args_list[0].args == ("SRC-1",)
+        assert cloud_mixin.jira.get_issue.call_args_list[0].kwargs == {
+            "fields": "issuetype"
+        }
+        assert cloud_mixin.jira.get_issue.call_args_list[1].args == ("10050",)
+
+    def test_move_issue_not_cloud(self, server_mixin: IssuesMixin):
+        """Raises NotImplementedError on Server/DC."""
+        with pytest.raises(NotImplementedError, match="Jira Cloud"):
+            server_mixin.move_issue("SRC-1", "DST")
+
+    def test_move_issue_empty_key(self, cloud_mixin: IssuesMixin):
+        """Raises ValueError when issue_key is empty."""
+        with pytest.raises(ValueError, match="Issue key is required"):
+            cloud_mixin.move_issue("", "DST")
+
+    def test_move_issue_empty_target(self, cloud_mixin: IssuesMixin):
+        """Raises ValueError when target_project_key is empty."""
+        with pytest.raises(ValueError, match="Target project key is required"):
+            cloud_mixin.move_issue("SRC-1", "")
+
+    def test_move_issue_task_failed(self, cloud_mixin: IssuesMixin):
+        """Raises ValueError when the async task reports FAILED."""
+        self._configure_target_issue_types(cloud_mixin)
+        cloud_mixin.jira.get_issue = MagicMock(
+            return_value=self._source_issue_response()
+        )
+        cloud_mixin._post_api3 = MagicMock(return_value={"taskId": "task-1"})
+        cloud_mixin.jira.resource_url = MagicMock(
+            return_value="https://api/bulk/queue/task-1"
+        )
+        cloud_mixin.jira.get = MagicMock(
+            return_value={"status": "FAILED", "errorMessages": ["No permission"]}
+        )
+
+        with pytest.raises(ValueError, match="Bulk move task failed"):
+            cloud_mixin.move_issue("SRC-1", "DST")
+
+    def test_move_issue_task_cancelled(self, cloud_mixin: IssuesMixin):
+        """Raises ValueError when the async task is cancelled."""
+        self._configure_target_issue_types(cloud_mixin)
+        cloud_mixin.jira.get_issue = MagicMock(
+            return_value=self._source_issue_response()
+        )
+        cloud_mixin._post_api3 = MagicMock(return_value={"taskId": "task-1"})
+        cloud_mixin.jira.resource_url = MagicMock(
+            return_value="https://api/bulk/queue/task-1"
+        )
+        cloud_mixin.jira.get = MagicMock(
+            return_value={"status": "CANCELLED", "result": {}}
+        )
+
+        with pytest.raises(ValueError, match="cancelled"):
+            cloud_mixin.move_issue("SRC-1", "DST")
+
+    def test_move_issue_timeout(self, cloud_mixin: IssuesMixin):
+        """Raises ValueError after exhausting all polling attempts."""
+        self._configure_target_issue_types(cloud_mixin)
+        cloud_mixin.jira.get_issue = MagicMock(
+            return_value=self._source_issue_response()
+        )
+        cloud_mixin._post_api3 = MagicMock(return_value={"taskId": "task-1"})
+        cloud_mixin.jira.resource_url = MagicMock(
+            return_value="https://api/bulk/queue/task-1"
+        )
+        cloud_mixin.jira.get = MagicMock(return_value={"status": "IN_PROGRESS"})
+
+        with patch("mcp_atlassian_with_bitbucket_and_privacy.jira.issues.time.sleep"):
+            with pytest.raises(ValueError, match="timed out"):
+                cloud_mixin.move_issue("SRC-1", "DST")
+
+    def test_move_issue_target_project_without_matching_issue_type(
+        self, cloud_mixin: IssuesMixin
+    ):
+        """Raises ValueError when the target project lacks the source issue type."""
+        self._configure_target_issue_types(
+            cloud_mixin,
+            [{"id": "10002", "name": "Story", "subtask": False}],
+        )
+        cloud_mixin.jira.get_issue = MagicMock(
+            return_value=self._source_issue_response(
+                issue_type_id="10000", issue_type_name="Task"
+            )
+        )
+
+        with pytest.raises(ValueError, match="does not support issue type Task"):
+            cloud_mixin.move_issue("SRC-1", "DST")
+
+    def test_move_issue_invalid_issue_count(self, cloud_mixin: IssuesMixin):
+        """Raises ValueError when the completed task reports invalid issues."""
+        self._configure_target_issue_types(cloud_mixin)
+        cloud_mixin.jira.get_issue = MagicMock(
+            return_value=self._source_issue_response()
+        )
+        cloud_mixin._post_api3 = MagicMock(return_value={"taskId": "task-1"})
+        cloud_mixin.jira.resource_url = MagicMock(
+            return_value="https://api/bulk/queue/task-1"
+        )
+        cloud_mixin.jira.get = MagicMock(
+            return_value=self._task_response("COMPLETE", invalid_count=1)
+        )
+
+        with pytest.raises(ValueError, match="invalid or inaccessible"):
+            cloud_mixin.move_issue("SRC-1", "DST")
+
+    def test_move_issue_falls_back_to_original_key(
+        self, cloud_mixin: IssuesMixin, make_issue_data
+    ):
+        """Falls back to the original key when progress omits processed IDs."""
+        self._configure_target_issue_types(cloud_mixin)
+        cloud_mixin._post_api3 = MagicMock(return_value={"taskId": "task-1"})
+        cloud_mixin.jira.resource_url = MagicMock(
+            return_value="https://api/bulk/queue/task-1"
+        )
+        cloud_mixin.jira.get = MagicMock(return_value=self._task_response("COMPLETE"))
+        cloud_mixin.jira.get_issue = MagicMock(
+            side_effect=[
+                self._source_issue_response(),
+                make_issue_data(key="DST-99"),
+            ]
+        )
+
+        result = cloud_mixin.move_issue("SRC-1", "DST")
+
+        assert result.key == "DST-99"
+        assert cloud_mixin.jira.get_issue.call_args_list[1].args == ("SRC-1",)

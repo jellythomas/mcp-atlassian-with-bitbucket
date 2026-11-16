@@ -2,7 +2,7 @@
 
 import pytest
 
-from mcp_atlassian.jira.watchers import WatchersMixin
+from mcp_atlassian_with_bitbucket_and_privacy.jira.watchers import WatchersMixin
 
 
 class TestGetIssueWatchers:

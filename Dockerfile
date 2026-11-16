@@ -10,6 +10,10 @@ ENV UV_COMPILE_BYTECODE=1
 # Copy from the cache instead of linking since it's a mounted volume
 ENV UV_LINK_MODE=copy
 
+# Allow injecting the package version at build time so that the image
+# reports the correct version even without a .git directory.
+ARG VERSION
+
 # Generate proper TOML lockfile first
 RUN --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     --mount=type=bind,source=README.md,target=README.md \
@@ -19,13 +23,16 @@ RUN --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     --mount=type=bind,source=uv.lock,target=uv.lock \
-    uv sync --frozen --no-install-project --no-dev --no-editable
+    uv sync --frozen --extra wpad --no-install-project --no-dev --no-editable
 
 # Then, copy the rest of the project source code and install it
 COPY . /app
+RUN if [ -n "$VERSION" ] && echo "$VERSION" | grep -qE '^[0-9]'; then \
+      sed -i "s/fallback-version = \"0.0.0\"/fallback-version = \"$VERSION\"/" pyproject.toml; \
+    fi
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
-    uv sync --frozen --no-dev --no-editable
+    uv sync --frozen --extra wpad --no-dev --no-editable
 
 # Remove unnecessary files from the virtual environment before copying
 RUN find /app/.venv -name '__pycache__' -type d -exec rm -rf {} + && \
@@ -55,4 +62,4 @@ ENV PYTHONUNBUFFERED=1
 # Authorization: Bearer <your_oauth_token>
 # X-Atlassian-Cloud-Id: <your_cloud_id>
 
-ENTRYPOINT ["mcp-atlassian"]
+ENTRYPOINT ["mcp-atlassian-with-bitbucket-and-privacy"]

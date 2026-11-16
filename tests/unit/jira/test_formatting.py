@@ -4,9 +4,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mcp_atlassian.jira import JiraFetcher
-from mcp_atlassian.jira.formatting import FormattingMixin
-from mcp_atlassian.preprocessing import JiraPreprocessor
+from mcp_atlassian_with_bitbucket_and_privacy.jira import JiraFetcher
+from mcp_atlassian_with_bitbucket_and_privacy.jira.formatting import FormattingMixin
+from mcp_atlassian_with_bitbucket_and_privacy.preprocessing import JiraPreprocessor
 
 
 @pytest.fixture

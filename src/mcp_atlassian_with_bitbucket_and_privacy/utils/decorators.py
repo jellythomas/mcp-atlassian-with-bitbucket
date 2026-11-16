@@ -1,0 +1,308 @@
+import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import replace
+from functools import wraps
+from inspect import getdoc
+from typing import Any, TypeVar
+
+import requests
+from fastmcp import Context
+from fastmcp.decorators import get_fastmcp_meta
+from fastmcp.exceptions import ToolError
+from fastmcp.tools.function_tool import ToolMeta
+from requests.exceptions import HTTPError
+
+from mcp_atlassian_with_bitbucket_and_privacy.exceptions import (
+    MCPAtlassianAuthenticationError,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.privacy.runtime import (
+    error_details_redacted,
+    privacy_safe_exception_detail,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.utils.toolsets import TOOLSET_TAG_PREFIX
+
+logger = logging.getLogger(__name__)
+
+
+F = TypeVar("F", bound=Callable[..., Awaitable[Any]])
+_warned_deprecated_tools: set[str] = set()
+_DEPRECATED_TOOL_MARKER = "__mcp_atlassian_with_bitbucket_and_privacy_deprecated_tool__"
+_DEPRECATED_TOOL_REGISTRATION_HOOK = (
+    "__mcp_atlassian_with_bitbucket_and_privacy_deprecated_tool_registration_hook__"
+)
+
+
+def deprecated_tool(
+    replacement: str, *, toolset_tag: str = "legacy"
+) -> Callable[[F], F]:
+    """Mark a tool as deprecated and direct callers to its replacement.
+
+    Args:
+        replacement: Name of the replacement outcome-oriented tool.
+        toolset_tag: Toolset that should contain the deprecated tool.
+    """
+
+    def decorator(func: F) -> F:
+        metadata = get_fastmcp_meta(func)
+        tool_name = (
+            metadata.name
+            if isinstance(metadata, ToolMeta) and metadata.name
+            else func.__name__
+        )
+        original_description = (
+            metadata.description
+            if isinstance(metadata, ToolMeta) and metadata.description is not None
+            else getdoc(func)
+        )
+        description = f"DEPRECATED: use {replacement}."
+        if original_description:
+            description = f"{description} {original_description}"
+        existing_tags = (
+            metadata.tags or set() if isinstance(metadata, ToolMeta) else set()
+        )
+        tags = {tag for tag in existing_tags if not tag.startswith(TOOLSET_TAG_PREFIX)}
+        tags.add(f"{TOOLSET_TAG_PREFIX}{toolset_tag}")
+
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if tool_name not in _warned_deprecated_tools:
+                logger.warning(
+                    "Tool '%s' is deprecated; use '%s' instead.",
+                    tool_name,
+                    replacement,
+                )
+                _warned_deprecated_tools.add(tool_name)
+            return await func(*args, **kwargs)
+
+        wrapper.__doc__ = description
+        setattr(wrapper, _DEPRECATED_TOOL_MARKER, True)
+        updated_metadata = (
+            replace(metadata, description=description, tags=tags)
+            if isinstance(metadata, ToolMeta)
+            else ToolMeta(description=description, tags=tags)
+        )
+        wrapper.__fastmcp__ = updated_metadata  # type: ignore[attr-defined]
+
+        registration_hook = getattr(func, _DEPRECATED_TOOL_REGISTRATION_HOOK, None)
+        if registration_hook is not None:
+            registration_hook(wrapper, updated_metadata)
+            delattr(wrapper, _DEPRECATED_TOOL_REGISTRATION_HOOK)
+
+        return wrapper  # type: ignore
+
+    return decorator
+
+
+def handle_tool_errors(func: F) -> F:
+    """
+    Convert tool handler exceptions to ToolError with details preserved.
+
+    Raising ToolError from inside the tool preserves actionable Atlassian API
+    errors for MCP clients even when the FastMCP server masks non-ToolError
+    exceptions.
+    """
+    tool_name = func.__name__
+
+    @wraps(func)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await func(*args, **kwargs)
+        except ToolError:
+            raise
+        except Exception as e:
+            detail = privacy_safe_exception_detail(e)
+            if error_details_redacted():
+                logger.error(
+                    "Error in tool '%s': %s",
+                    tool_name,
+                    type(e).__name__,
+                )
+                message = f"Error calling tool '{tool_name}'"
+            else:
+                logger.error(
+                    "Error in tool '%s': %s",
+                    tool_name,
+                    detail,
+                    exc_info=True,
+                )
+                message = f"Error calling tool '{tool_name}': {detail}"
+            raise ToolError(message) from e
+
+    return wrapper  # type: ignore
+
+
+def check_write_access(func: F) -> F:
+    """
+    Decorator for FastMCP tools to check if the application is in read-only mode.
+    If in read-only mode, it raises a ToolError.
+    Also catches unhandled exceptions and re-raises them as ToolError with
+    descriptive error messages.
+    Assumes the decorated function is async and has `ctx: Context` as its
+    first argument.
+    """
+    tool_name = func.__name__
+
+    @handle_tool_errors
+    @wraps(func)
+    async def wrapper(ctx: Context, *args: Any, **kwargs: Any) -> Any:
+        lifespan_ctx_dict = ctx.request_context.lifespan_context
+        app_lifespan_ctx = (
+            lifespan_ctx_dict.get("app_lifespan_context")
+            if isinstance(lifespan_ctx_dict, dict)
+            else None
+        )  # type: ignore
+
+        if app_lifespan_ctx is not None and app_lifespan_ctx.read_only:
+            action_description = tool_name.replace(
+                "_", " "
+            )  # e.g., "create_issue" -> "create issue"
+            logger.warning(f"Attempted to call tool '{tool_name}' in read-only mode.")
+            message = f"Cannot {action_description} in read-only mode."
+            raise ValueError(message)
+
+        return await func(ctx, *args, **kwargs)
+
+    return wrapper  # type: ignore
+
+
+def handle_auth_errors(
+    service_name: str = "Atlassian API",
+) -> Callable:
+    """Decorator to handle 401/403 HTTPError as auth errors.
+
+    Only catches HTTPError with 401/403 status codes and raises
+    MCPAtlassianAuthenticationError. All other exceptions pass
+    through unmodified.
+
+    Args:
+        service_name: Name of the service for error messages.
+    """
+
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                return func(self, *args, **kwargs)
+            except HTTPError as http_err:
+                if http_err.response is not None and http_err.response.status_code in [
+                    401,
+                    403,
+                ]:
+                    error_msg = (
+                        f"Authentication failed for "
+                        f"{service_name} "
+                        f"({http_err.response.status_code}). "
+                        "Token may be expired or invalid. "
+                        "Please verify credentials."
+                    )
+                    logger.error(error_msg)
+                    raise MCPAtlassianAuthenticationError(error_msg) from http_err
+                raise  # re-raise non-auth HTTPError
+
+        return wrapper
+
+    return decorator
+
+
+def handle_atlassian_api_errors(service_name: str = "Atlassian API") -> Callable:
+    """
+    Decorator to handle common Atlassian API exceptions (Jira, Confluence, etc.).
+
+    Args:
+        service_name: Name of the service for error logging (e.g., "Jira API").
+    """
+
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                return func(self, *args, **kwargs)
+            except HTTPError as http_err:
+                if http_err.response is not None and http_err.response.status_code in [
+                    401,
+                    403,
+                ]:
+                    error_msg = (
+                        f"Authentication failed for {service_name} "
+                        f"({http_err.response.status_code}). "
+                        "Token may be expired or invalid. Please verify credentials."
+                    )
+                    logger.error(error_msg)
+                    raise MCPAtlassianAuthenticationError(error_msg) from http_err
+                else:
+                    operation_name = getattr(func, "__name__", "API operation")
+                    if error_details_redacted():
+                        logger.error(
+                            "HTTP error during %s: status=%s",
+                            operation_name,
+                            getattr(http_err.response, "status_code", "unknown"),
+                        )
+                    else:
+                        logger.error(
+                            "HTTP error during %s: %s",
+                            operation_name,
+                            http_err,
+                            exc_info=False,
+                        )
+                    raise http_err
+            except KeyError as e:
+                operation_name = getattr(func, "__name__", "API operation")
+                detail = privacy_safe_exception_detail(e)
+                logger.error(
+                    "Missing key in %s results: %s",
+                    operation_name,
+                    detail,
+                )
+                message = f"{operation_name} returned an unexpected response"
+                if not error_details_redacted():
+                    message = (
+                        f"{operation_name} returned an unexpected response from "
+                        f"{service_name}: missing key {e}"
+                    )
+                raise ValueError(message) from e
+            except requests.RequestException as e:
+                operation_name = getattr(func, "__name__", "API operation")
+                detail = privacy_safe_exception_detail(e)
+                logger.error(
+                    "Network error during %s: %s",
+                    operation_name,
+                    detail,
+                )
+                message = f"Network error during {operation_name}"
+                if not error_details_redacted():
+                    message = f"{message}: {e}"
+                raise ValueError(message) from e
+            except (ValueError, TypeError) as e:
+                operation_name = getattr(func, "__name__", "API operation")
+                detail = privacy_safe_exception_detail(e)
+                logger.error(
+                    "Error processing %s results: %s",
+                    operation_name,
+                    detail,
+                )
+                message = f"Error processing {operation_name} results"
+                if not error_details_redacted():
+                    message = f"{message}: {e}"
+                raise ValueError(message) from e
+            except Exception as e:  # noqa: BLE001 - Intentional fallback with logging
+                operation_name = getattr(func, "__name__", "API operation")
+                detail = privacy_safe_exception_detail(e)
+                logger.error(
+                    "Unexpected error during %s: %s",
+                    operation_name,
+                    detail,
+                )
+                if not error_details_redacted():
+                    logger.debug(
+                        "Full exception details for %s:",
+                        operation_name,
+                        exc_info=True,
+                    )
+                message = f"Unexpected error during {operation_name}"
+                if not error_details_redacted():
+                    message = f"{message}: {e}"
+                raise RuntimeError(message) from e
+
+        return wrapper
+
+    return decorator

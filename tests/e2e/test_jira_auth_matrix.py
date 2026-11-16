@@ -6,8 +6,8 @@ import uuid
 
 import pytest
 
-from mcp_atlassian.jira import JiraFetcher
-from mcp_atlassian.jira.config import JiraConfig
+from mcp_atlassian_with_bitbucket_and_privacy.jira import JiraFetcher
+from mcp_atlassian_with_bitbucket_and_privacy.jira.config import JiraConfig
 
 from .conftest import AuthVariant, DCInstanceInfo, DCResourceTracker
 
@@ -83,6 +83,23 @@ class TestJiraReadOperations:
         """Verify createmeta endpoint works (PR #958 fix)."""
         meta = authed_jira.get_project_issue_types(dc_instance.project_key)
         assert meta is not None
+
+    def test_get_create_fields(
+        self,
+        authed_jira: JiraFetcher,
+        dc_instance: DCInstanceInfo,
+    ) -> None:
+        """Verify per-issue-type create metadata works on Server/DC."""
+        issue_types = authed_jira.get_project_issue_types(dc_instance.project_key)
+        issue_type = next(item for item in issue_types if item.get("id"))
+
+        fields = authed_jira.get_create_fields(
+            dc_instance.project_key,
+            str(issue_type["id"]),
+        )
+
+        assert fields
+        assert any(field.get("fieldId") == "summary" for field in fields)
 
 
 class TestJiraWriteOperations:

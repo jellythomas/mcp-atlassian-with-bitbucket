@@ -3,7 +3,9 @@
 Focused tests for Confluence constants, validating correct values and business logic.
 """
 
-from mcp_atlassian.confluence.constants import RESERVED_CQL_WORDS
+from mcp_atlassian_with_bitbucket_and_privacy.confluence.constants import (
+    RESERVED_CQL_WORDS,
+)
 
 
 class TestReservedCqlWords:

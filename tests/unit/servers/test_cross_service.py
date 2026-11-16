@@ -6,17 +6,24 @@ from unittest.mock import MagicMock, patch
 import pytest
 from requests.sessions import Session
 
-from mcp_atlassian.confluence import ConfluenceConfig
-from mcp_atlassian.jira import JiraConfig
-from mcp_atlassian.servers.context import MainAppContext
-from mcp_atlassian.servers.dependencies import (
+from mcp_atlassian_with_bitbucket_and_privacy.confluence import ConfluenceConfig
+from mcp_atlassian_with_bitbucket_and_privacy.jira import JiraConfig
+from mcp_atlassian_with_bitbucket_and_privacy.servers.context import MainAppContext
+from mcp_atlassian_with_bitbucket_and_privacy.servers.dependencies import (
     _create_user_config_for_fetcher,
     get_confluence_fetcher,
     get_jira_fetcher,
 )
-from mcp_atlassian.servers.main import AtlassianMCP, main_lifespan
-from mcp_atlassian.utils.environment import get_available_services
-from mcp_atlassian.utils.ssl import configure_ssl_verification
+from mcp_atlassian_with_bitbucket_and_privacy.servers.main import (
+    AtlassianMCP,
+    main_lifespan,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.utils.environment import (
+    get_available_services,
+)
+from mcp_atlassian_with_bitbucket_and_privacy.utils.ssl import (
+    configure_ssl_verification,
+)
 from tests.utils.factories import (
     ConfluencePageFactory,
     JiraIssueFactory,
@@ -155,7 +162,7 @@ class TestSharedAuthentication:
             request.state.user_atlassian_email = "test@example.com"
 
             with patch(
-                "mcp_atlassian.servers.dependencies.get_http_request",
+                "mcp_atlassian_with_bitbucket_and_privacy.servers.dependencies.get_http_request",
                 return_value=request,
             ):
                 # Create mock context with lifespan data
@@ -172,9 +179,11 @@ class TestSharedAuthentication:
 
                 # Mock the fetcher creation
                 with (
-                    patch("mcp_atlassian.jira.JiraFetcher") as mock_jira_fetcher,
                     patch(
-                        "mcp_atlassian.confluence.ConfluenceFetcher"
+                        "mcp_atlassian_with_bitbucket_and_privacy.jira.JiraFetcher"
+                    ) as mock_jira_fetcher,
+                    patch(
+                        "mcp_atlassian_with_bitbucket_and_privacy.confluence.ConfluenceFetcher"
                     ) as mock_confluence_fetcher,
                 ):
                     # Mock the current user validation
@@ -211,7 +220,7 @@ class TestCrossServiceErrorHandling:
 
             # Mock Jira to fail during initialization
             with patch(
-                "mcp_atlassian.jira.config.JiraConfig.from_env"
+                "mcp_atlassian_with_bitbucket_and_privacy.jira.config.JiraConfig.from_env"
             ) as mock_jira_config:
                 mock_jira_config.side_effect = Exception("Jira config failed")
 
@@ -230,7 +239,7 @@ class TestCrossServiceErrorHandling:
 
             # Mock Confluence to fail during initialization
             with patch(
-                "mcp_atlassian.confluence.config.ConfluenceConfig.from_env"
+                "mcp_atlassian_with_bitbucket_and_privacy.confluence.config.ConfluenceConfig.from_env"
             ) as mock_conf_config:
                 mock_conf_config.side_effect = Exception("Confluence config failed")
 
@@ -314,6 +323,8 @@ class TestSharedSSLProxyConfiguration:
             "HTTP_PROXY": "http://proxy.example.com:8080",
             "HTTPS_PROXY": "https://proxy.example.com:8443",
             "NO_PROXY": "localhost,127.0.0.1",
+            "ATLASSIAN_PROXY_WPAD_ENABLE": "true",
+            "ATLASSIAN_PROXY_WPAD_URL": "http://wpad.example.com/wpad.dat",
         }
 
         with MockEnvironment.basic_auth_env():
@@ -321,14 +332,46 @@ class TestSharedSSLProxyConfiguration:
                 jira_config = JiraConfig.from_env()
                 confluence_config = ConfluenceConfig.from_env()
 
-                # Both services should have the same proxy configuration
                 assert jira_config.http_proxy == proxy_config["HTTP_PROXY"]
                 assert jira_config.https_proxy == proxy_config["HTTPS_PROXY"]
                 assert jira_config.no_proxy == proxy_config["NO_PROXY"]
+                assert jira_config.proxy_wpad_enable is True
+                assert jira_config.proxy_wpad_url == "http://wpad.example.com/wpad.dat"
 
                 assert confluence_config.http_proxy == proxy_config["HTTP_PROXY"]
                 assert confluence_config.https_proxy == proxy_config["HTTPS_PROXY"]
                 assert confluence_config.no_proxy == proxy_config["NO_PROXY"]
+                assert confluence_config.proxy_wpad_enable is True
+                assert (
+                    confluence_config.proxy_wpad_url
+                    == "http://wpad.example.com/wpad.dat"
+                )
+
+    def test_service_specific_wpad_overrides_remain_independent(self):
+        """Test Jira and Confluence can override global WPAD settings independently."""
+        with MockEnvironment.basic_auth_env():
+            with patch.dict(
+                os.environ,
+                {
+                    "ATLASSIAN_PROXY_WPAD_ENABLE": "true",
+                    "ATLASSIAN_PROXY_WPAD_URL": "http://global-wpad.example.com/wpad.dat",
+                    "JIRA_PROXY_WPAD_ENABLE": "false",
+                    "CONFLUENCE_PROXY_WPAD_URL": "http://conf-wpad.example.com/wpad.dat",
+                },
+            ):
+                jira_config = JiraConfig.from_env()
+                confluence_config = ConfluenceConfig.from_env()
+
+                assert jira_config.proxy_wpad_enable is False
+                assert (
+                    jira_config.proxy_wpad_url
+                    == "http://global-wpad.example.com/wpad.dat"
+                )
+                assert confluence_config.proxy_wpad_enable is True
+                assert (
+                    confluence_config.proxy_wpad_url
+                    == "http://conf-wpad.example.com/wpad.dat"
+                )
 
 
 class TestConcurrentServiceInitialization:
@@ -356,11 +399,11 @@ class TestConcurrentServiceInitialization:
 
             with (
                 patch(
-                    "mcp_atlassian.jira.config.JiraConfig.from_env",
+                    "mcp_atlassian_with_bitbucket_and_privacy.jira.config.JiraConfig.from_env",
                     side_effect=mock_jira_init,
                 ),
                 patch(
-                    "mcp_atlassian.confluence.config.ConfluenceConfig.from_env",
+                    "mcp_atlassian_with_bitbucket_and_privacy.confluence.config.ConfluenceConfig.from_env",
                     side_effect=mock_confluence_init,
                 ),
             ):
@@ -403,12 +446,14 @@ class TestConcurrentServiceInitialization:
 
                 with (
                     patch(
-                        "mcp_atlassian.servers.dependencies.get_http_request",
+                        "mcp_atlassian_with_bitbucket_and_privacy.servers.dependencies.get_http_request",
                         return_value=request,
                     ),
-                    patch("mcp_atlassian.jira.JiraFetcher") as mock_jira_fetcher,
                     patch(
-                        "mcp_atlassian.confluence.ConfluenceFetcher"
+                        "mcp_atlassian_with_bitbucket_and_privacy.jira.JiraFetcher"
+                    ) as mock_jira_fetcher,
+                    patch(
+                        "mcp_atlassian_with_bitbucket_and_privacy.confluence.ConfluenceFetcher"
                     ) as mock_confluence_fetcher,
                 ):
                     # Mock fetcher instances

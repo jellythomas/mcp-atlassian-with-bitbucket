@@ -24,7 +24,7 @@ import os
 
 import pytest
 
-from mcp_atlassian.bitbucket.config import BitbucketConfig
+from mcp_atlassian_with_bitbucket_and_privacy.bitbucket.config import BitbucketConfig
 
 
 def _skip_unless_real_data(request):
@@ -62,7 +62,9 @@ class TestBitbucketReadOperations:
         self.config = _get_bitbucket_config()
         self.repo = _get_test_repo()
 
-        from mcp_atlassian.bitbucket.client import BitbucketClient
+        from mcp_atlassian_with_bitbucket_and_privacy.bitbucket.client import (
+            BitbucketClient,
+        )
 
         self.client = BitbucketClient(config=self.config)
         self.workspace = self.config.workspace or self.config.project_key
@@ -144,7 +146,9 @@ class TestBitbucketCloudOnly:
             pytest.skip("Cloud-only tests require Bitbucket Cloud")
         self.repo = _get_test_repo()
 
-        from mcp_atlassian.bitbucket.client import BitbucketClient
+        from mcp_atlassian_with_bitbucket_and_privacy.bitbucket.client import (
+            BitbucketClient,
+        )
 
         self.client = BitbucketClient(config=self.config)
         self.workspace = self.config.workspace
@@ -209,7 +213,9 @@ class TestBitbucketAuthentication:
 
     def test_api_request_succeeds(self):
         """Basic API request succeeds with configured auth."""
-        from mcp_atlassian.bitbucket.client import BitbucketClient
+        from mcp_atlassian_with_bitbucket_and_privacy.bitbucket.client import (
+            BitbucketClient,
+        )
 
         config = _get_bitbucket_config()
         client = BitbucketClient(config=config)

@@ -1,9 +1,9 @@
 ---
 title: "Docker Deployment"
-description: "Deploy MCP Atlassian with Docker for production — Compose examples, health checks, and Kubernetes notes"
+description: "Deploy MCP Atlassian with Bitbucket and Privacy with Docker for production — Compose examples, health checks, and Kubernetes notes"
 ---
 
-MCP Atlassian provides Docker images for production deployment. This guide covers Docker Compose setups, health checks, and orchestration patterns.
+MCP Atlassian with Bitbucket and Privacy provides Docker images for production deployment. This guide covers Docker Compose setups, health checks, and orchestration patterns.
 
 ## Quick Start
 
@@ -15,7 +15,7 @@ docker run -i --rm \
   -e CONFLUENCE_URL=https://your-company.atlassian.net/wiki \
   -e CONFLUENCE_USERNAME=your.email@example.com \
   -e CONFLUENCE_API_TOKEN=your_api_token \
-  ghcr.io/sooperset/mcp-atlassian:latest
+  ghcr.io/ulikoenig/mcp-atlassian-with-bitbucket-and-privacy:latest
 ```
 
 ## Docker Compose
@@ -25,8 +25,8 @@ docker run -i --rm \
 ```yaml
 version: "3.8"
 services:
-  mcp-atlassian:
-    image: ghcr.io/sooperset/mcp-atlassian:latest
+  mcp-atlassian-with-bitbucket-and-privacy:
+    image: ghcr.io/ulikoenig/mcp-atlassian-with-bitbucket-and-privacy:latest
     env_file: .env
     ports:
       - "8000:8000"
@@ -42,8 +42,8 @@ services:
 ```yaml
 version: "3.8"
 services:
-  mcp-atlassian:
-    image: ghcr.io/sooperset/mcp-atlassian:latest
+  mcp-atlassian-with-bitbucket-and-privacy:
+    image: ghcr.io/ulikoenig/mcp-atlassian-with-bitbucket-and-privacy:latest
     env_file: .env
     ports:
       - "8000:8000"
@@ -68,7 +68,7 @@ Run separate Jira and Confluence services:
 version: "3.8"
 services:
   jira-mcp:
-    image: ghcr.io/sooperset/mcp-atlassian:latest
+    image: ghcr.io/ulikoenig/mcp-atlassian-with-bitbucket-and-privacy:latest
     env_file: .env.jira
     ports:
       - "8001:8000"
@@ -78,7 +78,7 @@ services:
       - TOOLSETS=jira_issues,jira_fields,jira_transitions
 
   confluence-mcp:
-    image: ghcr.io/sooperset/mcp-atlassian:latest
+    image: ghcr.io/ulikoenig/mcp-atlassian-with-bitbucket-and-privacy:latest
     env_file: .env.confluence
     ports:
       - "8002:8000"
@@ -126,20 +126,20 @@ For Kubernetes deployments:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mcp-atlassian
+  name: mcp-atlassian-with-bitbucket-and-privacy
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mcp-atlassian
+      app: mcp-atlassian-with-bitbucket-and-privacy
   template:
     metadata:
       labels:
-        app: mcp-atlassian
+        app: mcp-atlassian-with-bitbucket-and-privacy
     spec:
       containers:
-      - name: mcp-atlassian
-        image: ghcr.io/sooperset/mcp-atlassian:latest
+      - name: mcp-atlassian-with-bitbucket-and-privacy
+        image: ghcr.io/ulikoenig/mcp-atlassian-with-bitbucket-and-privacy:latest
         ports:
         - containerPort: 8000
         env:
@@ -166,10 +166,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: mcp-atlassian
+  name: mcp-atlassian-with-bitbucket-and-privacy
 spec:
   selector:
-    app: mcp-atlassian
+    app: mcp-atlassian-with-bitbucket-and-privacy
   ports:
   - port: 8000
     targetPort: 8000

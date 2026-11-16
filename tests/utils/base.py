@@ -1,4 +1,4 @@
-"""Base test classes and utilities for MCP Atlassian tests."""
+"""Base test classes and utilities for MCP Atlassian with Bitbucket and Privacy tests."""
 
 from unittest.mock import AsyncMock, MagicMock
 

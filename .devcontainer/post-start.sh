@@ -7,6 +7,6 @@ set -xe
 # In the container, run checks manually: pre-commit run --all-files
 
 # Ensure git safe.directory is set (in case post-create didn't run)
-git config --global --add safe.directory /workspaces/mcp-atlassian 2>/dev/null || true
+git config --global --add safe.directory /workspaces/mcp-atlassian-with-bitbucket 2>/dev/null || true
 
 echo "✅ Container ready! Run 'pre-commit run --all-files' to check code quality."

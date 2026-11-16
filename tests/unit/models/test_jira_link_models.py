@@ -5,12 +5,12 @@ Tests for JiraIssueLinkType, JiraLinkedIssueFields, JiraLinkedIssue,
 and JiraIssueLink models.
 """
 
-from mcp_atlassian.models.constants import (
+from mcp_atlassian_with_bitbucket_and_privacy.models.constants import (
     EMPTY_STRING,
     JIRA_DEFAULT_ID,
     UNKNOWN,
 )
-from mcp_atlassian.models.jira import (
+from mcp_atlassian_with_bitbucket_and_privacy.models.jira import (
     JiraIssueLink,
     JiraIssueLinkType,
     JiraIssueType,

@@ -2,9 +2,9 @@
 
 import pytest
 
-from mcp_atlassian.confluence.config import ConfluenceConfig
-from mcp_atlassian.jira.config import JiraConfig
-from mcp_atlassian.servers.context import MainAppContext
+from mcp_atlassian_with_bitbucket_and_privacy.confluence.config import ConfluenceConfig
+from mcp_atlassian_with_bitbucket_and_privacy.jira.config import JiraConfig
+from mcp_atlassian_with_bitbucket_and_privacy.servers.context import MainAppContext
 
 
 class TestMainAppContext:

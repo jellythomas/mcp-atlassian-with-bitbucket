@@ -1,0 +1,615 @@
+"""Module for Jira transition operations."""
+
+import logging
+from typing import Any
+
+from requests.exceptions import HTTPError
+
+from ..models import JiraIssue, JiraTransition
+from ..utils.decorators import handle_auth_errors
+from .client import JiraClient
+from .protocols import IssueOperationsProto, UsersOperationsProto
+
+logger = logging.getLogger("mcp-jira")
+
+
+class TransitionsMixin(JiraClient, IssueOperationsProto, UsersOperationsProto):
+    """Mixin for Jira transition operations."""
+
+    @handle_auth_errors("Jira API")
+    def get_available_transitions(
+        self,
+        issue_key: str,
+        *,
+        expand_fields: bool = False,
+    ) -> list[dict[str, Any]]:
+        """
+        Get the available status transitions for an issue.
+
+        Includes has_screen flag and required fields metadata
+        (name, schema, allowed values) so callers can see what
+        fields are mandatory before attempting a transition.
+
+        .. note::
+
+           ``required_fields`` only covers transition **screen** fields
+           (resolution, fixVersions, assignee, etc.). Jira workflow
+           **validators** (e.g. "Time Spent required") are not exposed
+           through the REST API. A transition may still be rejected by
+           a validator even when all ``required_fields`` are satisfied.
+           In that case, read the ``errorMessages`` / ``errors``
+           from the transition response to discover the missing data.
+
+        Args:
+            issue_key: The issue key (e.g. 'PROJ-123')
+            expand_fields: Whether to request required field metadata
+                (allowed values, schema) for each transition. Defaults
+                to False, which keeps the response lightweight.
+
+        Returns:
+            List of available transitions with id, name,
+            to_status, has_screen, and required_fields details
+
+        Raises:
+            MCPAtlassianAuthenticationError: If authentication fails
+                with the Jira API (401/403)
+            Exception: If there is an error getting transitions
+        """
+        try:
+            transitions_data = self.get_transitions(
+                issue_key, expand_fields=expand_fields
+            )
+            result: list[dict[str, Any]] = []
+
+            # get_transitions already drops non-dict entries.
+            for transition in transitions_data:
+                # Extract the essential information
+                transition_info = {
+                    "id": transition.get("id", ""),
+                    "name": transition.get("name", ""),
+                }
+
+                # Handle "to" field in different formats.
+                # Build a structured "to" object (id, name, statusCategory)
+                # when the raw API returns a full dict; fall back to a
+                # plain string when only a name is available.
+                to_status = None
+                if "to" in transition and isinstance(transition["to"], dict):
+                    to_obj = transition["to"]
+                    to_status = to_obj.get("name")
+                    to_info: dict[str, Any] = {
+                        "id": str(to_obj.get("id", "")),
+                        "name": to_obj.get("name", ""),
+                    }
+                    sc = to_obj.get("statusCategory")
+                    if isinstance(sc, dict):
+                        to_info["statusCategory"] = {
+                            "id": str(sc.get("id", "")),
+                            "key": sc.get("key", ""),
+                            "name": sc.get("name", ""),
+                        }
+                    transition_info["to"] = to_info
+                elif "to_status" in transition:
+                    to_status = transition.get("to_status")
+                elif "status" in transition:
+                    to_status = transition.get("status")
+
+                if to_status:
+                    transition_info["to_status"] = to_status
+
+                # Include has_screen flag and required fields
+                transition_info["has_screen"] = bool(transition.get("hasScreen"))
+
+                transition_info["is_conditional"] = bool(
+                    transition.get("isConditional")
+                )
+
+                if expand_fields:
+                    fields = transition.get("fields", {})
+                    if isinstance(fields, dict):
+                        required_fields = self._extract_required_fields(fields)
+                        if required_fields:
+                            transition_info["required_fields"] = required_fields
+
+                result.append(transition_info)
+
+            return result
+        except HTTPError:
+            raise  # let decorator handle auth errors
+        except Exception as e:
+            error_msg = f"Error getting transitions for {issue_key}: {str(e)}"
+            logger.error(error_msg)
+            raise Exception(f"Error getting transitions: {str(e)}") from e
+
+    @staticmethod
+    def _extract_required_fields(
+        fields: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """
+        Extract required field metadata from transition fields dict.
+
+        .. note::
+
+           Only covers transition **screen** fields. Jira workflow
+           validators (permission checks, field validators, etc.)
+           are configured at the workflow level and are not
+           discoverable through the REST API.
+
+        Args:
+            fields: The "fields" dict from a transition API response.
+
+        Returns:
+            List of required field info dicts with key, name, schema,
+            and allowed_values (for select-type fields).
+        """
+        required_fields: list[dict[str, Any]] = []
+        for field_key, field_data in fields.items():
+            if not isinstance(field_data, dict):
+                continue
+            if not field_data.get("required"):
+                continue
+
+            field_info: dict[str, Any] = {
+                "key": field_key,
+                "name": field_data.get("name", field_key),
+            }
+
+            schema = field_data.get("schema")
+            if isinstance(schema, dict):
+                field_info["schema"] = schema
+
+            allowed_values = field_data.get("allowedValues")
+            if isinstance(allowed_values, list):
+                field_info["allowed_values"] = [
+                    TransitionsMixin._normalize_allowed_value(v) for v in allowed_values
+                ]
+
+            required_fields.append(field_info)
+
+        return required_fields
+
+    @staticmethod
+    def _normalize_allowed_value(value: Any) -> Any:
+        """
+        Preserve an allowed value and fill in its display name when needed.
+
+        Jira returns allowed values in multiple shapes:
+        - Scalar (str, int): ``"Fixed"``
+        - ``{id, name}``: ``{"id": "1", "name": "Fixed"}``
+        - ``{id, value}`` (custom field options): ``{"id": "1", "value": "Fixed"}``
+
+        Args:
+            value: A raw allowed value from the Jira API.
+
+        Returns:
+            The original scalar value, or a shallow copy of the original
+            mapping. Mappings with a ``value`` label get that label copied
+            to ``name`` when Jira omitted ``name``.
+        """
+        if not isinstance(value, dict):
+            return value
+
+        result = dict(value)
+        if not result.get("name") and result.get("value") is not None:
+            result["name"] = result["value"]
+        return result
+
+    def get_transitions(
+        self, issue_key: str, *, expand_fields: bool = False
+    ) -> list[dict[str, Any]]:
+        """
+        Get the raw transitions data for an issue.
+
+        Uses get_issue_transitions_full() to get the complete API response
+        including the full 'to' status object, not the simplified version
+        from get_issue_transitions() which only returns the status name as a string.
+
+        Args:
+            issue_key: The issue key (e.g. 'PROJ-123')
+            expand_fields: Whether to include transition field metadata.
+                Defaults to False, which keeps the response lightweight.
+
+        Returns:
+            Raw transitions data from the API with full 'to' status objects
+        """
+        if expand_fields:
+            response = self.jira.get_issue_transitions_full(
+                issue_key, expand="transitions.fields"
+            )
+        else:
+            response = self.jira.get_issue_transitions_full(issue_key)
+        if isinstance(response, dict):
+            transitions = response.get("transitions", [])
+            if isinstance(transitions, list):
+                return [item for item in transitions if isinstance(item, dict)]
+        return []
+
+    def get_transitions_models(self, issue_key: str) -> list[JiraTransition]:
+        """
+        Get the available status transitions for an issue as JiraTransition models.
+
+        Args:
+            issue_key: The issue key (e.g. 'PROJ-123')
+
+        Returns:
+            List of JiraTransition models
+        """
+        transitions_data = self.get_transitions(issue_key)
+        result: list[JiraTransition] = []
+
+        for transition_data in transitions_data:
+            transition = JiraTransition.from_api_response(transition_data)
+            result.append(transition)
+
+        return result
+
+    @handle_auth_errors("Jira API")
+    def transition_issue(
+        self,
+        issue_key: str,
+        transition_id: str | int,
+        fields: dict[str, Any] | None = None,
+        comment: str | None = None,
+        update_data: dict[str, Any] | None = None,
+    ) -> JiraIssue:
+        """
+        Transition a Jira issue to a new status.
+
+        Note on Jira Cloud comments:
+            On Jira Cloud, comments bundled in the transition request (`update.comment`)
+            are only recorded if the workflow transition's screen includes a Comment
+            field. If the comment is omitted after transition, call `add_comment`
+            directly to add it.
+
+        Args:
+            issue_key: The key of the issue to transition
+            transition_id: The ID of the transition to perform
+                (integer preferred, string accepted)
+            fields: Optional fields to set during the transition
+            comment: Optional comment to add during the transition.
+                Rejected for projects listed in JIRA_INTERNAL_ONLY_PROJECTS
+                (a transition comment may be customer-visible on JSM and
+                cannot be forced internal): transition without a comment,
+                then post an internal note with add_comment(public=False).
+            update_data: Optional update data (e.g., worklog) to send
+                alongside the transition. Example:
+                {"worklog": [{"add": {"timeSpent": "1h", "comment": "Resolved"}}]}
+                Top-level comment operations are subject to the same
+                JIRA_INTERNAL_ONLY_PROJECTS restriction as comment. On
+                Jira Cloud, string comment bodies and worklog comments are
+                treated as Markdown and converted to ADF.
+
+        Returns:
+            JiraIssue model representing the transitioned issue
+
+        Raises:
+            MCPAtlassianAuthenticationError: If authentication fails
+                with the Jira API (401/403)
+            ValueError: If there is an error transitioning the issue, or if
+                comment operations are provided for an internal-only project
+        """
+        try:
+            if comment or (update_data is not None and "comment" in update_data):
+                self._enforce_internal_only_transition_comment(issue_key)
+
+            # Normalize transition_id to int when possible
+            normalized_transition_id = self._normalize_transition_id(transition_id)
+
+            # Validate that this is a valid transition ID
+            valid_transitions = self.get_transitions_models(issue_key)
+            valid_ids: list[str | int] = [t.id for t in valid_transitions]
+
+            # Convert string IDs to integers for proper comparison
+            if isinstance(normalized_transition_id, int):
+                valid_ids = [
+                    int(id_val)
+                    if isinstance(id_val, str) and id_val.isdigit()
+                    else id_val
+                    for id_val in valid_ids
+                ]
+
+            # Check if normalized_transition_id is valid
+            id_to_check = normalized_transition_id
+            if id_to_check not in valid_ids:
+                available_transitions = ", ".join(
+                    f"{t.id} ({t.name})" for t in valid_transitions
+                )
+                logger.warning(
+                    f"Transition ID {id_to_check} not in"
+                    " available transitions:"
+                    f" {available_transitions}"
+                )
+                # Continue anyway as Jira will validate
+
+            # Sanitize fields if provided
+            fields_for_api = None
+            if fields:
+                sanitized_fields = self._sanitize_transition_fields(fields)
+                if sanitized_fields:
+                    fields_for_api = sanitized_fields
+
+            # Prepare update data (comment + extra update_data like worklog)
+            temp_transition_data: dict[str, Any] = {}
+            if update_data:
+                temp_transition_data["update"] = self._format_update_data_text(
+                    update_data
+                )
+            if comment:
+                self._add_comment_to_transition_data(temp_transition_data, comment)
+            update_for_api = temp_transition_data.get("update")
+
+            # Log the transition request for debugging
+            logger.info(
+                f"Transitioning issue {issue_key} with"
+                f" transition ID {normalized_transition_id}"
+            )
+            logger.debug(f"Fields: {fields_for_api}, Update: {update_for_api}")
+
+            payload: dict[str, Any] = {
+                "transition": {"id": str(normalized_transition_id)},
+            }
+            if fields_for_api:
+                payload["fields"] = fields_for_api
+            if update_for_api:
+                payload["update"] = update_for_api
+
+            if self.config.is_cloud:
+                # Cloud comments are ADF and require the REST v3 endpoint.
+                self._post_api3(f"issue/{issue_key}/transitions", payload)
+            else:
+                # Server/DC comments use wiki markup on REST v2.
+                base_url = self.jira.resource_url("issue")
+                url = f"{base_url}/{issue_key}/transitions"
+                self.jira.post(url, data=payload)
+
+            # Return the updated issue
+            return self.get_issue(issue_key)
+        except ValueError as e:
+            logger.error(f"Value error transitioning issue {issue_key}: {str(e)}")
+            raise
+        except HTTPError:
+            raise  # let decorator handle auth errors
+        except Exception as e:
+            error_msg = (
+                f"Error transitioning issue {issue_key}"
+                f" with transition ID"
+                f" {transition_id}: {str(e)}"
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg) from e
+
+    def _normalize_transition_id(self, transition_id: object) -> str | int:
+        """
+        Normalize the transition ID to a common format.
+
+        Args:
+            transition_id: The transition ID, which can be a string, int, or dict
+
+        Returns:
+            The normalized transition ID as an integer when possible, or string otherwise
+        """
+        logger.debug(
+            f"Normalizing transition_id: {transition_id}, type: {type(transition_id)}"
+        )
+
+        # Handle empty or None values
+        if transition_id is None:
+            raise ValueError("transition_id cannot be None")
+
+        # Handle integer directly (preferred by the API)
+        if isinstance(transition_id, int):
+            return transition_id
+
+        # Handle string by converting to integer if it's numeric
+        if isinstance(transition_id, str):
+            if transition_id.isdigit():
+                return int(transition_id)
+            else:
+                # For non-numeric strings, keep as string for backward compatibility
+                return transition_id
+
+        # Handle dictionary case
+        if isinstance(transition_id, dict):
+            logger.warning(
+                f"Received dict for transition_id when string expected: {transition_id}"
+            )
+
+            # Try to extract ID from standard formats
+            for key in ["id", "ID", "transitionId", "transition_id"]:
+                if key in transition_id and transition_id[key] is not None:
+                    value = transition_id[key]
+                    if isinstance(value, str | int):
+                        logger.warning(f"Using {key}={value} as transition ID")
+                        # Try to convert to int if possible
+                        if isinstance(value, int):
+                            return value
+                        elif isinstance(value, str) and value.isdigit():
+                            return int(value)
+                        else:
+                            return str(value)
+
+            # If no standard key found, try to use any string or int value
+            for key, value in transition_id.items():
+                if value is not None and isinstance(value, str | int):
+                    logger.warning(f"Using {key}={value} as transition ID from dict")
+                    # Try to convert to int if possible
+                    if isinstance(value, int):
+                        return value
+                    elif isinstance(value, str) and value.isdigit():
+                        return int(value)
+                    else:
+                        return str(value)
+
+            # Last resort: try to use the first value
+            try:
+                first_value = next(iter(transition_id.values()))
+                if first_value is not None:
+                    # Try to convert to int if possible
+                    if isinstance(first_value, int):
+                        return first_value
+                    elif isinstance(first_value, str) and str(first_value).isdigit():
+                        return int(first_value)
+                    else:
+                        return str(first_value)
+            except (StopIteration, AttributeError):
+                pass
+
+            # Nothing worked
+            msg = f"Could not extract valid transition ID from: {transition_id}"
+            logger.error(msg)
+            raise ValueError(msg)
+
+        # For any other type, convert to string with warning
+        logger.warning(
+            f"Unexpected type for transition_id: {type(transition_id)}, trying conversion"
+        )
+        try:
+            str_value = str(transition_id)
+            if str_value.isdigit():
+                return int(str_value)
+            else:
+                return str_value
+        except Exception as e:
+            msg = f"Failed to convert transition_id: {str(e)}"
+            logger.error(msg)
+            raise ValueError(msg) from e
+
+    def _sanitize_transition_fields(self, fields: dict[str, Any]) -> dict[str, Any]:
+        """
+        Sanitize fields to ensure they're valid for the Jira API.
+
+        Args:
+            fields: Dictionary of fields to sanitize
+
+        Returns:
+            Dictionary of sanitized fields
+        """
+        sanitized_fields: dict[str, Any] = {}
+        for key, value in fields.items():
+            # Skip None values
+            if value is None:
+                continue
+
+            # Handle special case for assignee
+            if key == "assignee" and isinstance(value, str):
+                try:
+                    # Check if _get_account_id is available (from UsersMixin)
+                    account_id = self._get_account_id(value)
+                    sanitized_fields[key] = {"accountId": account_id}
+                except Exception as e:  # noqa: BLE001 - Intentional fallback with logging
+                    error_msg = f"Could not resolve assignee '{value}': {str(e)}"
+                    logger.warning(error_msg)
+                    # Skip this field
+                    continue
+            else:
+                sanitized_fields[key] = value
+
+        return sanitized_fields
+
+    def _enforce_internal_only_transition_comment(self, issue_key: str) -> None:
+        """Reject transition comments on JIRA_INTERNAL_ONLY_PROJECTS projects.
+
+        A transition comment is posted through the core Jira API
+        (``update.comment[].add``), which on JSM issues is commonly
+        customer-visible by default — and this call offers no way to
+        force it internal. Allowing it would re-open the exact hole the
+        internal-only guard on add_comment/edit_comment closes, through a
+        sibling entry point. So for listed projects the transition
+        comment is refused outright; the transition itself (without a
+        comment) is unaffected.
+
+        Args:
+            issue_key: The issue key (e.g. 'CC-123')
+
+        Raises:
+            ValueError: If issue_key's project is listed in
+                JIRA_INTERNAL_ONLY_PROJECTS
+        """
+        if not self._is_internal_only_project(issue_key):
+            return
+        raise ValueError(
+            f"Issue {issue_key} belongs to a project configured as "
+            "internal-only (JIRA_INTERNAL_ONLY_PROJECTS). Transition "
+            "comments are posted via the core Jira API and may be "
+            "customer-visible on JSM, with no way to force them "
+            "internal from this call — so they are blocked here. "
+            "Perform the transition WITHOUT a comment, then post an "
+            "internal note with add_comment(public=False)."
+        )
+
+    def _format_update_data_text(self, update_data: dict[str, Any]) -> dict[str, Any]:
+        """
+        Convert text inside transition update operations for Jira Cloud.
+
+        Cloud transitions are sent to REST v3, which requires ADF for comment
+        bodies and worklog comments. Plain strings in ``comment[*].<op>.body``
+        and ``worklog[*].<op>.comment`` are treated as Markdown and converted
+        to ADF. Values that are already ADF dicts are left alone. Server/DC
+        payloads use REST v2, so they are returned unchanged.
+
+        Args:
+            update_data: Caller-supplied Jira update operations.
+
+        Returns:
+            A copy of the update operations, with Cloud text converted to ADF.
+        """
+        result = dict(update_data)
+        if not self.config.is_cloud or not hasattr(self, "_markdown_to_jira"):
+            return result
+
+        for op_key, text_key in (("comment", "body"), ("worklog", "comment")):
+            operations = result.get(op_key)
+            if not isinstance(operations, list):
+                continue
+            converted_operations: list[Any] = []
+            for operation in operations:
+                if not isinstance(operation, dict):
+                    converted_operations.append(operation)
+                    continue
+                converted_operation: dict[str, Any] = {}
+                for verb, payload in operation.items():
+                    if isinstance(payload, dict) and isinstance(
+                        payload.get(text_key), str
+                    ):
+                        payload = {
+                            **payload,
+                            text_key: self._markdown_to_jira(payload[text_key]),
+                        }
+                    converted_operation[verb] = payload
+                converted_operations.append(converted_operation)
+            result[op_key] = converted_operations
+        return result
+
+    def _add_comment_to_transition_data(
+        self, transition_data: dict[str, Any], comment: str | int
+    ) -> None:
+        """
+        Add comment to transition data.
+
+        Args:
+            transition_data: The transition data dictionary to update
+            comment: The comment to add
+        """
+        # Ensure comment is a string
+        if not isinstance(comment, str):
+            logger.warning(
+                f"Comment must be a string, converting from {type(comment)}: {comment}"
+            )
+            comment_str = str(comment)
+        else:
+            comment_str = comment
+
+        # Convert markdown to Jira format if _markdown_to_jira is available
+        jira_formatted_comment: str | dict[str, Any] = comment_str
+        if hasattr(self, "_markdown_to_jira"):
+            jira_formatted_comment = self._markdown_to_jira(comment_str)
+
+        # Preserve update operations supplied by the caller and append this
+        # comment to any existing comment operations.
+        update = transition_data.setdefault("update", {})
+        existing_comments = update.get("comment")
+        comments = (
+            list(existing_comments) if isinstance(existing_comments, list) else []
+        )
+        comments.append({"add": {"body": jira_formatted_comment}})
+        update["comment"] = comments

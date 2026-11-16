@@ -7,7 +7,7 @@ and the appropriate environment variables are configured.
 
 import pytest
 
-from mcp_atlassian.models import (
+from mcp_atlassian_with_bitbucket_and_privacy.models import (
     ConfluenceComment,
     ConfluencePage,
 )
@@ -25,9 +25,15 @@ class TestRealConfluenceData:
 
         try:
             # Initialize the Confluence client
-            from mcp_atlassian.confluence.client import ConfluenceClient
-            from mcp_atlassian.confluence.config import ConfluenceConfig
-            from mcp_atlassian.confluence.pages import PagesMixin
+            from mcp_atlassian_with_bitbucket_and_privacy.confluence.client import (
+                ConfluenceClient,
+            )
+            from mcp_atlassian_with_bitbucket_and_privacy.confluence.config import (
+                ConfluenceConfig,
+            )
+            from mcp_atlassian_with_bitbucket_and_privacy.confluence.pages import (
+                PagesMixin,
+            )
 
             # Use the from_env method to create the config
             config = ConfluenceConfig.from_env()

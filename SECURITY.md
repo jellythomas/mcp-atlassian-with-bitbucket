@@ -12,7 +12,7 @@
 Please **do not** open a public GitHub issue for security vulnerabilities.
 
 Instead, use GitHub's private vulnerability reporting:
-**[Report a vulnerability](https://github.com/sooperset/mcp-atlassian/security/advisories/new)**
+**[Report a vulnerability](https://github.com/ulikoenig/mcp-atlassian-with-bitbucket/security/advisories/new)**
 
 We will acknowledge your report within **72 hours** and work with you on a coordinated disclosure.
 

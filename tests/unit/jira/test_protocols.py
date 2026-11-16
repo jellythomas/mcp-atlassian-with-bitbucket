@@ -3,12 +3,12 @@
 import inspect
 from typing import Any, get_type_hints
 
-from mcp_atlassian.jira.protocols import (
+from mcp_atlassian_with_bitbucket_and_privacy.jira.protocols import (
     AttachmentsOperationsProto,
     UsersOperationsProto,
 )
-from mcp_atlassian.models.jira import JiraIssue
-from mcp_atlassian.models.jira.search import JiraSearchResult
+from mcp_atlassian_with_bitbucket_and_privacy.models.jira import JiraIssue
+from mcp_atlassian_with_bitbucket_and_privacy.models.jira.search import JiraSearchResult
 
 
 class TestProtocolCompliance:
@@ -177,6 +177,11 @@ class TestProtocolContractValidation:
         class CompliantImplementation:
             def upload_attachments(
                 self, issue_key: str, file_paths: list[str]
+            ) -> dict[str, Any]:
+                return {}
+
+            def upload_attachments_from_content(
+                self, issue_key: str, attachments: list[dict[str, Any]]
             ) -> dict[str, Any]:
                 return {}
 

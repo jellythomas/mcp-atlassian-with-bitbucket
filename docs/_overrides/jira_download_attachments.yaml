@@ -2,3 +2,5 @@ example: |
   {"issue_key": "PROJ-123"}
 tips: |
   Downloads all attachments from the issue. Files larger than 50MB are skipped. Returns base64-encoded content.
+
+  For machine-to-machine transfers, pass `as_base64: true` to `jira_download_attachments`. Image attachments are then returned as portable base64 `TextContent` instead of `EmbeddedResource`.

@@ -2,14 +2,14 @@
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: {{ include "mcp-atlassian.fullname" . }}
+  name: {{ include "mcp-atlassian-with-bitbucket-and-privacy.fullname" . }}
   labels:
-    {{- include "mcp-atlassian.labels" . | nindent 4 }}
+    {{- include "mcp-atlassian-with-bitbucket-and-privacy.labels" . | nindent 4 }}
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: {{ include "mcp-atlassian.fullname" . }}
+    name: {{ include "mcp-atlassian-with-bitbucket-and-privacy.fullname" . }}
   minReplicas: {{ .Values.autoscaling.minReplicas }}
   maxReplicas: {{ .Values.autoscaling.maxReplicas }}
   metrics:

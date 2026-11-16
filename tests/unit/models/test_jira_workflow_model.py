@@ -2,11 +2,11 @@
 Tests for the JiraTransition Pydantic model.
 """
 
-from mcp_atlassian.models.constants import (
+from mcp_atlassian_with_bitbucket_and_privacy.models.constants import (
     EMPTY_STRING,
     JIRA_DEFAULT_ID,
 )
-from mcp_atlassian.models.jira import (
+from mcp_atlassian_with_bitbucket_and_privacy.models.jira import (
     JiraTransition,
 )
 
@@ -81,5 +81,6 @@ class TestJiraTransition:
         assert simplified["name"] == "Start Progress"
         assert simplified["to_status"] is not None
         assert simplified["to_status"]["name"] == "In Progress"
-        assert "has_screen" not in simplified
+        assert simplified["has_screen"] is True
+        assert simplified["is_conditional"] is False
         assert "is_global" not in simplified

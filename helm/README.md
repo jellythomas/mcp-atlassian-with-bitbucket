@@ -1,6 +1,6 @@
-# MCP Atlassian Helm Chart
+# MCP Atlassian with Bitbucket and Privacy Helm Chart
 
-This Helm chart deploys the [MCP Atlassian](https://github.com/sooperset/mcp-atlassian) server to Kubernetes, providing a Model Context Protocol (MCP) server for Jira and Confluence integration.
+This Helm chart deploys the [MCP Atlassian with Bitbucket and Privacy](https://github.com/ulikoenig/mcp-atlassian-with-bitbucket) server to Kubernetes for Jira, Confluence, and Bitbucket integrations.
 
 ## Prerequisites
 
@@ -28,19 +28,19 @@ jira:
 YAML
 
 # Install the chart
-helm install mcp-atlassian ./mcp-atlassian -f my-values.yaml
+helm install mcp-atlassian-with-bitbucket-and-privacy ./mcp-atlassian-with-bitbucket-and-privacy -f my-values.yaml
 ```
 
 ### Validate the chart
 
 ```bash
-helm lint mcp-atlassian/
+helm lint mcp-atlassian-with-bitbucket-and-privacy/
 ```
 
 ### Test installation
 
 ```bash
-helm install mcp-atlassian ./mcp-atlassian \
+helm install mcp-atlassian-with-bitbucket-and-privacy ./mcp-atlassian-with-bitbucket-and-privacy \
   --set confluence.url="https://your-company.atlassian.net/wiki" \
   --set confluence.username="user@example.com" \
   --set confluence.apiToken="token" \
@@ -56,11 +56,156 @@ See the `values.yaml` file for all configuration options.
 
 ### Key Configuration Options
 
-- **authMode**: `api-token`, `personal-token`, `oauth`, or `byot`
+- **authMode**: `api-token`, `personal-token`, `oauth`, `byot`, or `external`
 - **transport**: `stdio`, `sse`, or `streamable-http`
 - **confluence/jira.enabled**: Enable/disable Confluence or Jira integration
 - **config.readOnlyMode**: Disable all write operations
 - **persistence.enabled**: Enable OAuth token persistence
+- **oauthProxy.enabled**: Expose MCP OAuth discovery + DCR routes (opt-in)
+- **oauthClientStorage.mode**: `default` (FastMCP storage) or `factory` (custom)
+
+### External proxy authentication
+
+Use `authMode: external` only behind a trusted gateway that authenticates every
+MCP request and overwrites the configured passthrough headers. The chart enables
+`ATLASSIAN_EXTERNAL_AUTH_ENABLE` and `IGNORE_HEADER_AUTH` for this mode.
+
+```yaml
+authMode: external
+transport: streamable-http
+jira:
+  url: "https://your-company.atlassian.net"
+  passthroughHeaders: "Cookie"
+confluence:
+  url: "https://your-company.atlassian.net/wiki"
+  passthroughHeaders: "Cookie"
+```
+
+For dynamic service URLs, add `MCP_ALLOWED_URL_DOMAINS` through `extraEnv`. The
+server rejects dynamic external-auth destinations without this allowlist.
+
+### Proxy + PAC/WPAD
+
+Proxy values can also enable optional PAC/WPAD auto-configuration.
+
+```yaml
+proxy:
+  enabled: true
+  https: "https://proxy.example.com:8443"
+  noProxy: "localhost,127.0.0.1,.internal.example.com"
+  wpad:
+    enabled: true
+    url: "http://wpad/wpad.dat"
+  jira:
+    wpad:
+      enabled: false
+  confluence:
+    wpad:
+      enabled: true
+      url: "http://confluence-wpad.example.com/wpad.dat"
+```
+
+This configures the related proxy environment variables when set, including:
+
+- `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SOCKS_PROXY`
+- `ATLASSIAN_PROXY_WPAD_ENABLE`, `ATLASSIAN_PROXY_WPAD_URL`
+- `JIRA_PROXY_WPAD_ENABLE`, `JIRA_PROXY_WPAD_URL`
+- `CONFLUENCE_PROXY_WPAD_ENABLE`, `CONFLUENCE_PROXY_WPAD_URL`
+
+PAC/WPAD remains opt-in and is only used when no explicit proxy is configured.
+
+### OAuth Proxy + DCR (opt-in)
+
+Enable OAuth proxy/DCR endpoints:
+
+```yaml
+oauthProxy:
+  enabled: true
+  requireConsent: true
+  allowedClientRedirectUris: "https://chatgpt.com/connector_platform_oauth_redirect,http://localhost:*"
+  allowedGrantTypes: "authorization_code,refresh_token"
+```
+
+This sets:
+
+- `ATLASSIAN_OAUTH_PROXY_ENABLE`
+- `ATLASSIAN_OAUTH_REQUIRE_CONSENT`
+- `ATLASSIAN_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS`
+- `ATLASSIAN_OAUTH_ALLOWED_GRANT_TYPES`
+
+### Custom OAuth Client Storage (factory mode)
+
+For advanced deployments, you can provide a custom storage backend factory
+without changing core chart API:
+
+```yaml
+oauthClientStorage:
+  mode: factory
+  factory:
+    importPath: "my_pkg.storage:create_store"
+    configJsonSecret:
+      name: mcp-atlassian-with-bitbucket-and-privacy-storage-config
+      key: config.json
+```
+
+This sets:
+
+- `ATLASSIAN_OAUTH_CLIENT_STORAGE_MODE=factory`
+- `ATLASSIAN_OAUTH_CLIENT_STORAGE_FACTORY`
+- `ATLASSIAN_OAUTH_CLIENT_STORAGE_CONFIG_JSON` (optional)
+
+The factory callable should return an async key/value compatible storage object
+used by FastMCP OAuth proxy client registration storage.
+
+### Structured Identity Privacy (opt-in)
+
+Identity privacy is disabled by default. For pseudonymization, create an
+existing Secret containing the private policy and a Base64-encoded key of at
+least 32 bytes:
+
+```bash
+kubectl create secret generic mcp-atlassian-with-bitbucket-and-privacy-identity-privacy \
+  --from-file=identity-policy.json=identity-policy.json \
+  --from-file=identity-keyring.json=identity-keyring.json
+```
+
+Mount it read-only and configure the feature through the chart's existing
+extension points:
+
+```yaml
+extraEnv:
+  - name: MCP_ATLASSIAN_IDENTITY_PRIVACY_MODE
+    value: pseudonymize
+  - name: MCP_ATLASSIAN_IDENTITY_POLICY_FILE
+    value: /run/secrets/identity-privacy/identity-policy.json
+  - name: MCP_ATLASSIAN_PSEUDONYM_KEYRING_FILE
+    value: /run/secrets/identity-privacy/identity-keyring.json
+  - name: MCP_ATLASSIAN_PSEUDONYM_CORRELATION_SCOPE
+    value: deployment
+  - name: MCP_ATLASSIAN_PSEUDONYM_CORRELATION_DOMAIN
+    value: my-mcp-deployment
+  - name: MCP_ATLASSIAN_PSEUDONYM_ROTATION_HOURS
+    value: "24"
+  - name: MCP_ATLASSIAN_IDENTITY_SELF_IDENTIFICATION_ENABLED
+    value: "true"
+  - name: MCP_ATLASSIAN_IDENTITY_ALIAS_ROUNDTRIP_ENABLED
+    value: "false"
+
+volumes:
+  - name: identity-privacy
+    secret:
+      secretName: mcp-atlassian-with-bitbucket-and-privacy-identity-privacy
+
+volumeMounts:
+  - name: identity-privacy
+    mountPath: /run/secrets/identity-privacy
+    readOnly: true
+```
+
+See [Structured Identity Privacy](../docs/identity-privacy.md) for policy
+syntax, scope boundaries, raw-content behavior, and fail-closed semantics.
+When alias roundtrip is enabled, use one replica or request affinity because
+the caller-bound alias cache is process-local.
 
 ### Health Checks and Readiness Probe
 
@@ -97,18 +242,18 @@ readinessProbe:
 ## Upgrading
 
 ```bash
-helm upgrade mcp-atlassian ./mcp-atlassian -f my-values.yaml
+helm upgrade mcp-atlassian-with-bitbucket-and-privacy ./mcp-atlassian-with-bitbucket-and-privacy -f my-values.yaml
 ```
 
 ## Uninstalling
 
 ```bash
-helm uninstall mcp-atlassian
+helm uninstall mcp-atlassian-with-bitbucket-and-privacy
 ```
 
 ## Support
 
-For issues with the MCP Atlassian server, see https://github.com/sooperset/mcp-atlassian
+For issues with MCP Atlassian with Bitbucket and Privacy, see https://github.com/ulikoenig/mcp-atlassian-with-bitbucket/issues
 
 ## License
 

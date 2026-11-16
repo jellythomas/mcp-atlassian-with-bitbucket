@@ -120,14 +120,17 @@ class TestTruststoreEnvParsing:
                 "os.environ",
                 {"MCP_ATLASSIAN_USE_SYSTEM_TRUSTSTORE": "false"},
             ),
-            patch("mcp_atlassian.dotenv_values", return_value={}),
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.dotenv_values",
+                return_value={},
+            ),
             patch("truststore.inject_into_ssl") as mock_inject,
         ):
             import importlib
 
-            import mcp_atlassian
+            import mcp_atlassian_with_bitbucket_and_privacy
 
-            importlib.reload(mcp_atlassian)
+            importlib.reload(mcp_atlassian_with_bitbucket_and_privacy)
             mock_inject.assert_not_called()
 
     def test_import_time_with_env_0(self) -> None:
@@ -137,14 +140,17 @@ class TestTruststoreEnvParsing:
                 "os.environ",
                 {"MCP_ATLASSIAN_USE_SYSTEM_TRUSTSTORE": "0"},
             ),
-            patch("mcp_atlassian.dotenv_values", return_value={}),
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.dotenv_values",
+                return_value={},
+            ),
             patch("truststore.inject_into_ssl") as mock_inject,
         ):
             import importlib
 
-            import mcp_atlassian
+            import mcp_atlassian_with_bitbucket_and_privacy
 
-            importlib.reload(mcp_atlassian)
+            importlib.reload(mcp_atlassian_with_bitbucket_and_privacy)
             mock_inject.assert_not_called()
 
     def test_import_time_with_env_no(self) -> None:
@@ -154,14 +160,17 @@ class TestTruststoreEnvParsing:
                 "os.environ",
                 {"MCP_ATLASSIAN_USE_SYSTEM_TRUSTSTORE": "no"},
             ),
-            patch("mcp_atlassian.dotenv_values", return_value={}),
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.dotenv_values",
+                return_value={},
+            ),
             patch("truststore.inject_into_ssl") as mock_inject,
         ):
             import importlib
 
-            import mcp_atlassian
+            import mcp_atlassian_with_bitbucket_and_privacy
 
-            importlib.reload(mcp_atlassian)
+            importlib.reload(mcp_atlassian_with_bitbucket_and_privacy)
             mock_inject.assert_not_called()
 
     def test_import_time_default_enables_truststore(self) -> None:
@@ -173,14 +182,17 @@ class TestTruststoreEnvParsing:
         }
         with (
             patch.dict("os.environ", env_without_key, clear=True),
-            patch("mcp_atlassian.dotenv_values", return_value={}),
+            patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.dotenv_values",
+                return_value={},
+            ),
             patch("truststore.inject_into_ssl") as mock_inject,
         ):
             import importlib
 
-            import mcp_atlassian
+            import mcp_atlassian_with_bitbucket_and_privacy
 
-            importlib.reload(mcp_atlassian)
+            importlib.reload(mcp_atlassian_with_bitbucket_and_privacy)
             mock_inject.assert_called_once()
 
     def test_import_time_dotenv_none_does_not_crash(self) -> None:
@@ -198,16 +210,16 @@ class TestTruststoreEnvParsing:
         with (
             patch.dict("os.environ", env_without_key, clear=True),
             patch(
-                "mcp_atlassian.dotenv_values",
+                "mcp_atlassian_with_bitbucket_and_privacy.dotenv_values",
                 return_value=dotenv_with_none,
             ),
             patch("truststore.inject_into_ssl") as mock_inject,
         ):
             import importlib
 
-            import mcp_atlassian
+            import mcp_atlassian_with_bitbucket_and_privacy
 
             # Must not raise AttributeError
-            importlib.reload(mcp_atlassian)
+            importlib.reload(mcp_atlassian_with_bitbucket_and_privacy)
             # None falls back to "true" → truststore enabled
             mock_inject.assert_called_once()

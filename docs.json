@@ -1,9 +1,9 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "MCP Atlassian",
+  "name": "MCP Atlassian with Bitbucket and Privacy",
   "metadata": {
-    "og:description": "MCP server for Atlassian Jira and Confluence — all 72 tools enabled by default"
+    "og:description": "MCP server for Jira and Confluence: all 98 tools enabled by default, plus Bitbucket integration and optional identity privacy protection"
   },
   "seo": {
     "indexHiddenPages": false
@@ -16,28 +16,28 @@
   },
   "topbarCtaButton": {
     "name": "GitHub",
-    "url": "https://github.com/sooperset/mcp-atlassian"
+    "url": "https://github.com/ulikoenig/mcp-atlassian-with-bitbucket"
   },
   "topbarLinks": [
     {
       "name": "PyPI",
-      "url": "https://pypi.org/project/mcp-atlassian/"
+      "url": "https://pypi.org/project/mcp-atlassian-with-bitbucket-and-privacy/"
     },
     {
       "name": "Releases",
-      "url": "https://github.com/sooperset/mcp-atlassian/releases"
+      "url": "https://github.com/ulikoenig/mcp-atlassian-with-bitbucket/releases"
     }
   ],
   "anchors": [
     {
       "name": "GitHub",
       "icon": "github",
-      "url": "https://github.com/sooperset/mcp-atlassian"
+      "url": "https://github.com/ulikoenig/mcp-atlassian-with-bitbucket"
     },
     {
       "name": "PyPI",
       "icon": "python",
-      "url": "https://pypi.org/project/mcp-atlassian/"
+      "url": "https://pypi.org/project/mcp-atlassian-with-bitbucket-and-privacy/"
     }
   ],
   "navigation": {
@@ -87,7 +87,9 @@
               "docs/tools/confluence-pages",
               "docs/tools/confluence-search",
               "docs/tools/confluence-attachments",
-              "docs/tools/confluence-comments"
+              "docs/tools/confluence-comments",
+              "docs/tools/confluence-permissions",
+              "docs/tools/confluence-templates"
             ]
           },
           {
@@ -110,6 +112,6 @@
     ]
   },
   "footerSocials": {
-    "github": "https://github.com/sooperset/mcp-atlassian"
+    "github": "https://github.com/ulikoenig/mcp-atlassian-with-bitbucket"
   }
 }

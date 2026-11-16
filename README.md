@@ -1,13 +1,17 @@
-# MCP Atlassian + Bitbucket
+# MCP Atlassian with Bitbucket and Privacy
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![License](https://img.shields.io/github/license/sooperset/mcp-atlassian)
+![License](https://img.shields.io/github/license/ulikoenig/mcp-atlassian-with-bitbucket)
 
 Model Context Protocol (MCP) server for Atlassian products — **Jira**, **Confluence**, and **Bitbucket**. Supports both Cloud and Server/Data Center deployments.
 
-**136 tools** across 33 toolsets: 49 Jira + 23 Confluence + 64 Bitbucket.
+**162 tools** across 37 toolsets: 63 Jira + 35 Confluence + 64 Bitbucket.
 
-> Fork of [sooperset/mcp-atlassian](https://github.com/sooperset/mcp-atlassian) with comprehensive Bitbucket Cloud and Server/DC integration.
+> Fork of [jellythomas/mcp-atlassian-with-bitbucket](https://github.com/jellythomas/mcp-atlassian-with-bitbucket), which added comprehensive Bitbucket Cloud and Server/DC integration on top of [sooperset/mcp-atlassian](https://github.com/sooperset/mcp-atlassian). This fork adds further Bitbucket Server/DC fixes (real branch-utils, build-status, branch-permissions, and code-search APIs).
+>
+> **Integrated upstream state:**
+> - `jellythomas/mcp-atlassian-with-bitbucket` @ [`9face83`](https://github.com/jellythomas/mcp-atlassian-with-bitbucket/commit/9face8350494dff9c0daf0c04754721f0ecf3848) (tag `v1.0.5`, 2026-03-13)
+> - `sooperset/mcp-atlassian` @ [`2e25fb4`](https://github.com/sooperset/mcp-atlassian/commit/2e25fb4f30630e1047a98fb8e2fbbcf229450a1c) (52 commits past tag `v0.23.0`, 2026-09-15)
 
 ## Quick Start
 
@@ -20,9 +24,9 @@ Just add to your Claude Desktop, Cursor, VS Code, or Claude Code MCP configurati
 ```json
 {
   "mcpServers": {
-    "mcp-atlassian-with-bitbucket": {
+    "mcp-atlassian-with-bitbucket-and-privacy": {
       "command": "uvx",
-      "args": ["mcp-atlassian-with-bitbucket"],
+      "args": ["mcp-atlassian-with-bitbucket-and-privacy"],
       "env": {
         "JIRA_URL": "https://your-company.atlassian.net",
         "JIRA_USERNAME": "your.email@company.com",
@@ -48,7 +52,7 @@ For contributing or running from a cloned repository:
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/jellythomas/mcp-atlassian-with-bitbucket.git
+git clone https://github.com/ulikoenig/mcp-atlassian-with-bitbucket.git
 cd mcp-atlassian-with-bitbucket
 
 # 2. Install dependencies with uv
@@ -60,9 +64,9 @@ Then add to your MCP configuration:
 ```json
 {
   "mcpServers": {
-    "mcp-atlassian-with-bitbucket": {
+    "mcp-atlassian-with-bitbucket-and-privacy": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/mcp-atlassian-with-bitbucket", "mcp-atlassian"],
+      "args": ["run", "--directory", "/path/to/mcp-atlassian-with-bitbucket", "mcp-atlassian-with-bitbucket-and-privacy"],
       "env": {
         "JIRA_URL": "https://your-company.atlassian.net",
         "JIRA_USERNAME": "your.email@company.com",
@@ -80,7 +84,26 @@ Then add to your MCP configuration:
 }
 ```
 
-> **Tip**: If you already have Jira/Confluence API tokens, the same token works for Bitbucket Cloud — no need to create a separate app password.
+> **Note**: Bitbucket Cloud uses its own scoped API tokens, separate from your Jira/Confluence Atlassian API token — see [Bitbucket Cloud](#bitbucket-cloud) below for how to create one.
+
+### Autohand Code
+
+Use the same `uvx` server with your Atlassian credentials:
+
+```bash
+autohand mcp add mcp-atlassian-with-bitbucket-and-privacy env \
+  JIRA_URL=https://your-company.atlassian.net \
+  JIRA_USERNAME=your.email@company.com \
+  JIRA_API_TOKEN=your_api_token \
+  CONFLUENCE_URL=https://your-company.atlassian.net/wiki \
+  CONFLUENCE_USERNAME=your.email@company.com \
+  CONFLUENCE_API_TOKEN=your_api_token \
+  uvx mcp-atlassian-with-bitbucket-and-privacy
+```
+
+Add `--scope project` after `add` to keep the configuration in the current
+project. See [Autohand Code](https://github.com/autohandai/code-cli/) for current
+installation and CLI details.
 
 ### Start Using
 
@@ -245,16 +268,40 @@ You can also find it at: [bitbucket.org/account/workspaces](https://bitbucket.or
 | `READ_ONLY_MODE` | `false` | Block all write operations |
 | `MCP_VERBOSE` | `false` | Enable verbose logging |
 
+### Structured Identity Privacy (Opt-in)
+
+Structured user identities in Jira, Confluence, and Bitbucket responses can be
+anonymized or time-bounded pseudonymized at the final MCP response boundary.
+The public default is `off`, so existing deployments and response shapes remain
+unchanged until the feature is explicitly enabled.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_ATLASSIAN_IDENTITY_PRIVACY_MODE` | `off` | `off`, `anonymize`, or `pseudonymize` |
+| `MCP_ATLASSIAN_IDENTITY_POLICY_FILE` | — | Optional JSON policy for affiliation, human/service classification, and selected Jira text fields |
+| `MCP_ATLASSIAN_PSEUDONYM_KEY` | — | Base64-encoded key of at least 32 bytes; use this or the key-file setting, never both |
+| `MCP_ATLASSIAN_PSEUDONYM_KEY_FILE` | — | File containing the Base64-encoded pseudonym key |
+| `MCP_ATLASSIAN_PSEUDONYM_KEYRING_FILE` | — | Versioned JSON keyring with one active key and up to four accepted predecessors; mutually exclusive with the other key sources |
+| `MCP_ATLASSIAN_PSEUDONYM_CORRELATION_SCOPE` | `deployment` | `deployment`, `connector`, or `instance` |
+| `MCP_ATLASSIAN_PSEUDONYM_CORRELATION_DOMAIN` | — | Required for deployment-scoped pseudonyms |
+| `MCP_ATLASSIAN_PSEUDONYM_ROTATION_HOURS` | `24` | UTC-aligned alias rotation period |
+| `MCP_ATLASSIAN_IDENTITY_SELF_IDENTIFICATION_ENABLED` | `true` | Mark the authenticated caller as `is_current_user: true` / `You` without revealing the raw identity |
+| `MCP_ATLASSIAN_IDENTITY_ALIAS_ROUNDTRIP_ENABLED` | `false` | Allow caller- and tenant-bound pseudonym aliases in supported identity write workflows |
+| `MCP_ATLASSIAN_UNSTRUCTURED_CONTENT_POLICY` | `allow` | `allow` registered raw content or `deny` it entirely |
+
+See [Structured Identity Privacy](docs/identity-privacy.md) for policy syntax,
+Docker and Kubernetes/Helm examples, failure behavior, and scope limitations.
+
 ## Toolset Reference
 
-Tools are organized into **33 toolsets** controlled via the `TOOLSETS` env var. Default toolsets are enabled when `TOOLSETS=default`.
+Tools are organized into **37 toolsets** controlled via the `TOOLSETS` env var. Default toolsets are enabled when `TOOLSETS=default`.
 
 ### Bitbucket Toolsets (12)
 
 | Toolset | Tools | Default | Description |
 |---------|------:|---------|-------------|
 | `bitbucket_repositories` | 7 | Yes | Repository CRUD, search, fork |
-| `bitbucket_pull_requests` | 15 | Yes | PR lifecycle, review, merge, diff, comments |
+| `bitbucket_pull_requests` | 18 | Yes | PR lifecycle, review, merge, diff, comments |
 | `bitbucket_branches` | 5 | Yes | Branch management, branching model, restrictions |
 | `bitbucket_commits` | 6 | Yes | Commit history, compare, statuses, comments |
 | `bitbucket_source` | 5 | Yes | File browsing, code search, blame, history |
@@ -266,7 +313,7 @@ Tools are organized into **33 toolsets** controlled via the `TOOLSETS` env var. 
 | `bitbucket_snippets` | — | No | Code snippets (placeholder) |
 | `bitbucket_workspace` | 5 | No | Workspace/project members, default reviewers |
 
-### Jira Toolsets (15)
+### Jira Toolsets (16)
 
 | Toolset | Default | Description |
 |---------|---------|-------------|
@@ -285,8 +332,9 @@ Tools are organized into **33 toolsets** controlled via the `TOOLSETS` env var. 
 | `jira_forms` | No | ProForma forms |
 | `jira_metrics` | No | Issue dates and SLA metrics |
 | `jira_development` | No | Dev info (branches, PRs, commits) |
+| `jira_project_analysis` | No | Project epic hierarchy and cross-project dependencies |
 
-### Confluence Toolsets (6)
+### Confluence Toolsets (8)
 
 | Toolset | Default | Description |
 |---------|---------|-------------|
@@ -296,6 +344,10 @@ Tools are organized into **33 toolsets** controlled via the `TOOLSETS` env var. 
 | `confluence_users` | No | User search |
 | `confluence_analytics` | No | Page view analytics |
 | `confluence_attachments` | No | Attachment management |
+| `confluence_templates` | No | Cloud page template listing and page creation from templates |
+| `confluence_permissions` | No | Content and space permission checking |
+
+Additionally, a `legacy` toolset (off by default) retains deprecated tools kept for migration compatibility — it isn't tied to a single product.
 
 ### Toolset Configuration Examples
 
@@ -479,9 +531,9 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 ```json
 {
   "mcpServers": {
-    "mcp-atlassian-with-bitbucket": {
+    "mcp-atlassian-with-bitbucket-and-privacy": {
       "command": "uvx",
-      "args": ["mcp-atlassian-with-bitbucket"],
+      "args": ["mcp-atlassian-with-bitbucket-and-privacy"],
       "env": {
         "BITBUCKET_URL": "https://bitbucket.org",
         "BITBUCKET_USERNAME": "your_username",
@@ -500,9 +552,9 @@ The recommended approach is to add the server directly in `~/.claude/settings.js
 ```json
 {
   "mcpServers": {
-    "mcp-atlassian-with-bitbucket": {
+    "mcp-atlassian-with-bitbucket-and-privacy": {
       "command": "uvx",
-      "args": ["mcp-atlassian-with-bitbucket"],
+      "args": ["mcp-atlassian-with-bitbucket-and-privacy"],
       "env": {
         "JIRA_URL": "https://your-company.atlassian.net",
         "JIRA_USERNAME": "your.email@company.com",
@@ -525,9 +577,9 @@ The recommended approach is to add the server directly in `~/.claude/settings.js
 ```json
 {
   "mcpServers": {
-    "mcp-atlassian-with-bitbucket": {
+    "mcp-atlassian-with-bitbucket-and-privacy": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/mcp-atlassian-with-bitbucket", "mcp-atlassian"],
+      "args": ["run", "--directory", "/path/to/mcp-atlassian-with-bitbucket-and-privacy", "mcp-atlassian-with-bitbucket-and-privacy"],
       "env": {
         "BITBUCKET_URL": "https://bitbucket.org",
         "BITBUCKET_USERNAME": "your.email@company.com",
@@ -541,16 +593,37 @@ The recommended approach is to add the server directly in `~/.claude/settings.js
 
 > **Note**: The `claude mcp add` CLI command works too, but doesn't support inline `env` — you'd need to export variables in your shell profile instead.
 
-### Cursor / VS Code
+### Cursor
 
-Add to `.cursor/mcp.json` or `.vscode/mcp.json`:
+Add to `.cursor/mcp.json` (uses the `mcpServers` key, same format as Claude Desktop):
+
+```json
+{
+  "mcpServers": {
+    "mcp-atlassian-with-bitbucket-and-privacy": {
+      "command": "uvx",
+      "args": ["mcp-atlassian-with-bitbucket-and-privacy"],
+      "env": {
+        "BITBUCKET_URL": "https://bitbucket.org",
+        "BITBUCKET_USERNAME": "your_username",
+        "BITBUCKET_APP_PASSWORD": "your_app_password",
+        "BITBUCKET_WORKSPACE": "your_workspace"
+      }
+    }
+  }
+}
+```
+
+### VS Code
+
+Add to `.vscode/mcp.json` (uses the `servers` key, not `mcpServers`):
 
 ```json
 {
   "servers": {
-    "mcp-atlassian-with-bitbucket": {
+    "mcp-atlassian-with-bitbucket-and-privacy": {
       "command": "uvx",
-      "args": ["mcp-atlassian-with-bitbucket"],
+      "args": ["mcp-atlassian-with-bitbucket-and-privacy"],
       "env": {
         "BITBUCKET_URL": "https://bitbucket.org",
         "BITBUCKET_USERNAME": "your_username",
@@ -565,7 +638,7 @@ Add to `.cursor/mcp.json` or `.vscode/mcp.json`:
 ## Architecture
 
 ```
-src/mcp_atlassian/
+src/mcp_atlassian_with_bitbucket_and_privacy/
 ├── bitbucket/
 │   ├── config.py          # BitbucketConfig with Cloud/Server detection
 │   └── client.py          # Unified client with dual Cloud/Server API support
@@ -573,11 +646,11 @@ src/mcp_atlassian/
 ├── confluence/             # Confluence client (existing)
 ├── servers/
 │   ├── main.py            # Main MCP server mounting all sub-servers
-│   ├── jira.py            # 49 Jira tool definitions
-│   ├── confluence.py      # 23 Confluence tool definitions
+│   ├── jira.py            # 63 Jira tool definitions
+│   ├── confluence.py      # 35 Confluence tool definitions
 │   └── bitbucket.py       # 64 Bitbucket tool definitions
 └── utils/
-    ├── toolsets.py         # 33 toolset definitions and filtering
+    ├── toolsets.py         # 37 toolset definitions and filtering
     └── tools.py            # Tool-level filtering utilities
 ```
 
@@ -599,7 +672,7 @@ src/mcp_atlassian/
 | Pipeline tools error on Server | Pipelines are Cloud-only; use `TOOLSETS` to disable |
 | `429 Too Many Requests` | Built-in retry handles this; increase `BITBUCKET_TIMEOUT` if persistent |
 | SSL errors (Server/DC) | Set `BITBUCKET_SSL_VERIFY=false` for self-signed certs |
-| Server name shows old name in `/mcp` | The name shown is the JSON key in your config, not the package name. Rename the key (e.g., `"mcp-atlassian"` → `"mcp-atlassian-with-bitbucket"`) and restart |
+| Server name shows old name in `/mcp` | The name shown is the JSON key in your config, not the package name. Rename the key (e.g., `"mcp-atlassian-with-bitbucket"` → `"mcp-atlassian-with-bitbucket-and-privacy"`) and restart |
 | Bitbucket tools not appearing | Ensure `BITBUCKET_URL` and credentials are set. The server auto-detects available services based on which env vars are present |
 
 ## LLM Context Optimization
@@ -612,17 +685,18 @@ Use `compact: true` when calling `get_pull_request` to return only essential fie
 
 **Essential fields returned:**
 - `id`, `title`, `state`, `description`
-- `author` (display name, account ID)
-- `source_branch`, `destination_branch`
-- `reviewers` (list with names and approval status)
-- `created_on`, `updated_on`
+- `author` (display name only)
+- `source` / `destination` (each with `branch`, `repo`, `commit`)
+- `reviewers` (list of display names), `approved_by` (list of display names who approved)
+- `created_on`, `updated_on`, `comment_count`, `task_count`
+- `merge_commit`, `close_source_branch`, `draft`, `links.html`
 
 **Example usage in your AI assistant:**
 > "Get PR #42 details in compact mode"
 
 ### Save Diff to File
 
-Use `save_to_file: true` when calling `get_pull_request_diff` to write the diff to a temporary file (`/tmp/bitbucket.diff`) instead of returning the raw text. Returns a metadata object with:
+Use `save_to_file: true` when calling `get_pull_request_diff` to write the diff to a file in the system temp directory instead of returning the raw text (e.g. `/tmp/bitbucket.diff` on Linux/macOS, `%TEMP%\bitbucket.diff` on Windows). Returns a metadata object with:
 
 ```json
 {
@@ -640,7 +714,10 @@ This prevents large diffs from flooding the LLM context window. Read the file se
 
 ## Security
 
-Never share API tokens or app passwords. Keep `.env` files secure and out of version control. See [SECURITY.md](SECURITY.md).
+Never share API tokens, app passwords, pseudonym keys, or private identity
+policies. Keep `.env` and mounted secret files secure and out of version
+control. See [SECURITY.md](SECURITY.md) and
+[Structured Identity Privacy](docs/identity-privacy.md).
 
 ## Contributing
 

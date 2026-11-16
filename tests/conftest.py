@@ -1,5 +1,5 @@
 """
-Root pytest configuration file for MCP Atlassian tests.
+Root pytest configuration file for MCP Atlassian with Bitbucket and Privacy tests.
 
 This module provides session-scoped fixtures and utilities that are shared
 across all test modules. It integrates with the new test utilities framework
@@ -330,6 +330,22 @@ def parametrized_auth_env(request):
 # ============================================================================
 
 
+@pytest.fixture(autouse=True)
+def _isolate_files_dir(tmp_path_factory, monkeypatch):
+    """Keep the remote-transport file root out of the real home directory.
+
+    CLI tests that start an HTTP transport would otherwise create
+    ``~/.mcp-atlassian/files`` and leave the module-level transport flag set
+    for later tests.
+    """
+    from mcp_atlassian_with_bitbucket_and_privacy.utils import io as io_mod
+
+    files_dir = tmp_path_factory.mktemp("mcp-files")
+    monkeypatch.setattr(io_mod, "default_files_dir", lambda: files_dir)
+    yield
+    io_mod.set_remote_transport(False)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def validate_test_environment():
     """
@@ -357,9 +373,11 @@ def validate_test_environment():
         pytest.fail(f"Failed to import test utilities: {e}")
 
     # Log session start
-    print("\n🧪 Starting MCP Atlassian test session with enhanced fixtures")
+    print(
+        "\n🧪 Starting MCP Atlassian with Bitbucket and Privacy test session with enhanced fixtures"
+    )
 
     yield
 
     # Log session end
-    print("\n✅ Completed MCP Atlassian test session")
+    print("\n✅ Completed MCP Atlassian with Bitbucket and Privacy test session")

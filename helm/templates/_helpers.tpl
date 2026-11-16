@@ -1,14 +1,14 @@
 {{/*
 Expand the name of the chart.
 */}}
-{{- define "mcp-atlassian.name" -}}
+{{- define "mcp-atlassian-with-bitbucket-and-privacy.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
 Create a default fully qualified app name.
 */}}
-{{- define "mcp-atlassian.fullname" -}}
+{{- define "mcp-atlassian-with-bitbucket-and-privacy.fullname" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
@@ -24,16 +24,16 @@ Create a default fully qualified app name.
 {{/*
 Create chart name and version as used by the chart label.
 */}}
-{{- define "mcp-atlassian.chart" -}}
+{{- define "mcp-atlassian-with-bitbucket-and-privacy.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
 Common labels
 */}}
-{{- define "mcp-atlassian.labels" -}}
-helm.sh/chart: {{ include "mcp-atlassian.chart" . }}
-{{ include "mcp-atlassian.selectorLabels" . }}
+{{- define "mcp-atlassian-with-bitbucket-and-privacy.labels" -}}
+helm.sh/chart: {{ include "mcp-atlassian-with-bitbucket-and-privacy.chart" . }}
+{{ include "mcp-atlassian-with-bitbucket-and-privacy.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
@@ -43,17 +43,17 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/*
 Selector labels
 */}}
-{{- define "mcp-atlassian.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "mcp-atlassian.name" . }}
+{{- define "mcp-atlassian-with-bitbucket-and-privacy.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "mcp-atlassian-with-bitbucket-and-privacy.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
 Create the name of the service account to use
 */}}
-{{- define "mcp-atlassian.serviceAccountName" -}}
+{{- define "mcp-atlassian-with-bitbucket-and-privacy.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create }}
-{{- default (include "mcp-atlassian.fullname" .) .Values.serviceAccount.name }}
+{{- default (include "mcp-atlassian-with-bitbucket-and-privacy.fullname" .) .Values.serviceAccount.name }}
 {{- else }}
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}

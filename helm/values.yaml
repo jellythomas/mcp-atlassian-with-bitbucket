@@ -1,12 +1,12 @@
-# Default values for mcp-atlassian
+# Default values for mcp-atlassian-with-bitbucket-and-privacy
 # This is a YAML-formatted file.
 
 replicaCount: 1
 
 image:
-  repository: ghcr.io/sooperset/mcp-atlassian
+  repository: ghcr.io/ulikoenig/mcp-atlassian-with-bitbucket-and-privacy
   pullPolicy: IfNotPresent
-  tag: "0.20.0"
+  tag: "1.1.0"
 
 imagePullSecrets: []
 nameOverride: ""
@@ -57,14 +57,14 @@ ingress:
     # kubernetes.io/ingress.class: nginx
     # cert-manager.io/cluster-issuer: letsencrypt-prod
   hosts:
-    - host: mcp-atlassian.local
+    - host: mcp-atlassian-with-bitbucket-and-privacy.local
       paths:
         - path: /
           pathType: Prefix
   tls: []
-  #  - secretName: mcp-atlassian-tls
+  #  - secretName: mcp-atlassian-with-bitbucket-and-privacy-tls
   #    hosts:
-  #      - mcp-atlassian.local
+  #      - mcp-atlassian-with-bitbucket-and-privacy.local
 
 resources:
   limits:
@@ -105,7 +105,8 @@ persistence:
   size: 1Gi
   # existingClaim: ""
 
-# Authentication Mode: "api-token", "personal-token", "oauth", or "byot" (bring your own token)
+# Authentication Mode: "api-token", "personal-token", "oauth", "byot"
+# (bring your own token), or "external" (trusted proxy header passthrough).
 authMode: "api-token"
 
 # Confluence Configuration
@@ -131,6 +132,9 @@ confluence:
   # Custom headers (comma-separated key=value pairs)
   customHeaders: ""
 
+  # Incoming MCP request header names to pass through (comma-separated)
+  passthroughHeaders: ""
+
 # Jira Configuration
 jira:
   enabled: true
@@ -154,6 +158,9 @@ jira:
   # Custom headers (comma-separated key=value pairs)
   customHeaders: ""
 
+  # Incoming MCP request header names to pass through (comma-separated)
+  passthroughHeaders: ""
+
 # OAuth 2.0 Configuration (Cloud only)
 # Required when authMode: oauth or byot
 oauth:
@@ -170,6 +177,33 @@ oauth:
   # Provide pre-existing access token
   accessToken: ""
 
+# OAuth Proxy + DCR Configuration
+# Optional and disabled by default. When enabled, the server exposes
+# discovery + DCR routes for MCP OAuth clients.
+oauthProxy:
+  enabled: false
+
+  # Optional restrictions (comma-separated values)
+  allowedClientRedirectUris: ""
+  allowedGrantTypes: ""
+
+  # Require consent page during OAuth authorize flow.
+  requireConsent: true
+
+# OAuth proxy client storage backend for registered clients.
+# "default": use FastMCP default encrypted storage.
+# "factory": load custom storage via import path.
+oauthClientStorage:
+  mode: "default" # default | factory
+  factory:
+    importPath: "" # e.g. "my_pkg.storage:create_store"
+    # Optional JSON object passed to the factory.
+    configJson: ""
+    # Optionally source JSON from an existing secret key.
+    configJsonSecret:
+      name: ""
+      key: "config.json"
+
 # Proxy Configuration
 proxy:
   enabled: false
@@ -177,16 +211,25 @@ proxy:
   https: ""
   noProxy: "localhost,127.0.0.1"
   socks: ""
+  wpad:
+    enabled: false
+    url: ""
 
   # Service-specific proxy overrides
   confluence:
     http: ""
     https: ""
     noProxy: ""
+    wpad:
+      enabled: null # Set true/false to override the global WPAD toggle for Confluence
+      url: ""
   jira:
     http: ""
     https: ""
     noProxy: ""
+    wpad:
+      enabled: null # Set true/false to override the global WPAD toggle for Jira
+      url: ""
 
 # Server Configuration
 config:

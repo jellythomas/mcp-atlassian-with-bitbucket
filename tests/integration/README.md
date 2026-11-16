@@ -1,6 +1,6 @@
 # Integration Tests
 
-This directory contains integration tests for the MCP Atlassian project. These tests validate the interaction between different components and services.
+This directory contains integration tests for the MCP Atlassian with Bitbucket and Privacy project. These tests validate the interaction between different components and services.
 
 ## Test Categories
 
@@ -85,7 +85,7 @@ uv run pytest tests/integration/ --integration
 uv run pytest tests/integration/test_authentication.py --integration
 
 # Run with coverage
-uv run pytest tests/integration/ --integration --cov=src/mcp_atlassian
+uv run pytest tests/integration/ --integration --cov=src/mcp_atlassian_with_bitbucket_and_privacy
 ```
 
 ### Real API Testing

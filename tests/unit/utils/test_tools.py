@@ -3,7 +3,10 @@
 import os
 from unittest.mock import patch
 
-from mcp_atlassian.utils.tools import get_enabled_tools, should_include_tool
+from mcp_atlassian_with_bitbucket_and_privacy.utils.tools import (
+    get_enabled_tools,
+    should_include_tool,
+)
 
 
 def test_get_enabled_tools_not_set():

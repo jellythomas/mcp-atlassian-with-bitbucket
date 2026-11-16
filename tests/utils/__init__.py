@@ -1,1 +1,1 @@
-"""Test utilities for MCP Atlassian test suite."""
+"""Test utilities for MCP Atlassian with Bitbucket and Privacy test suite."""

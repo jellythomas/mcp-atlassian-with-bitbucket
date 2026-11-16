@@ -5,12 +5,40 @@ import socket
 from unittest.mock import patch
 
 import pytest
+import requests
 
-from mcp_atlassian.utils.urls import (
+from mcp_atlassian_with_bitbucket_and_privacy.utils.urls import (
+    _check_ip_address,
     is_atlassian_cloud_url,
+    make_ssrf_redirect_hook,
     resolve_relative_url,
     validate_url_for_ssrf,
 )
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("/login", "https://jira.example.com/login"),
+        ("//cdn.example.com/file", "https://cdn.example.com/file"),
+    ],
+)
+def test_redirect_hook_resolves_location_before_validation(
+    location: str, expected: str
+) -> None:
+    """Relative and scheme-relative redirects are validated as absolute URLs."""
+    response = requests.Response()
+    response.status_code = 302
+    response.url = "https://jira.example.com/start"
+    response.headers["Location"] = location
+
+    with patch(
+        "mcp_atlassian_with_bitbucket_and_privacy.utils.urls.validate_url_for_ssrf",
+        return_value=None,
+    ) as validate:
+        assert make_ssrf_redirect_hook()(response) is response
+
+    validate.assert_called_once_with(expected)
 
 
 class TestResolveRelativeUrl:
@@ -157,13 +185,17 @@ class TestValidateUrlForSsrf:
 
     def test_valid_cloud_url(self) -> None:
         """Atlassian Cloud URL passes validation."""
-        with patch("mcp_atlassian.utils.urls.socket.getaddrinfo") as mock_dns:
+        with patch(
+            "mcp_atlassian_with_bitbucket_and_privacy.utils.urls.socket.getaddrinfo"
+        ) as mock_dns:
             mock_dns.return_value = [(2, 1, 6, "", ("104.192.141.1", 0))]
             assert validate_url_for_ssrf("https://company.atlassian.net") is None
 
     def test_valid_server_url(self) -> None:
         """Server/DC URL passes validation."""
-        with patch("mcp_atlassian.utils.urls.socket.getaddrinfo") as mock_dns:
+        with patch(
+            "mcp_atlassian_with_bitbucket_and_privacy.utils.urls.socket.getaddrinfo"
+        ) as mock_dns:
             mock_dns.return_value = [(2, 1, 6, "", ("8.8.8.8", 0))]
             assert validate_url_for_ssrf("https://jira.example.com") is None
 
@@ -228,7 +260,9 @@ class TestValidateUrlForSsrf:
 
     def test_dns_resolves_private(self) -> None:
         """Hostname resolving to private IP is rejected."""
-        with patch("mcp_atlassian.utils.urls.socket.getaddrinfo") as mock_dns:
+        with patch(
+            "mcp_atlassian_with_bitbucket_and_privacy.utils.urls.socket.getaddrinfo"
+        ) as mock_dns:
             mock_dns.return_value = [(2, 1, 6, "", ("10.0.0.1", 0))]
             result = validate_url_for_ssrf("https://evil.example.com")
             assert result is not None
@@ -236,7 +270,9 @@ class TestValidateUrlForSsrf:
 
     def test_dns_unresolvable(self) -> None:
         """Unresolvable hostname is rejected."""
-        with patch("mcp_atlassian.utils.urls.socket.getaddrinfo") as mock_dns:
+        with patch(
+            "mcp_atlassian_with_bitbucket_and_privacy.utils.urls.socket.getaddrinfo"
+        ) as mock_dns:
             mock_dns.side_effect = socket.gaierror("Name resolution failed")
             result = validate_url_for_ssrf("https://nonexistent.invalid")
             assert result is not None
@@ -248,7 +284,9 @@ class TestValidateUrlForSsrf:
             os.environ,
             {"MCP_ALLOWED_URL_DOMAINS": "corp.com"},
         ):
-            with patch("mcp_atlassian.utils.urls.socket.getaddrinfo") as mock_dns:
+            with patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.utils.urls.socket.getaddrinfo"
+            ) as mock_dns:
                 mock_dns.return_value = [(2, 1, 6, "", ("8.8.8.8", 0))]
                 assert validate_url_for_ssrf("https://corp.com") is None
 
@@ -258,7 +296,9 @@ class TestValidateUrlForSsrf:
             os.environ,
             {"MCP_ALLOWED_URL_DOMAINS": "atlassian.net"},
         ):
-            with patch("mcp_atlassian.utils.urls.socket.getaddrinfo") as mock_dns:
+            with patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.utils.urls.socket.getaddrinfo"
+            ) as mock_dns:
                 mock_dns.return_value = [(2, 1, 6, "", ("104.192.141.1", 0))]
                 assert validate_url_for_ssrf("https://company.atlassian.net") is None
 
@@ -308,7 +348,9 @@ class TestValidateUrlForSsrf:
         """Without allowlist, hostname resolving to private IP is rejected."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("MCP_ALLOWED_URL_DOMAINS", None)
-            with patch("mcp_atlassian.utils.urls.socket.getaddrinfo") as mock_dns:
+            with patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.utils.urls.socket.getaddrinfo"
+            ) as mock_dns:
                 mock_dns.return_value = [(2, 1, 6, "", ("10.0.0.1", 0))]
                 result = validate_url_for_ssrf("https://some.host")
                 assert result is not None
@@ -320,7 +362,9 @@ class TestValidateUrlForSsrf:
             os.environ,
             {"MCP_ALLOWED_URL_DOMAINS": "corp.example.com"},
         ):
-            with patch("mcp_atlassian.utils.urls.socket.getaddrinfo") as mock_dns:
+            with patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.utils.urls.socket.getaddrinfo"
+            ) as mock_dns:
                 mock_dns.side_effect = socket.gaierror("Name resolution failed")
                 assert validate_url_for_ssrf("https://jira.corp.example.com") is None
 
@@ -328,3 +372,142 @@ class TestValidateUrlForSsrf:
         """IPv4-mapped IPv6 loopback is rejected."""
         result = validate_url_for_ssrf("http://[::ffff:127.0.0.1]")
         assert result is not None
+
+
+@pytest.mark.security_regression
+class TestSsrfEmbeddedIpv4Regression:
+    """IPv6 transition forms must be judged by the IPv4 address they carry.
+
+    ``ipaddress`` reports NAT64 (64:ff9b::/96) and IPv4-compatible (::/96)
+    addresses as global whatever IPv4 they wrap, and 6to4 depends on the
+    Python version, so decoding only IPv4-mapped forms let internal and
+    metadata targets through all three guard layers.
+    """
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "64:ff9b::a9fe:a9fe",  # NAT64 -> 169.254.169.254
+            "64:ff9b::7f00:1",  # NAT64 -> 127.0.0.1
+            "64:ff9b::a00:5",  # NAT64 -> 10.0.0.5
+            "64:ff9b:1::a9fe:a9fe",  # NAT64 local-use prefix
+            "2002:a9fe:a9fe::",  # 6to4 -> 169.254.169.254
+            "2002:7f00:1::",  # 6to4 -> 127.0.0.1
+            "::a9fe:a9fe",  # IPv4-compatible -> 169.254.169.254
+            "::7f00:1",  # IPv4-compatible -> 127.0.0.1
+            "::ffff:a9fe:a9fe",  # IPv4-mapped (already handled)
+        ],
+    )
+    def test_embedded_internal_ipv4_is_blocked(self, ip: str) -> None:
+        assert _check_ip_address(ip) is not None
+        assert validate_url_for_ssrf(f"http://[{ip}]/") is not None
+
+    @pytest.mark.parametrize(
+        "ip", ["64:ff9b::a9fe:a9fe", "2002:a9fe:a9fe::", "::a9fe:a9fe"]
+    )
+    def test_dns_answer_with_embedded_internal_ipv4_is_blocked(self, ip: str) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MCP_ALLOWED_URL_DOMAINS", None)
+            with patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.utils.urls.socket.getaddrinfo"
+            ) as mock_dns:
+                mock_dns.return_value = [(10, 1, 6, "", (ip, 0, 0, 0))]
+                result = validate_url_for_ssrf("https://aaaa.attacker.test")
+        assert result is not None
+        assert "non-global" in result
+
+    @pytest.mark.parametrize(
+        "ip", ["64:ff9b::808:808", "2002:808:808::", "2606:4700:4700::1111"]
+    )
+    def test_embedded_or_native_public_address_is_allowed(self, ip: str) -> None:
+        assert _check_ip_address(ip) is None
+
+    @pytest.mark.parametrize("ip", ["::", "::1"])
+    def test_unspecified_and_loopback_stay_blocked(self, ip: str) -> None:
+        assert _check_ip_address(ip) is not None
+
+    @pytest.mark.parametrize(
+        "ip", ["224.0.0.1", "239.1.1.1", "ff02::1", "ff0e::1", "::ffff:224.0.0.1"]
+    )
+    def test_multicast_is_blocked(self, ip: str) -> None:
+        """ipaddress reports some multicast ranges as global; block them first."""
+        assert _check_ip_address(ip) is not None
+        assert _check_ip_address(ip, allow_private=True) is not None
+
+
+@pytest.mark.security_regression
+class TestAllowlistedHostAddressRegression:
+    """An allowlisted domain may sit on a private network, nothing more.
+
+    Request-supplied URLs can match an ``MCP_ALLOWED_URL_DOMAINS`` pattern, so
+    a subdomain an attacker can point at loopback or a metadata service must
+    not inherit the domain's trust.
+    """
+
+    @pytest.mark.parametrize(
+        "ip",
+        ["127.0.0.1", "169.254.169.254", "fd00:ec2::254", "::1", "0.0.0.0"],
+    )
+    def test_allowlisted_host_resolving_to_loopback_or_metadata_is_blocked(
+        self, ip: str
+    ) -> None:
+        family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        with patch.dict(os.environ, {"MCP_ALLOWED_URL_DOMAINS": "corp.example.com"}):
+            with patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.utils.urls.socket.getaddrinfo"
+            ) as mock_dns:
+                mock_dns.return_value = [(family, 1, 6, "", (ip, 0))]
+                result = validate_url_for_ssrf("https://evil.corp.example.com")
+        assert result is not None
+        assert "non-global" in result
+
+    @pytest.mark.parametrize("ip", ["10.0.0.5", "192.168.1.10", "fd12:3456::1"])
+    def test_allowlisted_host_resolving_to_private_network_is_allowed(
+        self, ip: str
+    ) -> None:
+        family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        with patch.dict(os.environ, {"MCP_ALLOWED_URL_DOMAINS": "corp.example.com"}):
+            with patch(
+                "mcp_atlassian_with_bitbucket_and_privacy.utils.urls.socket.getaddrinfo"
+            ) as mock_dns:
+                mock_dns.return_value = [(family, 1, 6, "", (ip, 0))]
+                assert validate_url_for_ssrf("https://jira.corp.example.com") is None
+
+
+class TestSsrfBackslashBypassRegression:
+    """Regression (GHSA-hgcf) — backslash authority-confusion SSRF bypass.
+
+    ``validate_url_for_ssrf`` extracts the host via ``urlparse().hostname``
+    (``urls.py:92``), but ``requests`` (and browsers) parse a backslash in the
+    authority differently: ``urlparse("http://localhost\\@evil.com/").hostname`` is
+    ``"evil.com"`` (external, so validation passes), while ``requests`` connects to
+    ``localhost`` / ``127.0.0.1`` — the validator would approve a URL that
+    actually targets an internal host. These tests assert the secure outcome: the
+    backslash-confusion URL is blocked.
+    """
+
+    @pytest.mark.security_regression
+    @pytest.mark.parametrize(
+        "url",
+        ["http://localhost\\@evil.com/", "http://127.0.0.1\\@evil.com/"],
+        ids=["localhost-backslash", "loopback-ip-backslash"],
+    )
+    @patch.dict(os.environ, {"MCP_ALLOWED_URL_DOMAINS": ""})
+    @patch("mcp_atlassian_with_bitbucket_and_privacy.utils.urls.socket.getaddrinfo")
+    def test_backslash_authority_confusion_is_blocked(
+        self, mock_getaddrinfo, url: str
+    ) -> None:
+        """A URL whose parsed host disagrees with its connection target is blocked."""
+        # DNS mock: evil.com resolves to a GLOBAL IP, so the *bare* host is "safe".
+        # This isolates the block to backslash normalization, not a DNS failure.
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))
+        ]
+        # Sanity: the external host on its own passes validation under this mock.
+        assert validate_url_for_ssrf("http://evil.com/") is None
+        # The backslash-confusion URL parses to evil.com but really targets internal.
+        result = validate_url_for_ssrf(url)
+        assert result is not None, (
+            "URL with backslash authority confusion must be blocked — the parsed "
+            "host disagrees with the real connection target"
+        )

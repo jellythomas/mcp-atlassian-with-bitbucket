@@ -1,20 +1,20 @@
 ---
 title: "Installation"
-description: "Install and configure MCP Atlassian using uvx, Docker, pip, or from source"
+description: "Install and configure MCP Atlassian with Bitbucket and Privacy using uvx, Docker, pip, or from source"
 ---
 
-MCP Atlassian can be installed using several methods. Choose the one that best fits your workflow.
+MCP Atlassian with Bitbucket and Privacy can be installed using several methods. Choose the one that best fits your workflow.
 
 ## uvx (Recommended)
 
-The simplest way to run MCP Atlassian without permanent installation using [uvx](https://docs.astral.sh/uv/guides/tools/):
+The simplest way to run MCP Atlassian with Bitbucket and Privacy without permanent installation using [uvx](https://docs.astral.sh/uv/guides/tools/):
 
 ```bash
 # Run directly (downloads on first use, cached for subsequent runs)
-uvx mcp-atlassian --help
+uvx mcp-atlassian-with-bitbucket-and-privacy --help
 
 # Run with a specific Python version if needed
-uvx --python=3.12 mcp-atlassian --help
+uvx --python=3.12 mcp-atlassian-with-bitbucket-and-privacy --help
 ```
 
 ### IDE Configuration with uvx
@@ -29,9 +29,9 @@ uvx --python=3.12 mcp-atlassian --help
     ```json
     {
       "mcpServers": {
-        "mcp-atlassian": {
+        "mcp-atlassian-with-bitbucket-and-privacy": {
           "command": "uvx",
-          "args": ["mcp-atlassian"],
+          "args": ["mcp-atlassian-with-bitbucket-and-privacy"],
           "env": {
             "CONFLUENCE_URL": "https://your-company.atlassian.net/wiki",
             "CONFLUENCE_USERNAME": "your.email@company.com",
@@ -56,14 +56,14 @@ Docker provides an isolated environment and is recommended for production deploy
 
 ```bash
 # Pull the latest image
-docker pull ghcr.io/sooperset/mcp-atlassian:latest
+docker pull ghcr.io/ulikoenig/mcp-atlassian-with-bitbucket-and-privacy:latest
 
 # Run with environment variables
 docker run --rm -i \
   -e JIRA_URL=https://your-company.atlassian.net \
   -e JIRA_USERNAME=your.email@company.com \
   -e JIRA_API_TOKEN=your_api_token \
-  ghcr.io/sooperset/mcp-atlassian:latest
+  ghcr.io/ulikoenig/mcp-atlassian-with-bitbucket-and-privacy:latest
 ```
 
 ### IDE Configuration with Docker
@@ -71,7 +71,7 @@ docker run --rm -i \
 ```json
 {
   "mcpServers": {
-    "mcp-atlassian": {
+    "mcp-atlassian-with-bitbucket-and-privacy": {
       "command": "docker",
       "args": [
         "run", "-i", "--rm",
@@ -81,7 +81,7 @@ docker run --rm -i \
         "-e", "JIRA_URL",
         "-e", "JIRA_USERNAME",
         "-e", "JIRA_API_TOKEN",
-        "ghcr.io/sooperset/mcp-atlassian:latest"
+        "ghcr.io/ulikoenig/mcp-atlassian-with-bitbucket-and-privacy:latest"
       ],
       "env": {
         "CONFLUENCE_URL": "https://your-company.atlassian.net/wiki",
@@ -103,10 +103,13 @@ See [Configuration](/docs/configuration) for more Docker options including envir
 Install directly with pip for development or when you need the package in your Python environment:
 
 ```bash
-pip install mcp-atlassian
+pip install mcp-atlassian-with-bitbucket-and-privacy
+
+# Include this extra when PAC/WPAD proxy routing is enabled
+pip install "mcp-atlassian-with-bitbucket-and-privacy[wpad]"
 
 # Run the server
-mcp-atlassian --help
+mcp-atlassian-with-bitbucket-and-privacy --help
 ```
 
 ## uv
@@ -115,10 +118,13 @@ If you're using [uv](https://docs.astral.sh/uv/) for package management:
 
 ```bash
 # Add to your project
-uv add mcp-atlassian
+uv add mcp-atlassian-with-bitbucket-and-privacy
+
+# Include this extra when PAC/WPAD proxy routing is enabled
+uv add "mcp-atlassian-with-bitbucket-and-privacy[wpad]"
 
 # Run
-uv run mcp-atlassian --help
+uv run mcp-atlassian-with-bitbucket-and-privacy --help
 ```
 
 ## From Source
@@ -126,10 +132,10 @@ uv run mcp-atlassian --help
 For development or contributing:
 
 ```bash
-git clone https://github.com/sooperset/mcp-atlassian.git
-cd mcp-atlassian
+git clone https://github.com/ulikoenig/mcp-atlassian-with-bitbucket.git
+cd mcp-atlassian-with-bitbucket
 uv sync --frozen --all-extras --dev
-uv run mcp-atlassian --help
+uv run mcp-atlassian-with-bitbucket-and-privacy --help
 ```
 
-See [CONTRIBUTING.md](https://github.com/sooperset/mcp-atlassian/blob/main/CONTRIBUTING.md) for development setup details.
+See [CONTRIBUTING.md](https://github.com/ulikoenig/mcp-atlassian-with-bitbucket/blob/main/CONTRIBUTING.md) for development setup details.

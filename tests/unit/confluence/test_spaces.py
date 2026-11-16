@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 import requests
 
-from mcp_atlassian.confluence.spaces import SpacesMixin
+from mcp_atlassian_with_bitbucket_and_privacy.confluence.spaces import SpacesMixin
 from tests.fixtures.confluence_mocks import MOCK_SPACES_RESPONSE
 
 
@@ -17,7 +17,7 @@ class TestSpacesMixin:
         """Create a SpacesMixin instance for testing."""
         # SpacesMixin inherits from ConfluenceClient, so we need to create it properly
         with patch(
-            "mcp_atlassian.confluence.spaces.ConfluenceClient.__init__"
+            "mcp_atlassian_with_bitbucket_and_privacy.confluence.spaces.ConfluenceClient.__init__"
         ) as mock_init:
             mock_init.return_value = None
             mixin = SpacesMixin()
